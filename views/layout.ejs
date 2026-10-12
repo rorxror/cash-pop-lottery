@@ -44,7 +44,7 @@ gtag('config', '<%= extCfg('google_analytics').tracking_id %>');
         <input type="hidden" name="_csrf" value="<%= csrf %>">
         <select name="code" onchange="this.form.submit()" aria-label="Display currency">
           <% (typeof currencies !== 'undefined' ? currencies : []).forEach(function(c){ %>
-          <option value="<%= c.code %>" <%= c.code===cur ? 'selected' : '' %>><%= c.code %> &middot; <%= fmt(walletBal(c.code), c.code) %></option>
+          <option value="<%= c.code %>" <%= c.code===cur ? 'selected' : '' %>><%= c.code %><% if (user) { %> &middot; <%= fmt(walletBal(c.code), c.code) %><% } %></option>
           <% }) %>
         </select>
       </form>

@@ -3,59 +3,76 @@
   <form action="/play/buy" method="POST" id="playForm" class="play-grid" data-cur="<%= cur %>">
     <input type="hidden" name="_csrf" value="<%= csrf %>">
     <script type="application/json" id="prizeData"><%- JSON.stringify(prizeTable || []) %></script>
-    <div class="card pslip-card">
-      <div class="card-h"><h2>1. Pick your pops (1&ndash;15)</h2></div>
-      <div class="balls" id="ballBox">
-        <% for (let i=1; i<=15; i++) { %>
-        <label class="ball-wrap"><input type="checkbox" name="pops" value="<%= i %>" class="ball-input"><span class="ball"><%= i %></span></label>
-        <% } %>
-      </div>
-      <div class="ball-actions">
-        <button type="button" class="btn btn-g btn-sm" id="quickPick">Quick Pick</button>
-        <button type="button" class="btn btn-g btn-sm" id="coverAll">Cover All</button>
-        <button type="button" class="btn btn-g btn-sm" id="clearBalls">Clear</button>
-      </div>
-      <p class="muted"><span id="popCount">0</span> pops selected</p>
-    </div>
 
-    <div class="card">
-      <div class="card-h"><h2>2. Wager per pop</h2></div>
-      <div class="field">
-        <select name="wager" id="wagerSel" required>
-          <% wagerOptions.forEach(function(w){ %>
-          <option value="<%= w %>"><%= fmt(w, cur) %></option>
+    <div class="pslip">
+      <!-- STEP 1 -->
+      <div class="pstep">
+        <div class="pstep-banner"><span class="pstep-num">1</span><span>Pick your pops</span></div>
+        <p class="pstep-sub">Play just 1 or up to 15 numbers (pops). The more numbers you play, the better your odds of winning!</p>
+        <div class="balls" id="ballBox">
+          <% for (let i=1; i<=15; i++) { %>
+          <label class="ball-wrap"><input type="checkbox" name="pops" value="<%= i %>" class="ball-input"><span class="ball"><%= i %></span></label>
+          <% } %>
+        </div>
+        <div class="ball-actions">
+          <button type="button" class="btn btn-p btn-sm" id="coverAll">&#10003; Cover All</button>
+          <button type="button" class="btn btn-g btn-sm" id="quickPick">Quick Pick</button>
+          <button type="button" class="btn btn-g btn-sm" id="clearBalls">Clear</button>
+        </div>
+        <p class="muted"><span id="popCount">0</span> pops selected</p>
+      </div>
+
+      <!-- STEP 2 -->
+      <div class="pstep">
+        <div class="pstep-banner"><span class="pstep-num">2</span><span>Select your wager per pop</span></div>
+        <p class="pstep-sub">The more you wager, the higher the cash prize you could win!</p>
+        <div class="wager-circles" id="wagerBox">
+          <% wagerOptions.forEach(function(w, idx){ %>
+          <label class="circle-wrap"><input type="radio" name="wager" value="<%= w %>" class="circle-input"<%= idx===0 ? ' checked' : '' %>><span class="circle-ball wager-ball"><%= fmt(w, cur) %></span></label>
           <% }) %>
-        </select>
+        </div>
       </div>
-      <div class="card-h mt"><h2>3. Draw type</h2></div>
-      <div class="field radios">
-        <label><input type="radio" name="draw_type" value="DAY" checked> Day</label>
-        <label><input type="radio" name="draw_type" value="EVE" checked> Evening</label>
-        <label><input type="radio" name="draw_type" value="BOTH"> Both (Day + Evening)</label>
+
+      <!-- STEP 3 -->
+      <div class="pstep">
+        <div class="pstep-banner"><span class="pstep-num">3</span><span>Select draw &amp; number of draws</span></div>
+        <p class="pstep-sub">Choose your draw time(s), then how many consecutive draws to play.</p>
+        <div class="circle-row-label">Draw time</div>
+        <div class="draw-circles" id="drawTypeBox">
+          <label class="circle-wrap"><input type="radio" name="draw_type" value="DAY" class="circle-input" checked><span class="circle-ball draw-ball">Day</span></label>
+          <label class="circle-wrap"><input type="radio" name="draw_type" value="EVE" class="circle-input"><span class="circle-ball draw-ball">Eve</span></label>
+          <label class="circle-wrap"><input type="radio" name="draw_type" value="BOTH" class="circle-input"><span class="circle-ball draw-ball">Both</span></label>
+        </div>
+        <div class="circle-row-label">Number of draws</div>
+        <div class="draw-circles" id="numDrawsBox">
+          <% for (let n=1; n<=maxDraws; n++) { %>
+          <label class="circle-wrap"><input type="radio" name="num_draws" value="<%= n %>" class="circle-input"<%= n===1 ? ' checked' : '' %>><span class="circle-ball draw-ball num-ball"><%= n %></span></label>
+          <% } %>
+        </div>
+        <p class="muted note">Both = your pops enter the Day draw <em>and</em> the Evening draw each day.</p>
       </div>
-      <p class="muted note">BOTH = your pops are entered into the Day draw and the Evening draw each day.</p>
-      <div class="card-h mt"><h2>4. Number of draws</h2></div>
-      <div class="field">
-        <select name="num_draws" id="numDrawsSel">
-          <% for (let n=1; n<=maxDraws; n++) { %><option value="<%= n %>"><%= n %> draw<%= n>1?'s':'' %></option><% } %>
-        </select>
-      </div>
+
+      <!-- PRIZES -->
       <% if (prizeTable && prizeTable.length) { %>
-      <div class="card-h mt"><h2>Prize multipliers</h2></div>
-      <div class="tbl-wrap">
-      <table class="tbl tbl-sm">
-        <thead><tr><th>Pops</th><th>Multiplier</th></tr></thead>
-        <tbody>
-          <% prizeTable.forEach(function(p){ %>
-          <tr><td><%= p.pops_count %></td><td>&times;<%= p.multiplier %></td></tr>
-          <% }) %>
-        </tbody>
-      </table>
+      <div class="pstep">
+        <div class="pstep-banner prize-banner"><span class="pstep-num">$</span><span>Prize multipliers</span></div>
+        <p class="pstep-sub">Match your number to the drawn number to win the multiplier for your pops.</p>
+        <div class="tbl-wrap">
+        <table class="tbl tbl-sm prize-tbl">
+          <thead><tr><th>Pops played</th><th>Multiplier</th><th>Win per $1</th></tr></thead>
+          <tbody>
+            <% prizeTable.forEach(function(p){ %>
+            <tr><td><%= p.pops_count %></td><td>&times;<%= p.multiplier %></td><td><%= fmt(p.multiplier * 100, cur) %></td></tr>
+            <% }) %>
+          </tbody>
+        </table>
+        </div>
       </div>
       <% } %>
     </div>
 
-    <div class="card" id="totalBox">
+    <!-- SLIP SUMMARY -->
+    <div class="card slip-card" id="totalBox">
       <div class="card-h"><h2>Your slip</h2><button type="button" id="slipToggle" class="btn btn-g btn-sm">Hide</button></div>
       <div id="slipBreakdown" class="slip-lines">
         <div class="slip-line"><span>Pops</span><span id="slPops">0</span></div>
@@ -63,7 +80,7 @@
         <div class="slip-line"><span>Draws</span><span id="slDraws">1 &times; Day</span></div>
       </div>
       <p class="muted" id="prizePreview"></p>
-      <div class="slip-total">Total: <span id="totalAmt"><%= fmt(0, cur) %></span></div>
+      <div class="slip-total"><span>Total cost</span><span id="totalAmt"><%= fmt(0, cur) %></span></div>
       <p class="muted">Wallet balance: <%= fmt(balance, cur) %></p>
       <button type="submit" class="btn btn-p btn-lg btn-block" id="buyBtn">Buy Ticket &mdash; <span id="totalAmtBtn"><%= fmt(0, cur) %></span></button>
     </div>
