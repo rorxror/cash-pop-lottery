@@ -1,5 +1,8 @@
-<section class="wrap section">
-  <h1 class="sec-title">Ticket <span class="code"><%= ticket.public_id %></span></h1>
+<section class="wrap section ticket-page">
+  <div class="sec-head">
+    <h1 class="sec-title">Ticket <span class="code"><%= ticket.public_id %></span></h1>
+    <button type="button" class="btn btn-g btn-sm no-print" onclick="window.print()">Print / Save PDF</button>
+  </div>
   <div class="grid2">
     <div class="card">
       <div class="card-h"><h2>Ticket details</h2></div>

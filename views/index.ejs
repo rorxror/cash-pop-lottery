@@ -28,8 +28,11 @@
 
 <% if (draws && draws.length) { %>
 <section class="wrap section">
-  <h2 class="sec-title">Upcoming Draws</h2>
-  <div class="draw-cards">
+  <div class="sec-head">
+    <h2 class="sec-title">Upcoming Draws</h2>
+    <button type="button" class="btn btn-g btn-sm collapse-toggle" data-target="upcomingDraws" data-start="hidden" aria-expanded="false">Show</button>
+  </div>
+  <div class="draw-cards collapsible collapsed" id="upcomingDraws">
     <% draws.forEach(function(d){ %>
     <div class="draw-card">
       <div class="draw-type"><%= d.draw_type %></div>
