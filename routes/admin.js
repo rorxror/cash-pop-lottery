@@ -36,7 +36,7 @@ function money(req, minor, cur) { return req.fmt(minor, cur); }
 async function csrf(req) { return req.csrfToken; }
 
 function shell(req, section, title, body) {
-  return ui.layout({ adminPath: adminPath(req), section, title, body, csrf: req.csrfToken, flash: req.flashData || {} });
+  return ui.layout({ adminPath: adminPath(req), section, title, body, csrf: req.csrfToken, flash: req.flashData || {}, assetV: req.app.locals.assetV || '1' });
 }
 const notFound = (req, res, msg) => res.status(404).send(shell(req, '', 'Not found', `<div class="alert a-err">${esc(msg)}</div>`));
 
