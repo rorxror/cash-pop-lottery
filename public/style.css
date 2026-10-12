@@ -512,6 +512,10 @@ img, video, iframe, embed { max-width: 100%; height: auto; }
   .foot-grid { grid-template-columns: 1fr 1fr; }
   /* Sticky total bar on mobile */
   #totalBox { position: sticky; bottom: var(--sp-3); z-index: 60; box-shadow: var(--sh-lg); }
+  #totalBox .card-h { display: flex; align-items: center; justify-content: space-between; }
+  #totalBox.collapsed #slipBreakdown,
+  #totalBox.collapsed #prizePreview,
+  #totalBox.collapsed .slip-total { display: none; }
 }
 @media (max-width: 640px) {
   .nav-toggle { display: inline-block; }

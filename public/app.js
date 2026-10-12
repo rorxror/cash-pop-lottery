@@ -140,6 +140,14 @@
     });
   }
 
+  /* ---------- (c2) Slip panel collapse (mobile) ---------- */
+  var slipToggle = document.getElementById('slipToggle');
+  var totalBox = document.getElementById('totalBox');
+  if (slipToggle && totalBox) slipToggle.addEventListener('click', function () {
+    var collapsed = totalBox.classList.toggle('collapsed');
+    slipToggle.textContent = collapsed ? 'Show' : 'Hide';
+  });
+
   /* ---------- (d) Deposit / withdraw charge preview ---------- */
   ['depAmount', 'wdAmount'].forEach(function (id) {
     var amt = document.getElementById(id);
