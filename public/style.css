@@ -279,6 +279,7 @@ img, video, iframe, embed { max-width: 100%; height: auto; }
 }
 .ball-input:focus-visible + .ball { box-shadow: var(--glow-gold); }
 .balls-sm .ball { max-width: 44px; font-size: var(--fs-sm); border-width: 1px; }
+.tbl .ball { max-width: 40px; font-size: var(--fs-sm); border-width: 1px; margin: 0; }
 .ball-win { background: linear-gradient(135deg, var(--gold), var(--gold-2)); color: var(--navy-900); border-color: var(--gold-2); }
 .ball-actions { display: flex; gap: var(--sp-2); flex-wrap: wrap; margin-bottom: var(--sp-3); }
 
@@ -357,6 +358,11 @@ img, video, iframe, embed { max-width: 100%; height: auto; }
 .slip-line span:last-child { font-weight: 700; text-align: right; overflow-wrap: anywhere; }
 .slip-total { font-size: var(--fs-lg); font-weight: 800; color: var(--gold-2); margin: var(--sp-4) 0; }
 .note { font-size: var(--fs-sm); }
+
+/* Collapsible sections (lottery hide/show) */
+.collapsible { overflow: hidden; }
+.collapsible.collapsed { display: none; }
+.collapse-toggle { flex: none; }
 
 /* ---------- Draw cards / countdown ---------- */
 .draw-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: var(--sp-5); }
@@ -586,8 +592,19 @@ img, video, iframe, embed { max-width: 100%; height: auto; }
 }
 @media (max-width: 640px) {
   .nav-toggle { display: inline-block; }
-  .main-nav { display: none; width: 100%; flex-direction: column; }
+  .head-in { position: relative; }
+  .main-nav {
+    display: none;
+    position: absolute; top: 100%; left: 0; right: 0; z-index: 99;
+    width: 100%; flex-direction: column; flex: none;
+    background: var(--navy-800);
+    border-bottom: 1px solid var(--line-dark);
+    box-shadow: var(--sh-lg);
+    padding: var(--sp-2) var(--gutter) var(--sp-4);
+    gap: var(--sp-1);
+  }
   .main-nav.open { display: flex; }
+  .main-nav a { padding: var(--sp-3) var(--sp-4); font-size: var(--fs-base); border-radius: var(--r-md); }
   .hero-copy h1 { font-size: var(--fs-2xl); }
   .head-in { gap: var(--sp-3); }
   .head-right { margin-left: 0; width: 100%; justify-content: flex-start; }
@@ -601,6 +618,27 @@ img, video, iframe, embed { max-width: 100%; height: auto; }
   .ball { font-size: var(--fs-base); }
   .hero-cta .btn { width: 100%; }
   .field.inline { flex-wrap: wrap; }
+}
+
+/* ============================================================
+   Print: ticket / save as PDF
+   ============================================================ */
+@media print {
+  .site-head, .site-foot, .no-print, .cookie-bar { display: none !important; }
+  body { background: #fff; color: #000; }
+  .ticket-page .card {
+    background: #fff; color: #000; border: 1px solid #999;
+    box-shadow: none; break-inside: avoid;
+  }
+  .ticket-page .card-h h2, .ticket-page h3 { color: #000; }
+  .ticket-page .slip-line span:first-child { color: #333; }
+  .ticket-page .slip-line span:last-child { color: #000; }
+  .ticket-page .muted { color: #333; }
+  .ticket-page .ball.sel {
+    background: #fff; color: #000; border: 2px solid #000; box-shadow: none;
+  }
+  .ticket-page .badge { border: 1px solid #000; }
+  .sec-title { color: #000; }
 }
 
 /* ============================================================
