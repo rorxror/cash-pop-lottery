@@ -43,7 +43,12 @@
 </section>
 <% } %>
 
-<%- content('home_banner') %>
+<% const _banner = content('home_banner'); %>
+<% if (_banner) { %>
+<section class="wrap section home-banner">
+  <%- _banner %>
+</section>
+<% } %>
 
 <section class="wrap section">
   <h2 class="sec-title">How It Works</h2>
@@ -73,10 +78,16 @@
 </section>
 <% } %>
 
+<% const _winners = content('winners'); %>
+<% if (_winners) { %>
 <section class="wrap section">
-  <%- content('winners') %>
+  <%- _winners %>
 </section>
+<% } %>
 
+<% const _testimonials = content('testimonials'); %>
+<% if (_testimonials) { %>
 <section class="wrap section">
-  <%- content('testimonials') %>
+  <%- _testimonials %>
 </section>
+<% } %>

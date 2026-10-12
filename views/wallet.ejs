@@ -8,7 +8,7 @@
     <div class="cur-row">
       <span class="cr-name"><%= w.currency %> <span class="cr-sym"><%= cinfo.symbol || '' %></span></span>
       <span class="cr-bal"><%= fmt(w.balance, w.currency) %></span>
-      <span class="cr-meta"><%= cinfo.rate ? ('rate ' + cinfo.rate) : '&nbsp;' %></span>
+      <span class="cr-meta"><%= cinfo.rate ? ('1 ' + w.currency + ' = ' + Number(cinfo.rate).toFixed(4) + ' USD') : '&nbsp;' %></span>
     </div>
     <% }) %>
   </div>
