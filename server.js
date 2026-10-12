@@ -45,6 +45,26 @@ async function boot() {
   await migrate(db, driver);
   console.log(`[db] ${driver} ready`);
 
+  // Self-healing demo: Render's free-tier ephemeral disk wipes SQLite on every
+  // redeploy/restart, which killed the demo admin account repeatedly ("Invalid
+  // email or password"). If no admin exists after migrations, seed the demo
+  // admin automatically so the demo login always works after a wipe.
+  // Override with env vars: ADMIN_SEED_EMAIL / ADMIN_SEED_PASSWORD / ADMIN_SEED_NAME.
+  {
+    const seeded = await db.get("SELECT id FROM users WHERE role = 'admin' LIMIT 1");
+    if (!seeded) {
+      const { hashPassword } = require('./lib/util');
+      const seedEmail = (process.env.ADMIN_SEED_EMAIL || 'admin@cashpop.live').trim().toLowerCase();
+      const seedPass = process.env.ADMIN_SEED_PASSWORD || 'K7#vQ2!mX9$pL4&zR8';
+      const seedName = (process.env.ADMIN_SEED_NAME || 'Demo Admin').trim();
+      await db.run(
+        'INSERT INTO users (email, phone, name, password_hash, role, status, email_verified, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        [seedEmail, '', seedName, hashPassword(seedPass), 'admin', 'active', 1, now()]
+      );
+      console.log(`[boot] no admin found — seeded demo admin ${seedEmail} (set ADMIN_SEED_* env to override)`);
+    }
+  }
+
   const app = express();
   app.set('trust proxy', 1);
   app.disable('x-powered-by');
