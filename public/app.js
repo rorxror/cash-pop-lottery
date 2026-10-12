@@ -170,11 +170,36 @@
   var navToggle = document.getElementById('navToggle');
   var mainNav = document.getElementById('mainNav');
   if (navToggle && mainNav) {
-    navToggle.addEventListener('click', function () {
+    navToggle.addEventListener('click', function (e) {
+      e.stopPropagation();
       var open = mainNav.classList.toggle('open');
       navToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
     });
+    // close when a link is tapped or when tapping outside
+    mainNav.addEventListener('click', function (e) {
+      if (e.target && e.target.tagName === 'A') {
+        mainNav.classList.remove('open');
+        navToggle.setAttribute('aria-expanded', 'false');
+      }
+    });
+    document.addEventListener('click', function (e) {
+      if (mainNav.classList.contains('open') && !mainNav.contains(e.target) && e.target !== navToggle) {
+        mainNav.classList.remove('open');
+        navToggle.setAttribute('aria-expanded', 'false');
+      }
+    });
   }
+
+  /* ---------- (f) Generic collapsible sections ---------- */
+  Array.prototype.forEach.call(document.querySelectorAll('.collapse-toggle'), function (btn) {
+    btn.addEventListener('click', function () {
+      var target = document.getElementById(btn.getAttribute('data-target'));
+      if (!target) return;
+      var hidden = target.classList.toggle('collapsed');
+      btn.textContent = hidden ? 'Show' : 'Hide';
+      btn.setAttribute('aria-expanded', hidden ? 'false' : 'true');
+    });
+  });
 
   /* User menu dropdown */
   var userMenu = document.getElementById('userMenu');
