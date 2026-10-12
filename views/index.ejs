@@ -1,0 +1,82 @@
+<section class="hero">
+  <div class="wrap hero-in">
+    <div class="hero-copy">
+      <h1>Pick a number. Pop a prize.</h1>
+      <p class="hero-sub">Cash Pop style lottery with draws every day &mdash; provably fair, transparent results, instant payouts.</p>
+      <div class="hero-cta">
+        <a href="/play" class="btn btn-p btn-lg">Play Now</a>
+        <a href="/fairness" class="btn btn-g btn-lg">How Fairness Works</a>
+      </div>
+      <div class="hero-stats">
+        <div class="hstat"><span class="n"><%= stats.players %></span><span class="l">Players</span></div>
+        <div class="hstat"><span class="n"><%= stats.tickets_today %></span><span class="l">Tickets today</span></div>
+        <div class="hstat"><span class="n"><%= stats.paid_out_fmt %></span><span class="l">Paid out</span></div>
+      </div>
+    </div>
+    <div class="hero-teaser">
+      <div class="pslip-card">
+        <h3>Mini Playslip</h3>
+        <div class="balls balls-sm">
+          <% for (let i=1; i<=15; i++) { %><span class="ball<%= i===7 ? ' sel' : '' %>"><%= i %></span><% } %>
+        </div>
+        <p class="muted">One number, two daily draws &mdash; pick your lucky pop.</p>
+        <a href="/play" class="btn btn-p btn-block">Build My Slip</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<% if (draws && draws.length) { %>
+<section class="wrap section">
+  <h2 class="sec-title">Upcoming Draws</h2>
+  <div class="draw-cards">
+    <% draws.forEach(function(d){ %>
+    <div class="draw-card">
+      <div class="draw-type"><%= d.draw_type %></div>
+      <div class="draw-label"><%= d.label %></div>
+      <div class="countdown" data-close-at="<%= d.close_at %>">--:--:--</div>
+      <div class="draw-hash muted">Seed hash: <span class="code"><%= d.seed_hash ? d.seed_hash.slice(0,16) + '...' : 'pending' %></span></div>
+      <a href="/play" class="btn btn-p btn-sm btn-block">Enter</a>
+    </div>
+    <% }) %>
+  </div>
+</section>
+<% } %>
+
+<%- content('home_banner') %>
+
+<section class="wrap section">
+  <h2 class="sec-title">How It Works</h2>
+  <div class="steps">
+    <%- content('how_it_works') %>
+  </div>
+</section>
+
+<% if (recentResults && recentResults.length) { %>
+<section class="wrap section">
+  <h2 class="sec-title">Recent Results</h2>
+  <div class="tbl-wrap">
+  <table class="tbl">
+    <thead><tr><th>Draw</th><th>Date</th><th>Winning Number</th></tr></thead>
+    <tbody>
+      <% recentResults.forEach(function(r){ %>
+      <tr>
+        <td><%= r.draw_type %><%= r.is_test ? ' <span class="badge b-warn">TEST</span>' : '' %></td>
+        <td><%= r.draw_date %></td>
+        <td><span class="ball ball-win"><%= r.winning_number %></span></td>
+      </tr>
+      <% }) %>
+    </tbody>
+  </table>
+  </div>
+  <div class="mt"><a href="/results" class="btn btn-g">All Results</a></div>
+</section>
+<% } %>
+
+<section class="wrap section">
+  <%- content('winners') %>
+</section>
+
+<section class="wrap section">
+  <%- content('testimonials') %>
+</section>

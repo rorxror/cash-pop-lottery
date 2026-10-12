@@ -1,0 +1,51 @@
+<section class="wrap section">
+  <h1 class="sec-title">Ticket <span class="code"><%= ticket.public_id %></span></h1>
+  <div class="grid2">
+    <div class="card">
+      <div class="card-h"><h2>Ticket details</h2></div>
+      <div class="slip-lines">
+        <div class="slip-line"><span>Status</span><span>
+          <% if (ticket.status === 'won') { %><span class="badge b-ok">WON</span>
+          <% } else if (ticket.status === 'lost') { %><span class="badge b-muted">LOST</span>
+          <% } else if (ticket.status === 'cancelled') { %><span class="badge b-err">CANCELLED</span>
+          <% } else { %><span class="badge b-info">ACTIVE</span><% } %>
+        </span></div>
+        <div class="slip-line"><span>Purchased</span><span><%= new Date(ticket.created_at).toLocaleString() %></span></div>
+        <div class="slip-line"><span>Draw type</span><span><%= ticket.draw_type %> &times; <%= ticket.num_draws %></span></div>
+        <div class="slip-line"><span>Wager per pop</span><span><%= fmt(ticket.wager, ticket.currency) %></span></div>
+        <div class="slip-line"><span>Total</span><span><%= fmt(ticket.total, ticket.currency) %></span></div>
+        <div class="slip-line"><span>Signature</span><span class="code"><%= ticket.hmac_short %></span></div>
+      </div>
+      <h3 class="mt">Your pops</h3>
+      <div class="balls balls-sm">
+        <% ticket.pops.forEach(function(p){ %><span class="ball sel"><%= p %></span><% }) %>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-h"><h2>Per-draw results</h2></div>
+      <% if (entries && entries.length) { %>
+      <div class="tbl-wrap">
+      <table class="tbl">
+        <thead><tr><th>Draw</th><th>Date</th><th>Winner</th><th>Result</th></tr></thead>
+        <tbody>
+          <% entries.forEach(function(e){ %>
+          <tr>
+            <td><%= e.draw_label %></td>
+            <td><%= e.draw_date %></td>
+            <td><%= e.winning_number != null ? e.winning_number : '&mdash;' %></td>
+            <td>
+              <% if (e.status === 'won') { %><span class="badge b-ok">WON <%= fmt(e.win_amount, ticket.currency) %></span>
+              <% } else if (e.status === 'lost') { %><span class="badge b-muted">LOST</span>
+              <% } else { %><span class="badge b-info">PENDING</span><% } %>
+            </td>
+          </tr>
+          <% }) %>
+        </tbody>
+      </table>
+      </div>
+      <% } else { %>
+      <p class="muted">Draw entries will appear here once scheduled.</p>
+      <% } %>
+    </div>
+  </div>
+</section>

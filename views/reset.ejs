@@ -1,0 +1,10 @@
+<div class="form-card">
+  <h2>Set a new password</h2>
+  <% if (typeof formError !== 'undefined' && formError) { %><div class="flash f-err"><%= formError %></div><% } %>
+  <form method="POST" action="/reset/<%= token %>">
+    <input type="hidden" name="_csrf" value="<%= csrf %>">
+    <div class="field"><label>New password</label><input type="password" name="password" required></div>
+    <div class="field"><label>Confirm password</label><input type="password" name="password2" required></div>
+    <button class="btn btn-p" type="submit">Set password</button>
+  </form>
+</div>

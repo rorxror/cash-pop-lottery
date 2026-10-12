@@ -1,0 +1,47 @@
+<section class="wrap section narrow">
+  <div class="form-card">
+    <h1>Create Account</h1>
+<% if (typeof formError !== 'undefined' && formError) { %><div class="flash f-err"><%= formError %></div><% } %>
+        <form action="/register" method="POST">
+      <input type="hidden" name="_csrf" value="<%= csrf %>">
+      <div class="field">
+        <label for="name">Full name</label>
+        <input type="text" id="name" name="name" required autocomplete="name">
+      </div>
+      <div class="field">
+        <label for="email">Email</label>
+        <input type="email" id="email" name="email" required autocomplete="email">
+      </div>
+      <div class="field">
+        <label for="phone">Phone</label>
+        <input type="tel" id="phone" name="phone" autocomplete="tel">
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" required autocomplete="new-password" minlength="8">
+      </div>
+      <div class="field">
+        <label for="password_confirm">Confirm password</label>
+        <input type="password" id="password_confirm" name="password_confirm" required autocomplete="new-password" minlength="8">
+      </div>
+      <% if (typeof otpEnabled !== 'undefined' && otpEnabled) { %>
+      <div class="field">
+        <label for="otp_code">Signup code</label>
+        <input type="text" id="otp_code" name="otp_code" required>
+        <small class="muted">Enter the signup code issued by the operator.</small>
+      </div>
+      <% } %>
+      <% if (S('policy_agreement')==='1') { %>
+      <div class="field check">
+        <label><input type="checkbox" name="agree" value="1" required> I agree to the <a href="/page/terms">Terms</a> and <a href="/page/privacy">Privacy Policy</a></label>
+      </div>
+      <% } %>
+      <%- captchaHtml %>
+      <%- recaptchaHtml %>
+      <button type="submit" class="btn btn-p btn-lg btn-block">Register</button>
+    </form>
+    <div class="form-links">
+      <p class="muted">Already have an account? <a href="/login">Login</a></p>
+    </div>
+  </div>
+</section>

@@ -1,0 +1,25 @@
+<section class="wrap section">
+  <h1 class="sec-title">Draw Results</h1>
+  <div class="card">
+    <% if (draws && draws.length) { %>
+    <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr><th>Draw</th><th>Date</th><th>Winning Number</th><th>Seed Hash</th></tr></thead>
+      <tbody>
+        <% draws.forEach(function(d){ %>
+        <tr>
+          <td><%= d.draw_type %><%= d.is_test ? ' <span class="badge b-warn">TEST</span>' : '' %></td>
+          <td><%= d.draw_date %></td>
+          <td><span class="ball ball-win"><%= d.winning_number %></span></td>
+          <td><span class="code"><%= d.seed_hash ? d.seed_hash.slice(0, 20) + '…' : '—' %></span></td>
+        </tr>
+        <% }) %>
+      </tbody>
+    </table>
+    </div>
+    <% } else { %>
+    <p class="muted">No results yet. Check back after the next draw.</p>
+    <% } %>
+  </div>
+  <p class="muted mt">Draws marked <span class="badge b-warn">TEST</span> are operator test draws and are excluded from payouts. Every result can be independently verified on the <a href="/fairness">Fairness</a> page.</p>
+</section>

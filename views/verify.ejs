@@ -1,0 +1,39 @@
+<section class="wrap section">
+  <h1 class="sec-title">Provably Fair</h1>
+  <div class="card">
+    <div class="card-h"><h2>Verify a draw</h2></div>
+    <p class="muted">Every draw commits to its secret seed before it closes by publishing the seed's SHA-256 hash. After the draw the seed is revealed, so anyone can recompute the hash and the winning number.</p>
+    <form action="/fairness" method="GET" class="filters">
+      <div class="field inline">
+        <label for="draw_id">Draw ID</label>
+        <input type="text" id="draw_id" name="draw_id" value="<%= (typeof result !== 'undefined' && result && result.draw) ? result.draw.id : '' %>" placeholder="e.g. 123">
+      </div>
+      <button type="submit" class="btn btn-p">Verify</button>
+    </form>
+  </div>
+
+  <% if (typeof result !== 'undefined' && result && result.draw) { %>
+  <div class="card mt">
+    <div class="card-h"><h2>Verification result &mdash; draw #<%= result.draw.id %></h2></div>
+    <div class="slip-lines">
+      <div class="slip-line"><span>Draw</span><span><%= result.draw.draw_type %> &middot; <%= result.draw.draw_date %><%= result.draw.is_test ? ' <span class="badge b-warn">TEST</span>' : '' %></span></div>
+      <div class="slip-line"><span>Published seed hash</span><span class="code"><%= result.draw.seed_hash %></span></div>
+      <div class="slip-line"><span>Recomputed hash of revealed seed</span><span class="code"><%= result.recomputed_hash %></span></div>
+      <div class="slip-line"><span>Hash match</span><span><%= result.hash_match ? '<span class="badge b-ok">&#10003; MATCH</span>' : '<span class="badge b-err">&#10007; MISMATCH</span>' %></span></div>
+      <div class="slip-line"><span>Revealed seed</span><span class="code"><%= result.draw.seed %></span></div>
+      <div class="slip-line"><span>Published winning number</span><span><%= result.draw.winning_number %></span></div>
+      <div class="slip-line"><span>Recomputed winning number</span><span><%= result.recomputed_number %></span></div>
+      <div class="slip-line"><span>Number match</span><span><%= result.number_match ? '<span class="badge b-ok">&#10003; MATCH</span>' : '<span class="badge b-err">&#10007; MISMATCH</span>' %></span></div>
+    </div>
+  </div>
+  <% } %>
+
+  <div class="card mt">
+    <div class="card-h"><h2>How provably-fair works</h2></div>
+    <ol class="fair-steps">
+      <li><strong>Commit.</strong> Before the draw closes, the operator generates a secret random seed and publishes its SHA-256 hash (<span class="code">seed_hash</span>). The hash is a one-way fingerprint: it cannot be reversed to reveal the seed.</li>
+      <li><strong>Draw.</strong> Once betting closes, the seed is used to derive the winning number deterministically: <span class="code">winning_number = (HMAC(seed) mod 15) + 1</span>. Because the hash was published first, the operator cannot change the outcome afterwards.</li>
+      <li><strong>Reveal &amp; verify.</strong> The seed is revealed. Anyone can compute <span class="code">SHA256(seed)</span> and compare it with the published hash, then recompute the winning number from the seed. If both match, the draw was fair.</li>
+    </ol>
+  </div>
+</section>

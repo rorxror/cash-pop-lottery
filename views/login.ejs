@@ -1,0 +1,36 @@
+<section class="wrap section narrow">
+  <div class="form-card">
+    <h1>Login</h1>
+<% if (typeof formError !== 'undefined' && formError) { %><div class="flash f-err"><%= formError %></div><% } %>
+        <form action="/login" method="POST">
+      <input type="hidden" name="_csrf" value="<%= csrf %>">
+      <% if (typeof totpRequired !== 'undefined' && totpRequired) { %>
+      <input type="hidden" name="email" value="<%= emailPrefill %>">
+      <p class="muted">Two-factor authentication is enabled for <strong><%= emailPrefill %></strong>. Enter the code from your authenticator app.</p>
+      <div class="field">
+        <label for="totp_code">Authenticator code</label>
+        <input type="text" id="totp_code" name="totp_code" inputmode="numeric" autocomplete="one-time-code" required>
+      </div>
+      <% } else { %>
+      <div class="field">
+        <label for="email">Email</label>
+        <input type="email" id="email" name="email" value="<%= emailPrefill %>" required autocomplete="email">
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" required autocomplete="current-password">
+      </div>
+      <% } %>
+      <%- captchaHtml %>
+      <%- recaptchaHtml %>
+      <button type="submit" class="btn btn-p btn-lg btn-block">Login</button>
+    </form>
+    <div class="form-links">
+      <a href="/forgot">Forgot password?</a>
+      <% if (S('google_oauth_enabled')==='1') { %>
+      <a class="btn btn-g btn-block" href="/auth/google">Continue with Google</a>
+      <% } %>
+      <p class="muted">No account? <a href="/register">Register</a></p>
+    </div>
+  </div>
+</section>

@@ -1,0 +1,34 @@
+<section class="wrap section">
+  <h1 class="sec-title">Support</h1>
+  <div class="grid2">
+    <div class="card">
+      <div class="card-h"><h2>Your tickets</h2></div>
+      <% if (stickets && stickets.length) { %>
+      <ul class="ticket-list">
+        <% stickets.forEach(function(t){ %>
+        <li>
+          <a href="/support/<%= t.public_id %>"><%= t.subject %></a>
+          <span class="badge <%= t.status === 'open' ? 'b-info' : 'b-muted' %>"><%= t.status %></span>
+          <small class="muted"><%= new Date(t.created_at).toLocaleString() %></small>
+        </li>
+        <% }) %>
+      </ul>
+      <% } else { %><p class="muted">No support tickets yet.</p><% } %>
+    </div>
+    <div class="card">
+      <div class="card-h"><h2>Open a new ticket</h2></div>
+      <form action="/support/new" method="POST">
+        <input type="hidden" name="_csrf" value="<%= csrf %>">
+        <div class="field">
+          <label for="subject">Subject</label>
+          <input type="text" id="subject" name="subject" required maxlength="120">
+        </div>
+        <div class="field">
+          <label for="message">Message</label>
+          <textarea id="message" name="message" rows="6" required></textarea>
+        </div>
+        <button type="submit" class="btn btn-p">Submit Ticket</button>
+      </form>
+    </div>
+  </div>
+</section>

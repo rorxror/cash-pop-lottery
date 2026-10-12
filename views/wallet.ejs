@@ -1,0 +1,68 @@
+<section class="wrap section">
+  <h1 class="sec-title">Wallet</h1>
+  <h2 class="sec-title">Balances</h2>
+  <div class="cur-rows">
+    <% (typeof wallets !== 'undefined' ? wallets : []).forEach(function(w){
+         var cinfo = ((typeof currencies !== 'undefined' ? currencies : []).filter(function(c){ return c.code === w.currency; })[0]) || {};
+    %>
+    <div class="cur-row">
+      <span class="cr-name"><%= w.currency %> <span class="cr-sym"><%= cinfo.symbol || '' %></span></span>
+      <span class="cr-bal"><%= fmt(w.balance, w.currency) %></span>
+      <span class="cr-meta"><%= cinfo.rate ? ('rate ' + cinfo.rate) : '&nbsp;' %></span>
+    </div>
+    <% }) %>
+  </div>
+
+  <div class="grid2 mt">
+    <div class="card">
+      <div class="card-h"><h2>Deposit</h2></div>
+      <% if (depositMethods && depositMethods.length) { %>
+      <ul class="method-list">
+        <% depositMethods.forEach(function(m){ %>
+        <li>
+          <span class="method-name"><%= m.name %></span>
+          <span class="muted"><% if (m.min == null && m.max == null) { %>No limits<% } else { %><%= m.min == null ? '' : fmt(m.min, m.currency) %><%= m.min == null || m.max == null ? '' : ' – ' %><%= m.max == null ? 'no max' : fmt(m.max, m.currency) %><% } %></span>
+          <a class="btn btn-p btn-sm" href="/deposit/new?m=<%= m.id %>">Deposit</a>
+        </li>
+        <% }) %>
+      </ul>
+      <% } else { %><p class="muted">No deposit methods available.</p><% } %>
+    </div>
+    <div class="card">
+      <div class="card-h"><h2>Withdraw</h2></div>
+      <% if (withdrawMethods && withdrawMethods.length) { %>
+      <ul class="method-list">
+        <% withdrawMethods.forEach(function(m){ %>
+        <li>
+          <span class="method-name"><%= m.name %></span>
+          <span class="muted"><% if (m.min == null && m.max == null) { %>No limits<% } else { %><%= m.min == null ? '' : fmt(m.min, m.currency) %><%= m.min == null || m.max == null ? '' : ' – ' %><%= m.max == null ? 'no max' : fmt(m.max, m.currency) %><% } %></span>
+          <a class="btn btn-g btn-sm" href="/withdraw/new?m=<%= m.id %>">Withdraw</a>
+        </li>
+        <% }) %>
+      </ul>
+      <% } else { %><p class="muted">No withdrawal methods available.</p><% } %>
+    </div>
+  </div>
+
+  <div class="card mt">
+    <div class="card-h"><h2>Pending requests</h2></div>
+    <% if (pending && pending.length) { %>
+    <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr><th>ID</th><th>Type</th><th>Amount</th><th>Status</th><th>Created</th></tr></thead>
+      <tbody>
+        <% pending.forEach(function(p){ %>
+        <tr>
+          <td><span class="code"><%= p.public_id %></span></td>
+          <td><%= p.kind === 'deposit' ? 'Deposit' : 'Withdrawal' %></td>
+          <td><%= fmt(p.amount, p.currency) %></td>
+          <td><span class="badge b-warn"><%= p.status %></span></td>
+          <td><%= new Date(p.created_at).toLocaleString() %></td>
+        </tr>
+        <% }) %>
+      </tbody>
+    </table>
+    </div>
+    <% } else { %><p class="muted">No pending requests.</p><% } %>
+  </div>
+</section>
