@@ -1,0 +1,35 @@
+<section class="wrap section narrow">
+  <div class="form-card">
+    <h1>Transfer to Player</h1>
+    <p class="muted">Move funds from your agent float to a player's wallet.</p>
+    <form action="/agent/transfer" method="POST">
+      <input type="hidden" name="_csrf" value="<%= csrf %>">
+      <div class="field">
+        <label for="to_user_id">Player</label>
+        <select id="to_user_id" name="to_user_id" required>
+          <% (players || []).forEach(function(p){ %>
+          <option value="<%= p.id %>"><%= p.name %></option>
+          <% }) %>
+        </select>
+      </div>
+      <div class="field">
+        <label for="currency">Currency</label>
+        <select id="currency" name="currency" required>
+          <% (floats || []).forEach(function(f){ %>
+          <option value="<%= f.currency %>"><%= f.currency %> &middot; <%= fmt(f.balance, f.currency) %></option>
+          <% }) %>
+        </select>
+      </div>
+      <div class="field">
+        <label for="amount">Amount (minor units)</label>
+        <input type="number" id="amount" name="amount" min="1" required>
+      </div>
+      <div class="field">
+        <label for="note">Note (optional)</label>
+        <input type="text" id="note" name="note" maxlength="140">
+      </div>
+      <button type="submit" class="btn btn-p btn-lg btn-block" data-confirm="Confirm this transfer?">Send Transfer</button>
+    </form>
+    <p class="mt"><a href="/agent">&larr; Back to dashboard</a></p>
+  </div>
+</section>
