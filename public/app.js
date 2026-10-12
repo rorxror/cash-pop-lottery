@@ -133,6 +133,11 @@
       try { localStorage.setItem(KEY, '1'); } catch (e) {}
       banner.setAttribute('hidden', '');
     });
+    var noBtn = document.getElementById('cookie-no');
+    if (noBtn) noBtn.addEventListener('click', function () {
+      try { localStorage.setItem(KEY, '0'); } catch (e) {}
+      banner.setAttribute('hidden', '');
+    });
   }
 
   /* ---------- (d) Deposit / withdraw charge preview ---------- */
