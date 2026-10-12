@@ -51,6 +51,17 @@ async function boot() {
   app.set('view engine', 'ejs');
   app.set('views', path.join(__dirname, 'views'));
 
+  // Cache-busting version for static assets: hash of the files at boot.
+  // Any change to app.js/style.css produces a new ?v= so browsers never
+  // serve stale JS/CSS after a deploy.
+  try {
+    const h = require('node:crypto').createHash('sha1');
+    for (const f of ['public/app.js', 'public/style.css']) {
+      h.update(fs.readFileSync(path.join(__dirname, f)));
+    }
+    app.locals.assetV = h.digest('hex').slice(0, 8);
+  } catch { app.locals.assetV = String(Date.now()); }
+
   // security headers (CSP intentionally omitted: views use inline handlers)
   app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
