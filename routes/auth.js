@@ -193,12 +193,12 @@ router.post('/register', rateLimit({ windowMs: 3600000, max: 20, keyFn: r => 're
   const capExt = await getExtension(req.db, 'custom_captcha');
   if (extEnabled(capExt) && !checkCaptcha(req)) return render('Wrong answer to the security check.');
 
-  const { name, email, phone, password, password2, otp_code, agree } = req.body;
+  const { name, email, phone, password, password_confirm, otp_code, agree } = req.body;
   if (!name || name.trim().length < 2) return render('Please enter your name.');
   if (!validEmail(email)) return render('Please enter a valid email.');
   const pwErr = strongPassword(password, getBool(req.settings, 'secure_password', true));
   if (pwErr) return render(pwErr);
-  if (password !== password2) return render('Passwords do not match.');
+  if (password !== password_confirm) return render('Passwords do not match.');
   if (getBool(req.settings, 'policy_agreement', true) && !agree) return render('You must accept the terms to register.');
 
   if (getBool(req.settings, 'otp_registration', false)) {
