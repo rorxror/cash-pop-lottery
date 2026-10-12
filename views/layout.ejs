@@ -5,8 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title><%= metaTitle ? metaTitle : siteName %> | <%= siteName %></title>
 <meta name="description" content="<%= S('metaDesc') %>">
-<link rel="stylesheet" href="/style.css">
-<script src="/app.js" defer></script>
+<link rel="stylesheet" href="/style.css?v=<%= assetV %>">
+<script src="/app.js?v=<%= assetV %>" defer></script>
 <% if (S('custom_css')) { %><style><%- S('custom_css') %></style><% } %>
 <% if (extOn('google_analytics') && extCfg('google_analytics') && extCfg('google_analytics').tracking_id) { %>
 <script async src="https://www.googletagmanager.com/gtag/js?id=<%= extCfg('google_analytics').tracking_id %>"></script>
