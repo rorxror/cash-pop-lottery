@@ -1,0 +1,28 @@
+<section class="wrap section">
+  <h1 class="sec-title">Transactions</h1>
+  <div class="filters">
+    <a class="btn btn-sm <%= (typeof filterType === 'undefined' || filterType === 'all') ? 'btn-p' : 'btn-g' %>" href="/transactions?type=all">All</a>
+    <a class="btn btn-sm <%= filterType === 'credit' ? 'btn-p' : 'btn-g' %>" href="/transactions?type=credit">Credits</a>
+    <a class="btn btn-sm <%= filterType === 'debit' ? 'btn-p' : 'btn-g' %>" href="/transactions?type=debit">Debits</a>
+  </div>
+  <div class="card mt">
+    <% if (txs && txs.length) { %>
+    <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr><th>Date</th><th>Type</th><th>Reference</th><th>Amount</th><th>Balance after</th></tr></thead>
+      <tbody>
+        <% txs.forEach(function(t){ %>
+        <tr>
+          <td><%= new Date(t.created_at).toLocaleString() %></td>
+          <td><%= t.type %></td>
+          <td><span class="code"><%= t.ref %></span></td>
+          <td class="<%= t.amount >= 0 ? 'pos' : 'neg' %>"><%= (t.amount >= 0 ? '+' : '&minus;') + fmt(Math.abs(t.amount), t.currency) %></td>
+          <td><%= fmt(t.balance_after, t.currency) %></td>
+        </tr>
+        <% }) %>
+      </tbody>
+    </table>
+    </div>
+    <% } else { %><p class="muted">No transactions yet.</p><% } %>
+  </div>
+</section>

@@ -1,0 +1,71 @@
+<section class="wrap section">
+  <h1 class="sec-title">Play &mdash; Build Your Slip</h1>
+  <form action="/play/buy" method="POST" id="playForm" class="play-grid" data-cur="<%= cur %>">
+    <input type="hidden" name="_csrf" value="<%= csrf %>">
+    <script type="application/json" id="prizeData"><%- JSON.stringify(prizeTable || []) %></script>
+    <div class="card pslip-card">
+      <div class="card-h"><h2>1. Pick your pops (1&ndash;15)</h2></div>
+      <div class="balls" id="ballBox">
+        <% for (let i=1; i<=15; i++) { %>
+        <label class="ball-wrap"><input type="checkbox" name="pops" value="<%= i %>" class="ball-input"><span class="ball"><%= i %></span></label>
+        <% } %>
+      </div>
+      <div class="ball-actions">
+        <button type="button" class="btn btn-g btn-sm" id="quickPick">Quick Pick</button>
+        <button type="button" class="btn btn-g btn-sm" id="coverAll">Cover All</button>
+        <button type="button" class="btn btn-g btn-sm" id="clearBalls">Clear</button>
+      </div>
+      <p class="muted"><span id="popCount">0</span> pops selected</p>
+    </div>
+
+    <div class="card">
+      <div class="card-h"><h2>2. Wager per pop</h2></div>
+      <div class="field">
+        <select name="wager" id="wagerSel" required>
+          <% wagerOptions.forEach(function(w){ %>
+          <option value="<%= w %>"><%= fmt(w, cur) %></option>
+          <% }) %>
+        </select>
+      </div>
+      <div class="card-h mt"><h2>3. Draw type</h2></div>
+      <div class="field radios">
+        <label><input type="radio" name="draw_type" value="DAY" checked> Day</label>
+        <label><input type="radio" name="draw_type" value="EVE" checked> Evening</label>
+        <label><input type="radio" name="draw_type" value="BOTH"> Both (Day + Evening)</label>
+      </div>
+      <p class="muted note">BOTH = your pops are entered into the Day draw and the Evening draw each day.</p>
+      <div class="card-h mt"><h2>4. Number of draws</h2></div>
+      <div class="field">
+        <select name="num_draws" id="numDrawsSel">
+          <% for (let n=1; n<=maxDraws; n++) { %><option value="<%= n %>"><%= n %> draw<%= n>1?'s':'' %></option><% } %>
+        </select>
+      </div>
+      <% if (prizeTable && prizeTable.length) { %>
+      <div class="card-h mt"><h2>Prize multipliers</h2></div>
+      <div class="tbl-wrap">
+      <table class="tbl tbl-sm">
+        <thead><tr><th>Pops</th><th>Multiplier</th></tr></thead>
+        <tbody>
+          <% prizeTable.forEach(function(p){ %>
+          <tr><td><%= p.pops %></td><td>&times;<%= p.mult %></td></tr>
+          <% }) %>
+        </tbody>
+      </table>
+      </div>
+      <% } %>
+    </div>
+
+    <div class="card" id="totalBox">
+      <div class="card-h"><h2>Your slip</h2></div>
+      <div id="slipBreakdown" class="slip-lines">
+        <div class="slip-line"><span>Pops</span><span id="slPops">0</span></div>
+        <div class="slip-line"><span>Wager each</span><span id="slWager"><%= fmt(wagerOptions[0], cur) %></span></div>
+        <div class="slip-line"><span>Draws</span><span id="slDraws">1 &times; Day</span></div>
+      </div>
+      <p class="muted" id="prizePreview"></p>
+      <div class="slip-total">Total: <span id="totalAmt"><%= fmt(0, cur) %></span></div>
+      <p class="muted">Wallet balance: <%= fmt(balance, cur) %></p>
+      <button type="submit" class="btn btn-p btn-lg btn-block" id="buyBtn">Buy Ticket &mdash; <span id="totalAmtBtn"><%= fmt(0, cur) %></span></button>
+    </div>
+  </form>
+</section>
