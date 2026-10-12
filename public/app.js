@@ -17,8 +17,6 @@
     var cur = form.getAttribute('data-cur') || 'USD';
     var ballBox = document.getElementById('ballBox');
     var inputs = Array.prototype.slice.call(ballBox.querySelectorAll('.ball-input'));
-    var wagerSel = document.getElementById('wagerSel');
-    var numDrawsSel = document.getElementById('numDrawsSel');
     var popCount = document.getElementById('popCount');
     var slPops = document.getElementById('slPops');
     var slWager = document.getElementById('slWager');
@@ -30,20 +28,23 @@
     try { prizeData = JSON.parse(document.getElementById('prizeData').textContent || '[]'); } catch (e) { prizeData = []; }
 
     function selectedPops() { return inputs.filter(function (i) { return i.checked; }); }
-    function drawType() {
-      var r = form.querySelector('input[name="draw_type"]:checked');
-      return r ? r.value : 'DAY';
+    function checkedVal(name, dflt) {
+      var r = form.querySelector('input[name="' + name + '"]:checked');
+      return r ? r.value : dflt;
     }
+    function drawType() { return checkedVal('draw_type', 'DAY'); }
+    function wagerVal() { return Number(checkedVal('wager', '0')) || 0; }
+    function drawsVal() { return Number(checkedVal('num_draws', '1')) || 1; }
     function multFor(pops) {
       for (var i = 0; i < prizeData.length; i++) {
-        if (Number(prizeData[i].pops) === pops) return Number(prizeData[i].mult);
+        if (Number(prizeData[i].pops_count) === pops) return Number(prizeData[i].multiplier);
       }
       return 0;
     }
     function recalc() {
       var pops = selectedPops().length;
-      var wager = Number(wagerSel.value) || 0;
-      var draws = Number(numDrawsSel.value) || 1;
+      var wager = wagerVal();
+      var draws = drawsVal();
       var dt = drawType();
       var mult = dt === 'BOTH' ? 2 : 1;
       var total = pops * wager * draws * mult;
@@ -73,10 +74,8 @@
       recalc();
     }
     ballBox.addEventListener('change', recalc);
-    wagerSel.addEventListener('change', recalc);
-    numDrawsSel.addEventListener('change', recalc);
     form.addEventListener('change', function (e) {
-      if (e.target && e.target.name === 'draw_type') recalc();
+      if (e.target && (e.target.name === 'draw_type' || e.target.name === 'wager' || e.target.name === 'num_draws')) recalc();
     });
     document.getElementById('quickPick').addEventListener('click', function () { pickRandom(5); });
     document.getElementById('coverAll').addEventListener('click', function () {

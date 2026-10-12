@@ -283,7 +283,75 @@ img, video, iframe, embed { max-width: 100%; height: auto; }
 .ball-actions { display: flex; gap: var(--sp-2); flex-wrap: wrap; margin-bottom: var(--sp-3); }
 
 .pslip-card { text-align: center; }
-.play-grid { display: grid; grid-template-columns: 1.2fr 1fr 0.9fr; gap: var(--sp-5); align-items: start; }
+.play-grid { display: grid; grid-template-columns: 1.6fr 1fr; gap: var(--sp-5); align-items: start; }
+@media (max-width: 900px) { .play-grid { grid-template-columns: 1fr; } }
+
+/* ---------- Paper-slip style steps ---------- */
+.pslip { display: flex; flex-direction: column; gap: var(--sp-5); }
+.pstep {
+  background: var(--card-dark); border: 1px solid var(--line-dark);
+  border-radius: var(--r-lg); overflow: hidden;
+}
+.pstep-banner {
+  display: flex; align-items: center; gap: var(--sp-3);
+  background: linear-gradient(135deg, var(--gold), var(--gold-2));
+  color: var(--navy-900); font-weight: 800; font-size: var(--fs-md);
+  letter-spacing: 0.04em; text-transform: uppercase;
+  padding: var(--sp-3) var(--sp-4);
+}
+.pstep-banner.prize-banner { background: linear-gradient(135deg, #e5484d, #c81e3a); color: #fff; }
+.pstep-num {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 34px; height: 34px; flex: none; border-radius: 50%;
+  background: var(--navy-900); color: var(--gold-2);
+  font-size: var(--fs-md); font-weight: 800;
+}
+.prize-banner .pstep-num { background: #fff; color: #c81e3a; }
+.pstep-sub { padding: var(--sp-3) var(--sp-4) 0; color: var(--muted); font-size: var(--fs-sm); }
+.pstep .balls { padding: 0 var(--sp-4); }
+.pstep .ball-actions { padding: 0 var(--sp-4); }
+.pstep .muted { padding: 0 var(--sp-4); }
+.pstep .note { padding: 0 var(--sp-4) var(--sp-4); }
+.pstep .tbl-wrap { margin: 0 var(--sp-4) var(--sp-4); }
+
+/* Circular option selectors (wager / draw / draws) */
+.circle-row-label {
+  padding: var(--sp-3) var(--sp-4) 0; color: var(--muted);
+  font-size: var(--fs-xs); font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em;
+}
+.wager-circles, .draw-circles {
+  display: flex; flex-wrap: wrap; gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4) var(--sp-4);
+}
+.circle-wrap { cursor: pointer; display: block; }
+.circle-input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.circle-ball {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 64px; height: 64px; padding: 0 var(--sp-3); border-radius: 999px;
+  background: var(--navy-800); border: 2px solid var(--line-dark);
+  color: var(--white); font-size: var(--fs-md); font-weight: 800;
+  transition: transform 0.12s ease, box-shadow 0.12s ease, background 0.12s ease;
+  user-select: none; white-space: nowrap;
+}
+.draw-ball { min-width: 76px; }
+.num-ball { min-width: 56px; height: 56px; }
+.circle-wrap:hover .circle-ball { border-color: var(--gold-border); transform: scale(1.05); }
+.circle-input:checked + .circle-ball {
+  background: linear-gradient(135deg, var(--gold), var(--gold-2));
+  color: var(--navy-900); border-color: var(--gold-2); box-shadow: var(--glow-gold);
+}
+.circle-input:focus-visible + .circle-ball { box-shadow: var(--glow-gold); }
+
+/* Slip summary card (red total-cost panel style) */
+.slip-card { border-top: 4px solid var(--gold); }
+.slip-card .card-h { display: flex; align-items: center; justify-content: space-between; }
+.slip-total {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: var(--fs-lg); font-weight: 800; color: var(--gold-2);
+  background: rgba(229, 72, 77, 0.08); border: 1px solid rgba(229, 72, 77, 0.35);
+  border-radius: var(--r-md); padding: var(--sp-3) var(--sp-4); margin: var(--sp-4) 0;
+}
+.prize-tbl td:nth-child(2), .prize-tbl td:nth-child(3) { color: var(--gold-2); font-weight: 700; }
 .slip-lines { display: flex; flex-direction: column; gap: var(--sp-3); margin-bottom: var(--sp-4); }
 .slip-line { display: flex; justify-content: space-between; align-items: center; gap: var(--sp-3); font-size: var(--fs-sm); padding-bottom: var(--sp-2); border-bottom: 1px dashed var(--line-dark); }
 .slip-line span:first-child { color: var(--muted); }
