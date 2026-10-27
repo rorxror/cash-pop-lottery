@@ -66,7 +66,42 @@ async function boot() {
         );
         console.log(`[boot] no admin found — seeded configured admin ${seedEmail}`);
       } else {
-        console.log('[boot] no admin found — visit /setup or configure ADMIN_SEED_EMAIL and ADMIN_SEED_PASSWORD');
+        console.log('[boot] no admin found — configure ADMIN_SEED_EMAIL and ADMIN_SEED_PASSWORD (public /setup is disabled by default; set ALLOW_SETUP=1 only to enable it temporarily)');
+      }
+    }
+  }
+
+  // Self-healing scratch: a fresh DB (e.g. Render free-tier wipe) ships only
+  // DRAFT template series, so the lobby shows "No scratch series on sale"
+  // and nothing is buyable. Seed one honest default series only when NO
+  // live+enabled series exists — and never re-create it: if Gold Rush already
+  // exists (e.g. the operator stopped it), that choice is respected so a
+  // restart can never crash on the slug UNIQUE constraint or override the
+  // operator. Same 75% RTP math as the demo series: $1 ticket, 100 tickets,
+  // prizes 1x$10 + 5x$5 + 20x$2 = $75 pool. Outcomes committed via launchSeries.
+  {
+    const { launchSeries } = require('./lib/scratch');
+    const { randHex, sha256 } = require('./lib/util');
+    const live = await db.get(`SELECT COUNT(*) AS c FROM scratch_series WHERE status='live' AND enabled=1`);
+    if (!live || Number(live.c) === 0) {
+      const existing = await db.get(`SELECT id FROM scratch_series WHERE slug='gold-rush'`);
+      if (existing) {
+        console.log('[boot] no live scratch series, but Gold Rush already exists — leaving operator choice untouched');
+      } else {
+        const seed = randHex(32);
+        const r = await db.run(
+          `INSERT INTO scratch_series (title,slug,game_type,currency,price,total_tickets,status,enabled,rules,server_seed,seed_hash,created_by,created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          ['Gold Rush', 'gold-rush', 'single', 'USD', 100, 100, 'draft', 0,
+           'Scratch to reveal your prize instantly. Prizes are locked before sale and verifiable after reveal.',
+           seed, sha256(seed), 0, now()]
+        );
+        const tiers = [[1000, 1, 'Jackpot'], [500, 5, 'Big win'], [200, 20, 'Win']];
+        for (const [amount, qty, label] of tiers) {
+          await db.run('INSERT INTO scratch_prize_tiers (series_id,amount,quantity,label) VALUES (?,?,?,?)', [r.id, amount, qty, label]);
+        }
+        await launchSeries(db, r.id, 0);
+        console.log('[boot] no live scratch series — seeded default live series Gold Rush ($1, 100 tickets, 75% RTP)');
       }
     }
   }
@@ -266,7 +301,7 @@ async function boot() {
   const port = parseInt(process.env.PORT || '3000', 10);
   app.listen(port, () => {
     console.log(`[app] listening on :${port} — admin at ${ADMIN_PATH}`);
-    console.log('[app] first run? visit /setup to create the admin account');
+    console.log('[app] first run? set ADMIN_SEED_EMAIL/ADMIN_SEED_PASSWORD to create the admin account (public /setup is disabled by default)');
   });
 
   cron.start({ db, driver });

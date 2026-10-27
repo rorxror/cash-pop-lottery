@@ -12,6 +12,18 @@ async function adminExists(db) {
   return !!r;
 }
 
+// SECURITY: the setup wizard is DISABLED by default. A public /setup page
+// means anyone who visits first can claim the admin account — that is how
+// a fresh deploy gets hijacked. Enable it only intentionally, for one admin
+// creation, with ALLOW_SETUP=1 (operator env var), then turn it off again.
+// The secure production path is ADMIN_SEED_EMAIL / ADMIN_SEED_PASSWORD.
+// NOTE: this router is mounted at '/', so the gate MUST be scoped to the
+// /setup path — an unscoped router.use here would 404 the whole site.
+router.use('/setup', (req, res, next) => {
+  if (process.env.ALLOW_SETUP !== '1') return res.status(404).render('error', { status: 404, message: 'Setup is disabled.' });
+  next();
+});
+
 router.get('/setup', async (req, res) => {
   if (await adminExists(req.db)) return res.status(404).render('error', { status: 404, message: 'Setup is disabled.' });
   res.render('setup', { metaTitle: 'Setup', metaDesc: 'First-run setup' });

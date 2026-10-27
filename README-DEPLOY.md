@@ -26,8 +26,10 @@ dependencies only (no native modules), SQLite built in, MySQL optional.
      `RECAPTCHA_SITE_KEY`, `SMTP_*`, `TWILIO_*`
 5. Make sure the `data/` directory is writable by the app (SQLite file
    lives at `data/cashpop.sqlite`; created automatically on first boot).
-6. **Start** the app. Visit `https://yourdomain.com/setup` once to create
-   the admin account. The setup page disables itself permanently after.
+6. **Start** the app with `ADMIN_SEED_EMAIL` and `ADMIN_SEED_PASSWORD`
+   set to create the admin account. The public `/setup` page is disabled
+   by default (it would let anyone claim admin); enable it only briefly
+   with `ALLOW_SETUP=1` if you ever need the wizard, then turn it off.
 7. Log in and open your hidden admin path. Enable a payment method
    (Admin → Payment Methods), review Settings → Game economy, and configure
    Scratch Series at `<ADMIN_PATH>/scratch` before going live.
