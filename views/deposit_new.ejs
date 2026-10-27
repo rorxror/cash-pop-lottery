@@ -1,0 +1,42 @@
+<section class="wrap section">
+  <h1 class="sec-title">New Deposit</h1>
+  <div class="grid2">
+    <div class="card">
+      <div class="card-h"><h2>Payment method</h2></div>
+      <ul class="method-list">
+        <% (methods || []).forEach(function(m){ %>
+        <li class="<%= method && method.id === m.id ? 'sel' : '' %>">
+          <span class="method-name"><%= m.name %></span>
+          <a class="btn <%= method && method.id === m.id ? 'btn-p' : 'btn-g' %> btn-sm" href="/deposit/new?m=<%= m.id %>">Select</a>
+        </li>
+        <% }) %>
+      </ul>
+    </div>
+    <div class="card">
+      <% if (method) { %>
+      <div class="card-h"><h2><%= method.name %></h2></div>
+      <div class="instruction"><%- content('deposit_instruction_' + method.id) %><p class="muted pre"><%= method.instruction %></p></div>
+      <form action="/deposit/new" method="POST" id="depositForm">
+        <input type="hidden" name="_csrf" value="<%= csrf %>">
+        <input type="hidden" name="method_id" value="<%= method.id %>">
+        <div class="field">
+          <label for="depAmount">Amount (<%= method.currency %>)</label>
+          <input type="number" id="depAmount" name="amount" min="<%= method.min %>" max="<%= method.max %>" required
+                 data-fixed="<%= method.fixed_charge %>" data-percent="<%= method.percent_charge %>" data-currency="<%= method.currency %>">
+          <small class="muted">Min <%= fmt(method.min, method.currency) %> &middot; Max <%= fmt(method.max, method.currency) %></small>
+        </div>
+        <p class="muted" id="chargePreview"></p>
+        <% (method.custom_fields || []).forEach(function(f){ %>
+        <div class="field">
+          <label for="cf_<%= f.key %>"><%= f.label %><%= f.required ? ' *' : '' %></label>
+          <input type="text" id="cf_<%= f.key %>" name="custom_<%= f.key %>" <%= f.required ? 'required' : '' %>>
+        </div>
+        <% }) %>
+        <button type="submit" class="btn btn-p btn-lg btn-block">Submit Deposit</button>
+      </form>
+      <% } else { %>
+      <p class="muted">Select a payment method to continue.</p>
+      <% } %>
+    </div>
+  </div>
+</section>

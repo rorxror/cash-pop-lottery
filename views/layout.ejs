@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title><%= metaTitle ? metaTitle : siteName %> | <%= siteName %></title>
+<meta name="description" content="<%= S('metaDesc') %>">
+<link rel="stylesheet" href="/style.css?v=<%= assetV %>">
+<script src="/app.js?v=<%= assetV %>" defer></script>
+<% if (S('custom_css')) { %><style><%- S('custom_css') %></style><% } %>
+<% if (extOn('google_analytics') && extCfg('google_analytics') && extCfg('google_analytics').tracking_id) { %>
+<script async src="https://www.googletagmanager.com/gtag/js?id=<%= extCfg('google_analytics').tracking_id %>"></script>
+<script>
+window.dataLayer = window.dataLayer || [];
+function gtag(){ dataLayer.push(arguments); }
+gtag('js', new Date());
+gtag('config', '<%= extCfg('google_analytics').tracking_id %>');
+</script>
+<% } %>
+<% if (extOn('fb_comments')) { %>
+<div id="fb-root"></div>
+<script async defer crossorigin="anonymous" src="https://connect.facebook.net/en_US/sdk.js#xfbml=1&version=v21.0"></script>
+<% } %>
+</head>
+<body>
+<% if (typeof impersonating !== 'undefined' && impersonating) { %>
+<div class="impersonate-bar">Staff view &mdash; acting as <%= user.name %> (admin: <%= impersonatorName %>)</div>
+<% } %>
+<header class="site-head">
+  <div class="wrap head-in">
+    <a class="logo" href="/"><%= siteName %></a>
+    <button class="nav-toggle" id="navToggle" aria-label="Toggle menu" aria-expanded="false">&#9776;</button>
+    <nav class="main-nav" id="mainNav">
+      <a href="/" class="<%= S('currentPath')==='/' ? 'active' : '' %>">Home</a>
+      <a href="/play" class="<%= S('currentPath')==='/play' ? 'active' : '' %>">Play</a>
+      <a href="/scratch" class="<%= String(S('currentPath')).startsWith('/scratch') ? 'active' : '' %>">Scratch</a>
+      <a href="/results" class="<%= S('currentPath')==='/results' ? 'active' : '' %>">Results</a>
+      <a href="/fairness" class="<%= S('currentPath')==='/fairness' ? 'active' : '' %>">Fairness</a>
+      <a href="/page/how-it-works">How It Works</a>
+      <a href="/page/faq">FAQ</a>
+      <a href="/support">Support</a>
+    </nav>
+    <div class="head-right">
+      <details class="cur-picker">
+        <summary class="cur-pill" aria-label="Display currency">
+          <span class="cur-code"><%= cur %></span>
+          <% if (user) { %><span class="cur-bal"><%= fmt(walletBal(cur), cur) %></span><% } %>
+          <span class="cur-caret">&#9662;</span>
+        </summary>
+        <div class="cur-menu" role="menu">
+          <div class="cur-menu-title">Display currency</div>
+          <% (typeof currencies !== 'undefined' ? currencies : []).forEach(function(c){ %>
+          <form action="/currency" method="POST" role="none">
+            <input type="hidden" name="_csrf" value="<%= csrf %>">
+            <input type="hidden" name="code" value="<%= c.code %>">
+            <button type="submit" class="cur-item<%= c.code===cur ? ' sel' : '' %>" role="menuitem">
+              <span class="cur-item-code"><%= c.code %></span>
+              <% if (user) { %><span class="cur-item-bal"><%= fmt(walletBal(c.code), c.code) %></span><% } %>
+              <% if (c.code===cur) { %><span class="cur-check">&#10003;</span><% } %>
+            </button>
+          </form>
+          <% }) %>
+        </div>
+      </details>
+      <% if (user) { %>
+      <div class="user-menu" id="userMenu">
+        <button class="balance-pill" id="userMenuBtn" aria-haspopup="true" aria-expanded="false">
+          <span class="ubal"><%= fmt(walletBal(cur), cur) %></span>
+          <span class="uname"><%= user.name %></span>
+          <span class="caret">&#9662;</span>
+        </button>
+        <div class="user-menu-links">
+          <a href="/tickets">My Cash Pop Tickets</a>
+          <a href="/scratch/my-tickets">My Scratch Tickets</a>
+          <a href="/wallet">Wallet</a>
+          <a href="/transactions">Transactions</a>
+          <a href="/profile">Profile</a>
+          <a href="/security">Security</a>
+          <a href="/support">Support</a>
+          <% if (typeof isAgent !== 'undefined' && isAgent) { %><a href="/agent">Agent Panel</a><% } %>
+          <form action="/logout" method="POST"><input type="hidden" name="_csrf" value="<%= csrf %>"><button type="submit" class="link-btn">Logout</button></form>
+        </div>
+      </div>
+      <% } else { %>
+      <a class="btn btn-g btn-sm" href="/login">Login</a>
+      <a class="btn btn-p btn-sm" href="/register">Register</a>
+      <% } %>
+    </div>
+  </div>
+</header>
+
+<% if (typeof flash !== 'undefined' && flash && (flash.error || flash.success)) { %>
+<div class="wrap flash-wrap">
+  <% if (flash.error) { %><div class="flash f-err" role="alert"><%= flash.error %></div><% } %>
+  <% if (flash.success) { %><div class="flash f-ok" role="alert"><%= flash.success %></div><% } %>
+</div>
+<% } %>
+
+<main>
+<%- body %>
+</main>
+
+<footer class="site-foot">
+  <div class="wrap foot-grid">
+    <div class="foot-col"><%- content('footer_about') %></div>
+    <div class="foot-col">
+      <h4>Quick Links</h4>
+      <ul>
+        <% (typeof footerPages !== 'undefined' ? footerPages : []).forEach(function(p){ %>
+        <li><a href="/page/<%= p.slug %>"><%= p.title %></a></li>
+        <% }) %>
+        <li><a href="/results">Results</a></li>
+        <li><a href="/fairness">Fairness</a></li>
+        <li><a href="/support">Support</a></li>
+      </ul>
+    </div>
+    <div class="foot-col"><%- content('footer_contact') %></div>
+  </div>
+  <div class="foot-bar">
+    <div class="wrap foot-bar-in">
+      <span>&copy; <%= new Date().getFullYear() %> <%= siteName %>. All rights reserved.</span>
+      <span>18+ only &middot; Play responsibly</span>
+    </div>
+  </div>
+</footer>
+
+<% if (S('cookie_consent_enabled')==='1') { %>
+<div id="cookie-banner" hidden>
+  <p><%= S('cookie_text') %></p>
+  <button id="cookie-ok" class="btn btn-p btn-sm">Accept</button>
+  <button id="cookie-no" class="btn btn-g btn-sm">Necessary only</button>
+</div>
+<% } %>
+
+<% if (extOn('tawkto') && extCfg('tawkto') && extCfg('tawkto').embed_code) { %>
+<%- extCfg('tawkto').embed_code %>
+<% } %>
+</body>
+</html>

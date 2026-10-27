@@ -1,0 +1,9 @@
+<section class="wrap section">
+  <article class="card cms-page">
+    <h1><%= pg.title %></h1>
+    <div class="cms-body"><%- pg.body %></div>
+    <% if (extOn('fb_comments')) { %>
+    <div class="fb-comments" data-href="<%= typeof canonical !== 'undefined' ? canonical : '' %>" data-width="100%"></div>
+    <% } %>
+  </article>
+</section>

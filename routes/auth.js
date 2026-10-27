@@ -1,0 +1,459 @@
+'use strict';
+/* Authentication: login (+TOTP challenge), OTP-gated registration,
+   logout, password reset, Google OAuth, custom captcha + reCAPTCHA hooks. */
+const express = require('express');
+const router = express.Router();
+const { validEmail, hashPassword, verifyPassword, sha256, randHex, now, strongPassword } = require('../lib/util');
+const { getS, getBool, getCurrencies } = require('../lib/settings');
+const { createSession, getSession, destroySession, rateLimit, verifyTotp, useBackupCode, parseUA, csrfToken, touchSession } = require('../lib/auth');
+const { getExtension, extEnabled } = require('../lib/extensions');
+const notify = require('../lib/notify');
+const otpLib = require('../lib/otp');
+const audit = require('../lib/audit');
+
+/* ---------- custom captcha (math question, session-stored) ---------- */
+async function anonSession(req, res) {
+  // logged-out forms (login/register captcha, CSRF) need a session to persist
+  if (req.sess) return;
+  const sid = await createSession(req.db, 0, { ip: req.ip, ua: req.headers['user-agent'] || '' });
+  res.cookie('sid', sid, { httpOnly: true, sameSite: 'lax', maxAge: 3600000 });
+  const sess = await getSession(req.db, sid);
+  req.sess = sess; req.sessionData = sess ? sess.data : {};
+  req.csrfToken = csrfToken(req.sessionData);
+  await touchSession(req.db, sid, { _csrf: req.sessionData._csrf });
+}
+function newCaptcha(req) {
+  const a = 2 + Math.floor(Math.random() * 7), b = 2 + Math.floor(Math.random() * 7);
+  req.sessionData._captcha = sha256('captcha:' + (a + b) + ':' + (req.sess ? req.sess.id : 'anon'));
+  req.sessionData._captcha_n = 1;
+  if (req.sess) { const { touchSession } = require('../lib/auth'); touchSession(req.db, req.sess.id, { _captcha: req.sessionData._captcha }); }
+  return `<div class="field captcha"><label>Security check: what is ${a} + ${b}?</label><input type="text" name="captcha_answer" autocomplete="off" required></div>`;
+}
+function checkCaptcha(req) {
+  const ans = String(req.body.captcha_answer || '').trim();
+  const ok = req.sessionData._captcha === sha256('captcha:' + ans + ':' + (req.sess ? req.sess.id : 'anon'));
+  req.sessionData._captcha = null;
+  return ok;
+}
+async function captchaHtml(req) {
+  const ext = await getExtension(req.db, 'custom_captcha');
+  return extEnabled(ext) ? newCaptcha(req) : '';
+}
+async function recaptchaHtml(req) {
+  const ext = await getExtension(req.db, 'recaptcha');
+  if (!extEnabled(ext) || !ext.config.site_key) return '';
+  return `<div class="g-recaptcha" data-sitekey="${ext.config.site_key}"></div><script src="https://www.google.com/recaptcha/api.js" async defer></script>`;
+}
+async function checkRecaptcha(req) {
+  const ext = await getExtension(req.db, 'recaptcha');
+  if (!extEnabled(ext) || !ext.config.secret_key) return true; // not configured => skip
+  const token = req.body['g-recaptcha-response'];
+  if (!token) return false;
+  try {
+    const r = await fetch('https://www.google.com/recaptcha/api/siteverify', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ secret: ext.config.secret_key, response: token, remoteip: req.ip }).toString(),
+    });
+    const j = await r.json();
+    return !!j.success;
+  } catch { return false; }
+}
+
+async function recordLogin(req, userId, email, success) {
+  const { browser, os } = parseUA(req.headers['user-agent']);
+  await req.db.run(
+    'INSERT INTO login_history (user_id, email, ip, country, browser, os, success, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    [userId, email, req.ip, '', browser, os, success ? 1 : 0, now()]);
+}
+
+/* ---------- login ---------- */
+router.get('/login', async (req, res) => {
+  if (req.user) return res.redirect('/');
+  const capExt = await getExtension(req.db, 'custom_captcha');
+  if (extEnabled(capExt)) await anonSession(req, res);
+  res.render('login', {
+    phoneCountries: require('../lib/phone-countries').allowedCountries(req.settings),
+    metaTitle: 'Sign In', metaDesc: 'Sign in to your account.',
+    totpRequired: false, emailPrefill: '',
+    captchaHtml: await captchaHtml(req), recaptchaHtml: await recaptchaHtml(req),
+    googleOn: getBool(req.settings, 'google_oauth_enabled', false) && !!process.env.GOOGLE_CLIENT_ID,
+    facebookOn: getBool(req.settings, 'facebook_oauth_enabled', false) && !!process.env.FACEBOOK_APP_ID,
+    phoneOtpOn: getBool(req.settings, 'phone_otp_enabled', true),
+    emailOtpOn: getBool(req.settings, 'email_otp_enabled', true),
+    passwordOn: getBool(req.settings, 'password_login_enabled', false) || getBool(req.settings, 'phone_password_enabled', true) || getBool(req.settings, 'email_password_enabled', true),
+    phonePwOn: getBool(req.settings, 'phone_password_enabled', true),
+    emailPwOn: getBool(req.settings, 'email_password_enabled', true),
+  });
+});
+
+const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30, keyFn: r => 'login:' + r.ip });
+
+router.post('/login', loginLimiter, async (req, res) => {
+  const render = async (vars = {}) => res.render('login', {
+    metaTitle: 'Sign In', metaDesc: 'Sign in to your account.',
+    totpRequired: false, emailPrefill: req.body.email || '',
+    captchaHtml: await captchaHtml(req), recaptchaHtml: await recaptchaHtml(req),
+    googleOn: getBool(req.settings, 'google_oauth_enabled', false) && !!process.env.GOOGLE_CLIENT_ID,
+    formError: vars.formError,
+  });
+  if (!(await checkRecaptcha(req))) return render({ formError: 'Captcha verification failed.' });
+  const capExt = await getExtension(req.db, 'custom_captcha');
+  if (extEnabled(capExt) && !checkCaptcha(req)) return render({ formError: 'Wrong answer to the security check.' });
+
+  // TOTP challenge step
+  if (req.body.totp_code && req.sessionData.pending_user_id) {
+    const u = await req.db.get('SELECT * FROM users WHERE id = ?', [req.sessionData.pending_user_id]);
+    if (!u) return render({ formError: 'Session expired. Please sign in again.' });
+    let ok = verifyTotp(u.totp_secret, req.body.totp_code);
+    let usedBackup = false;
+    if (!ok && u.backup_codes) {
+      const remaining = useBackupCode(u.backup_codes, req.body.totp_code);
+      if (remaining !== null) { await req.db.run('UPDATE users SET backup_codes = ? WHERE id = ?', [remaining, u.id]); ok = true; usedBackup = true; }
+    }
+    if (!ok) { await recordLogin(req, u.id, u.email, false); return render({ formError: 'Invalid authenticator code.' });
+    }
+    const { touchSession } = require('../lib/auth');
+    await touchSession(req.db, req.sess.id, { pending_user_id: null });
+    return finishLogin(req, res, u);
+  }
+
+  // Sign In (returning players only): email/phone + password. Registration is separate
+  // (/register collects full details) — a password sign-in never auto-creates an account.
+  const isJson = (req.headers['content-type'] || '').includes('application/json');
+  const jsonErr = (msg) => isJson ? res.status(401).json({ error: msg }) : render({ formError: msg });
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const phone = String(req.body.phone || '').trim();
+  const identifier = email || phone;
+  let u = email
+    ? await req.db.get('SELECT * FROM users WHERE email = ?', [email])
+    : await req.db.get('SELECT * FROM users WHERE phone = ?', [phone]);
+  if (!u) {
+    await recordLogin(req, null, identifier, false);
+    return jsonErr('No account found with this ' + (email ? 'email' : 'phone') + '. Please register first.');
+  }
+  if (!u.password_hash || !verifyPassword(req.body.password || '', u.password_hash)) {
+    await recordLogin(req, null, identifier, false);
+    return jsonErr('Invalid credentials. Please try again.');
+  }
+  if (u.status === 'banned') { await recordLogin(req, u.id, identifier, false); return jsonErr('This account has been blocked. Contact support.'); }
+  if (u.status === 'pending_review') { await recordLogin(req, u.id, identifier, false); return jsonErr('Your account is pending review.'); }
+
+  if (u.totp_secret) {
+    // stash pending auth; need a session to hold it — create temp session
+    const { touchSession } = require('../lib/auth');
+    let sess = req.sess;
+    if (!sess) {
+      const sid = await createSession(req.db, u.id, { ip: req.ip, ua: req.headers['user-agent'], extra: { pending_user_id: u.id, pre_auth: true } });
+      res.cookie('sid', sid, { httpOnly: true, sameSite: 'lax', secure: req.secure || getBool(req.settings, 'force_ssl', false), maxAge: 15 * 60 * 1000 });
+      return res.render('login', {
+        metaTitle: 'Two-Factor', metaDesc: '', totpRequired: true, emailPrefill: email,
+        captchaHtml: '', recaptchaHtml: '', googleOn: false,
+      });
+    }
+    await touchSession(req.db, sess.id, { pending_user_id: u.id, pre_auth: true });
+    return res.render('login', {
+      metaTitle: 'Two-Factor', metaDesc: '', totpRequired: true, emailPrefill: email,
+      captchaHtml: '', recaptchaHtml: '', googleOn: false,
+    });
+  }
+  await recordLogin(req, u.id, email, true);
+  return finishLogin(req, res, u);
+});
+
+async function finishLogin(req, res, u, welcomeMsg) {
+  // kill pre-auth flag if present
+  const extra = welcomeMsg ? { _flash: { type: 'success', msg: welcomeMsg } } : {};
+  const sid = await createSession(req.db, u.id, { ip: req.ip, ua: req.headers['user-agent'], extra });
+  if (req.sess) await destroySession(req.db, req.sess.id);
+  await req.db.run('UPDATE users SET last_login_at = ?, last_login_ip = ? WHERE id = ?', [now(), req.ip, u.id]);
+  res.cookie('sid', sid, { httpOnly: true, sameSite: 'lax', secure: req.secure || getBool(req.settings, 'force_ssl', false), maxAge: 7 * 24 * 3600 * 1000 });
+  const dest = u.role === 'admin' ? (req.adminPath || '/') : (u.role === 'agent' ? '/agent' : '/');
+  res.redirect(dest);
+}
+
+router.post('/logout', async (req, res) => {
+  if (req.sess) await destroySession(req.db, req.sess.id);
+  res.clearCookie('sid');
+  res.redirect('/');
+});
+
+/* ---------- registration (OTP-gated when enabled) ---------- */
+/* Separate Register page: full detail form upfront (name, email, phone, password, terms).
+   Register and Sign In are DIFFERENT screens by design — registration collects details,
+   sign-in is for returning players. No merged/OTP-first confusion. */
+router.get('/register', async (req, res) => {
+  if (!getBool(req.settings, 'registration_enabled', true))
+    return res.render('error', { status: 403, message: 'Registration is currently disabled.' });
+  if (req.user) return res.redirect('/');
+  const capExt2 = await getExtension(req.db, 'custom_captcha');
+  if (extEnabled(capExt2)) await anonSession(req, res);
+  const { allowedCountries } = require('../lib/phone-countries');
+  res.render('register', {
+    metaTitle: 'Create Account', metaDesc: 'Create your Cash Pop account.',
+    phoneCountries: allowedCountries(req.settings),
+    refCode: String(req.query.ref || '').trim().toUpperCase(),
+    otpEnabled: getBool(req.settings, 'otp_registration', false),
+    captchaHtml: await captchaHtml(req), recaptchaHtml: await recaptchaHtml(req),
+    googleOn: getBool(req.settings, 'google_oauth_enabled', false) && !!process.env.GOOGLE_CLIENT_ID,
+  });
+});
+
+async function consumeOtpCode(db, code) {
+  const rows = await db.query('SELECT * FROM otp_codes WHERE revoked = 0 AND (expires_at IS NULL OR expires_at > ?)', [now()]);
+  for (const r of rows) {
+    if (r.code_hash === sha256('otp:' + String(code).trim()) && r.uses < r.max_uses) {
+      await db.run('UPDATE otp_codes SET uses = uses + 1 WHERE id = ?', [r.id]);
+      return r;
+    }
+  }
+  return null;
+}
+
+router.post('/register', rateLimit({ windowMs: 3600000, max: 20, keyFn: r => 'reg:' + r.ip }), async (req, res) => {
+  const render = async (formError) => res.render('register', {
+    metaTitle: 'Create Account', metaDesc: '', formError,
+    otpEnabled: getBool(req.settings, 'otp_registration', false),
+    captchaHtml: await captchaHtml(req), recaptchaHtml: await recaptchaHtml(req), googleOn: false,
+  });
+  if (!getBool(req.settings, 'registration_enabled', true)) return res.render('error', { status: 403, message: 'Registration is currently disabled.' });
+  if (!(await checkRecaptcha(req))) return render('Captcha verification failed.');
+  const capExt = await getExtension(req.db, 'custom_captcha');
+  if (extEnabled(capExt) && !checkCaptcha(req)) return render('Wrong answer to the security check.');
+
+  const { name, email, password, password_confirm, otp_code, agree } = req.body;
+  // Phone = dial code + local number (combined client-side; recombine server-side as fallback)
+  let phone = String(req.body.phone || '').trim();
+  if (!phone && req.body.phone_cc && req.body.phone_local) {
+    const cc = String(req.body.phone_cc).replace(/\D/g, '');
+    const local = String(req.body.phone_local).replace(/\D/g, '');
+    if (cc && local) phone = '+' + cc + local;
+  }
+  // Admin-blocked countries are rejected server-side (dropdown also hides them)
+  if (phone) {
+    const { isBlockedPhone } = require('../lib/phone-countries');
+    if (isBlockedPhone(req.settings, phone)) return render('Phone numbers from this country are not accepted on this platform.');
+  }
+  if (!name || name.trim().length < 2) return render('Please enter your name.');
+  if (!validEmail(email)) return render('Please enter a valid email.');
+  const pwErr = strongPassword(password, getBool(req.settings, 'secure_password', true));
+  if (pwErr) return render(pwErr);
+  if (password !== password_confirm) return render('Passwords do not match.');
+  if (getBool(req.settings, 'policy_agreement', true) && !agree) return render('You must accept the terms to register.');
+
+  if (getBool(req.settings, 'otp_registration', false)) {
+    if (!otp_code || !(await consumeOtpCode(req.db, otp_code))) return render('Invalid or expired signup code. Ask the operator for a valid code.');
+  }
+
+  const emailLc = email.trim().toLowerCase();
+  const ex = await req.db.get('SELECT id FROM users WHERE email = ?', [emailLc]);
+  if (ex) return render('An account with this email already exists.');
+
+  // Referral: ?ref=CODE on the register link credits the referrer (ViserLab-style)
+  let referredBy = null;
+  const refCode = String(req.query.ref || req.body.ref || '').trim().toUpperCase();
+  if (refCode) {
+    const ref = await req.db.get('SELECT id FROM users WHERE referral_code = ?', [refCode]);
+    if (ref) referredBy = ref.id;
+  }
+  const r = await req.db.run(
+    'INSERT INTO users (email, phone, name, password_hash, role, status, referred_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    [emailLc, String(phone || '').trim(), name.trim(), hashPassword(password), 'player', 'active', referredBy, now()]);
+  // Referral code for the new player (used in their invite link)
+  await req.db.run('UPDATE users SET referral_code = ? WHERE id = ?', ['CP' + r.id.toString(36).toUpperCase(), r.id]);
+  const u = await req.db.get('SELECT * FROM users WHERE id = ?', [r.id]);
+  await audit.log(req.db, { actorId: u.id, actorRole: 'player', action: 'user.register', entity: 'user', entityId: u.id, detail: { email: emailLc }, ip: req.ip });
+  notify.send(req.db, req.settings, 'email', 'welcome', emailLc, { name: u.name }).catch(() => {});
+  await recordLogin(req, u.id, emailLc, true);
+  return finishLogin(req, res, u, 'Welcome, ' + u.name.split(' ')[0] + '! Your account is ready — good luck!');
+});
+
+/* ---------- forgot / reset password ---------- */
+router.get('/forgot', (req, res) => res.render('forgot', { metaTitle: 'Reset Password', metaDesc: '', sent: false }));
+router.post('/forgot', rateLimit({ windowMs: 3600000, max: 10, keyFn: r => 'forgot:' + r.ip }), async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const u = await req.db.get('SELECT * FROM users WHERE email = ?', [email]);
+  if (u) {
+    const token = randHex(24);
+    await req.db.run('INSERT INTO password_resets (user_id, token_hash, expires_at, used, created_at) VALUES (?, ?, ?, 0, ?)',
+      [u.id, sha256('reset:' + token), now() + 3600000, now()]);
+    const link = (process.env.BASE_URL || '') + '/reset/' + token;
+    await notify.send(req.db, req.settings, 'email', 'password_reset', email, { name: u.name, link }).catch(() => {});
+  }
+  res.render('forgot', { metaTitle: 'Reset Password', metaDesc: '', sent: true });
+});
+router.get('/reset/:token', async (req, res) => {
+  const pr = await req.db.get('SELECT * FROM password_resets WHERE token_hash = ? AND used = 0 AND expires_at > ?', [sha256('reset:' + req.params.token), now()]);
+  if (!pr) return res.render('error', { status: 400, message: 'This reset link is invalid or expired.' });
+  res.render('reset', { metaTitle: 'Set New Password', metaDesc: '', token: req.params.token });
+});
+router.post('/reset/:token', async (req, res) => {
+  const pr = await req.db.get('SELECT * FROM password_resets WHERE token_hash = ? AND used = 0 AND expires_at > ?', [sha256('reset:' + req.params.token), now()]);
+  if (!pr) return res.render('error', { status: 400, message: 'This reset link is invalid or expired.' });
+  const pwErr = strongPassword(req.body.password, getBool(req.settings, 'secure_password', true));
+  if (pwErr || req.body.password !== req.body.password2)
+    return res.render('reset', { metaTitle: 'Set New Password', metaDesc: '', token: req.params.token, formError: pwErr || 'Passwords do not match.' });
+  await req.db.run('UPDATE users SET password_hash = ? WHERE id = ?', [hashPassword(req.body.password), pr.user_id]);
+  await req.db.run('UPDATE password_resets SET used = 1 WHERE id = ?', [pr.id]);
+  const { destroyUserSessions } = require('../lib/auth');
+  await destroyUserSessions(req.db, pr.user_id);
+  await audit.log(req.db, { actorId: pr.user_id, actorRole: '', action: 'user.password_reset', entity: 'user', entityId: pr.user_id, detail: {}, ip: req.ip });
+  res.redirect('/login');
+});
+
+/* ---------- OTP Login (phone/email, no password) ---------- */
+router.post('/login/otp/request', loginLimiter, async (req, res) => {
+  const idType = req.body.id_type === 'phone' ? 'phone' : 'email';
+  const identifier = String(req.body.identifier || '').trim().toLowerCase();
+  if (idType === 'email' && !validEmail(identifier))
+    return res.status(400).json({ ok: false, error: 'Enter a valid email.' });
+  if (idType === 'phone' && !/^\+?[0-9]{7,15}$/.test(identifier.replace(/[\s-]/g, '')))
+    return res.status(400).json({ ok: false, error: 'Enter a valid phone number.' });
+  if (idType === 'phone' && !getBool(req.settings, 'phone_otp_enabled', true))
+    return res.status(400).json({ ok: false, error: 'Phone login is disabled.' });
+  if (idType === 'email' && !getBool(req.settings, 'email_otp_enabled', true))
+    return res.status(400).json({ ok: false, error: 'Email login is disabled.' });
+  const code = await otpLib.createOtp(req.db, identifier, idType);
+  const result = await otpLib.sendOtp(req.db, req.settings, identifier, idType, code);
+  await audit.log(req.db, { actorId: 0, actorRole: 'anon', action: 'otp.requested', entity: 'otp', entityId: '', detail: { idType }, ip: req.ip });
+  res.json({ ok: true, via: result.via, demoCode: result.code || null });
+});
+
+router.post('/login/otp/verify', loginLimiter, async (req, res) => {
+  const idType = req.body.id_type === 'phone' ? 'phone' : 'email';
+  const identifier = String(req.body.identifier || '').trim().toLowerCase();
+  const code = String(req.body.code || '').trim();
+  const v = await otpLib.verifyOtp(req.db, identifier, idType, code);
+  if (!v.ok) return res.status(400).json({ ok: false, error: v.error });
+  // Find or create user
+  const field = idType === 'phone' ? 'phone' : 'email';
+  let u = await req.db.get(`SELECT * FROM users WHERE ${field} = ?`, [identifier]);
+  let isNew = false;
+  if (!u) {
+    if (!getBool(req.settings, 'registration_enabled', true))
+      return res.status(403).json({ ok: false, error: 'Registration is disabled.' });
+    const r = await req.db.run(
+      'INSERT INTO users (email, phone, name, password_hash, role, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      [idType === 'email' ? identifier : '', idType === 'phone' ? identifier : '', identifier.split('@')[0], '', 'player', 'active', now()]);
+    u = await req.db.get('SELECT * FROM users WHERE id = ?', [r.id]);
+    await audit.log(req.db, { actorId: u.id, actorRole: 'player', action: 'user.register_otp', entity: 'user', entityId: u.id, detail: { idType }, ip: req.ip });
+    isNew = true;
+  }
+  await recordLogin(req, u.id, identifier, true);
+  // NEW USER: details are NOT lost — collect name + terms before full login (registration step preserved)
+  if (isNew) {
+    const { createSession, csrfToken, touchSession } = require('../lib/auth');
+    const sid = await createSession(req.db, u.id, { ip: req.ip, ua: req.headers['user-agent'], extra: { profile_pending: 1 } });
+    const token = csrfToken({}); // fresh token for the profile step
+    await touchSession(req.db, sid, { _csrf: token });
+    res.cookie('sid', sid, { httpOnly: true, sameSite: 'lax', secure: req.secure || getBool(req.settings, 'force_ssl', false), maxAge: 7 * 24 * 3600 * 1000 });
+    return res.json({ ok: true, needsProfile: true, csrf: token });
+  }
+  return finishLogin(req, res, u, 'Welcome back!');
+});
+
+/* ---------- Complete profile (registration details for first-time users) ----------
+   A first-time user who verified via OTP/password lands here BEFORE full login.
+   This preserves the old register form's details (full name + terms agreement)
+   inside the unified flow — no detail is lost, and returning users never see it. */
+router.post('/login/complete-profile', async (req, res) => {
+  if (!req.sess || !req.sessionData.profile_pending)
+    return res.status(401).json({ ok: false, error: 'Session expired. Please sign in again.' });
+  const name = String(req.body.name || '').trim();
+  if (name.length < 2) return res.status(400).json({ ok: false, error: 'Please enter your full name.' });
+  if (!req.body.agree) return res.status(400).json({ ok: false, error: 'Please accept the Terms & Privacy Policy.' });
+  const u = await req.db.get('SELECT * FROM users WHERE id = ?', [req.sess.user_id]);
+  if (!u) return res.status(401).json({ ok: false, error: 'Session expired. Please sign in again.' });
+  await req.db.run('UPDATE users SET name = ? WHERE id = ?', [name, u.id]);
+  const { touchSession } = require('../lib/auth');
+  await touchSession(req.db, req.sess.id, { profile_pending: null });
+  await audit.log(req.db, { actorId: u.id, actorRole: 'player', action: 'user.profile_completed', entity: 'user', entityId: u.id, detail: {}, ip: req.ip });
+  notify.send(req.db, req.settings, 'email', 'welcome', u.email, { name }).catch(() => {});
+  return res.json({ ok: true, redirect: '/', firstName: name.split(' ')[0] });
+});
+
+/* ---------- Facebook OAuth ---------- */
+router.get('/auth/facebook', (req, res) => {
+  const id = process.env.FACEBOOK_APP_ID;
+  if (!getBool(req.settings, 'facebook_oauth_enabled', false) || !id)
+    return res.render('error', { status: 503, message: 'Facebook sign-in is not configured yet.' });
+  const redirect = encodeURIComponent((process.env.BASE_URL || '') + '/auth/facebook/callback');
+  const state = randHex(12);
+  if (req.sess) require('../lib/auth').touchSession(req.db, req.sess.id, { oauth_state: state });
+  res.redirect(`https://www.facebook.com/v18.0/dialog/oauth?client_id=${id}&redirect_uri=${redirect}&state=${state}&scope=email,public_profile`);
+});
+router.get('/auth/facebook/callback', async (req, res) => {
+  try {
+    const id = process.env.FACEBOOK_APP_ID, secret = process.env.FACEBOOK_APP_SECRET;
+    if (!id || !secret) throw new Error('not configured');
+    if (req.sessionData.oauth_state && req.query.state !== req.sessionData.oauth_state) throw new Error('bad state');
+    const redirect = (process.env.BASE_URL || '') + '/auth/facebook/callback';
+    const tok = await fetch(`https://graph.facebook.com/v18.0/oauth/access_token?client_id=${id}&client_secret=${secret}&redirect_uri=${encodeURIComponent(redirect)}&code=${req.query.code}`);
+    const tj = await tok.json();
+    if (!tj.access_token) throw new Error('token exchange failed');
+    const me = await fetch(`https://graph.facebook.com/me?fields=id,name,email&access_token=${tj.access_token}`);
+    const profile = await me.json();
+    if (!profile.id) throw new Error('no profile from Facebook');
+    let u = await req.db.get('SELECT * FROM users WHERE facebook_id = ?', [profile.id]);
+    if (!u && profile.email) u = await req.db.get('SELECT * FROM users WHERE email = ?', [String(profile.email).toLowerCase()]);
+    if (!u) {
+      if (!getBool(req.settings, 'registration_enabled', true)) throw new Error('registration disabled');
+      const r = await req.db.run(
+        'INSERT INTO users (email, phone, name, password_hash, role, status, facebook_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        [profile.email ? String(profile.email).toLowerCase() : '', '', String(profile.name || 'Facebook User'), '', 'player', 'active', profile.id, now()]);
+      u = await req.db.get('SELECT * FROM users WHERE id = ?', [r.id]);
+      await audit.log(req.db, { actorId: u.id, actorRole: 'player', action: 'user.register_oauth', entity: 'user', entityId: u.id, detail: { provider: 'facebook' }, ip: req.ip });
+    } else if (!u.facebook_id) {
+      await req.db.run('UPDATE users SET facebook_id = ? WHERE id = ?', [profile.id, u.id]);
+    }
+    await recordLogin(req, u.id, u.email || profile.id, true);
+    return finishLogin(req, res, u, 'Welcome back!');
+  } catch (e) {
+    return res.render('error', { status: 400, message: 'Facebook sign-in failed: ' + e.message });
+  }
+});
+
+/* ---------- Google OAuth (ready; needs client ID/secret) ---------- */
+router.get('/auth/google', (req, res) => {
+  const id = process.env.GOOGLE_CLIENT_ID;
+  if (!getBool(req.settings, 'google_oauth_enabled', false) || !id)
+    return res.render('error', { status: 503, message: 'Google sign-in is not configured yet. The operator needs to add the Google OAuth credentials.' });
+  const redirect = encodeURIComponent((process.env.BASE_URL || '') + '/auth/google/callback');
+  const state = randHex(12);
+  if (req.sess) require('../lib/auth').touchSession(req.db, req.sess.id, { oauth_state: state });
+  res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?client_id=${id}&redirect_uri=${redirect}&response_type=code&scope=openid%20email%20profile&state=${state}`);
+});
+router.get('/auth/google/callback', async (req, res) => {
+  try {
+    const id = process.env.GOOGLE_CLIENT_ID, secret = process.env.GOOGLE_CLIENT_SECRET;
+    if (!id || !secret) throw new Error('not configured');
+    if (req.sessionData.oauth_state && req.query.state !== req.sessionData.oauth_state) throw new Error('bad state');
+    const redirect = (process.env.BASE_URL || '') + '/auth/google/callback';
+    const tok = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ code: req.query.code, client_id: id, client_secret: secret, redirect_uri: redirect, grant_type: 'authorization_code' }).toString(),
+    });
+    const tj = await tok.json();
+    if (!tj.access_token) throw new Error('token exchange failed');
+    const me = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', { headers: { Authorization: 'Bearer ' + tj.access_token } });
+    const profile = await me.json();
+    if (!profile.email) throw new Error('no email from Google');
+    const emailLc = String(profile.email).toLowerCase();
+    let u = await req.db.get('SELECT * FROM users WHERE email = ?', [emailLc]);
+    if (!u) {
+      if (!getBool(req.settings, 'registration_enabled', true)) throw new Error('registration disabled');
+      const r = await req.db.run(
+        'INSERT INTO users (email, phone, name, password_hash, role, status, email_verified, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        [emailLc, '', String(profile.name || emailLc.split('@')[0]), '', 'player', 'active', 1, now()]);
+      u = await req.db.get('SELECT * FROM users WHERE id = ?', [r.id]);
+      await audit.log(req.db, { actorId: u.id, actorRole: 'player', action: 'user.register_oauth', entity: 'user', entityId: u.id, detail: { provider: 'google' }, ip: req.ip });
+    }
+    if (u.status === 'banned') throw new Error('account blocked');
+    await recordLogin(req, u.id, emailLc, true);
+    return finishLogin(req, res, u);
+  } catch (e) {
+    return res.render('error', { status: 400, message: 'Google sign-in failed: ' + e.message });
+  }
+});
+
+module.exports = router;
+module.exports.captchaHtml = captchaHtml;

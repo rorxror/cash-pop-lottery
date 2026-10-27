@@ -1,0 +1,28 @@
+<section class="wrap section narrow">
+  <div class="form-card">
+    <h1>Add Player</h1>
+<% if (typeof formError !== 'undefined' && formError) { %><div class="flash f-err"><%= formError %></div><% } %>
+        <p class="muted">Create a new player account under your agency.</p>
+    <form action="/agent/players/new" method="POST">
+      <input type="hidden" name="_csrf" value="<%= csrf %>">
+      <div class="field">
+        <label for="name">Full name</label>
+        <input type="text" id="name" name="name" required>
+      </div>
+      <div class="field">
+        <label for="email">Email</label>
+        <input type="email" id="email" name="email" required>
+      </div>
+      <div class="field">
+        <label for="phone">Phone</label>
+        <input type="tel" id="phone" name="phone">
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" required minlength="8" autocomplete="new-password">
+      </div>
+      <button type="submit" class="btn btn-p btn-lg btn-block">Create Player</button>
+    </form>
+    <p class="mt"><a href="/agent/players">&larr; Back to players</a></p>
+  </div>
+</section>

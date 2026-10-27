@@ -1,0 +1,41 @@
+<section class="wrap section">
+  <h1 class="sec-title">Agent Panel</h1>
+  <div class="agent-nav card">
+    <a href="/agent" class="active">Dashboard</a>
+    <a href="/agent/players">Players</a>
+    <a href="/agent/players/new">Add Player</a>
+    <a href="/agent/transfer">Transfer</a>
+    <a href="/agent/commissions">Commissions</a>
+  </div>
+  <div class="kpis mt">
+    <div class="kpi"><span class="n"><%= stats.players %></span><span class="l">Your players</span></div>
+    <div class="kpi"><span class="n"><%= stats.tickets_week %></span><span class="l">Player tickets this week</span></div>
+    <div class="kpi"><span class="n"><%= stats.commission_earned_fmt %></span><span class="l">Commission earned</span></div>
+  </div>
+  <div class="grid2 mt">
+    <div class="card">
+      <div class="card-h"><h2>Float balances</h2></div>
+      <% if (floats && floats.length) { %>
+      <div class="slip-lines">
+        <% floats.forEach(function(f){ %>
+        <div class="slip-line"><span><%= f.currency %></span><span><%= fmt(f.balance, f.currency) %></span></div>
+        <% }) %>
+      </div>
+      <% } else { %><p class="muted">No float allocated yet. Ask the operator to fund your float.</p><% } %>
+      <div class="mt"><a href="/agent/transfer" class="btn btn-p btn-sm">Transfer to Player</a></div>
+    </div>
+    <div class="card">
+      <div class="card-h"><h2>Recent commissions</h2></div>
+      <% if (recent && recent.length) { %>
+      <ul class="ticket-list">
+        <% recent.forEach(function(c){ %>
+        <li>
+          <span class="muted"><%= new Date(c.created_at).toLocaleString() %></span>
+          <span><%= fmt(c.amount, c.currency) %></span>
+        </li>
+        <% }) %>
+      </ul>
+      <% } else { %><p class="muted">No commissions yet.</p><% } %>
+    </div>
+  </div>
+</section>

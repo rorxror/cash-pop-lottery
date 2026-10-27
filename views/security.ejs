@@ -1,0 +1,60 @@
+<section class="wrap section narrow">
+  <div class="form-card">
+    <span class="eyebrow">Authenticator security</span>
+<% if (typeof formError !== 'undefined' && formError) { %><div class="flash f-err"><%= formError %></div><% } %>
+        <div class="sec-head">
+      <h1>Two-factor authentication</h1>
+      <% if (typeof totpEnabled !== 'undefined' && totpEnabled) { %>
+      <span class="badge b-ok">Enrolled</span>
+      <% } else { %>
+      <span class="badge b-err">Not enrolled</span>
+      <% } %>
+    </div>
+    <% if (typeof totpEnabled !== 'undefined' && totpEnabled) { %>
+    <p class="muted">Two-factor authentication is active on your account. You will be asked for a code from your authenticator app at login.</p>
+    <h3>Disable 2FA</h3>
+    <form action="/security/totp/disable" method="POST">
+      <input type="hidden" name="_csrf" value="<%= csrf %>">
+      <div class="field">
+        <label for="password">Confirm your password</label>
+        <input type="password" id="password" name="password" required autocomplete="current-password">
+      </div>
+      <button type="submit" class="btn btn-d" data-confirm="Disable two-factor authentication?">Disable 2FA</button>
+    </form>
+    <h3 class="mt">Backup codes</h3>
+    <p class="muted">Regenerating invalidates all previously issued codes. Store the new codes somewhere safe.</p>
+    <form action="/security/totp/backup" method="POST">
+      <input type="hidden" name="_csrf" value="<%= csrf %>">
+      <button type="submit" class="btn btn-g" data-confirm="Regenerate backup codes? Old codes will stop working.">Regenerate backup codes</button>
+    </form>
+    <% if (typeof showBackup !== 'undefined' && showBackup && backupCodes && backupCodes.length) { %>
+    <div class="alert a-ok mt">
+      <p><strong>Your new backup codes</strong> &mdash; shown only once:</p>
+      <ul class="code-list">
+        <% backupCodes.forEach(function(c){ %><li class="code"><%= c %></li><% }) %>
+      </ul>
+    </div>
+    <% } %>
+    <% } else { %>
+    <p class="muted">Two-factor authentication is not enabled yet. Enable it to protect your funds.</p>
+    <% if (typeof showSetup !== 'undefined' && showSetup && setup) { %>
+    <h3>Scan the QR code</h3>
+    <img src="<%= setup.qrDataUrl %>" alt="TOTP QR code" class="qr">
+    <p class="muted">Or enter this secret manually: <span class="code"><%= setup.secret %></span></p>
+    <form action="/security/totp/confirm" method="POST">
+      <input type="hidden" name="_csrf" value="<%= csrf %>">
+      <div class="field">
+        <label for="totp_code">Confirmation code</label>
+        <input type="text" id="totp_code" name="totp_code" inputmode="numeric" autocomplete="one-time-code" required>
+      </div>
+      <button type="submit" class="btn btn-p">Confirm &amp; Enable</button>
+    </form>
+    <% } else { %>
+    <form action="/security/totp/start" method="POST">
+      <input type="hidden" name="_csrf" value="<%= csrf %>">
+      <button type="submit" class="btn btn-p btn-lg btn-block">Set up 2FA</button>
+    </form>
+    <% } %>
+    <% } %>
+  </div>
+</section>

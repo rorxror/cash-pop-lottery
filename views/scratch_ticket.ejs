@@ -1,0 +1,36 @@
+<section class="section wrap narrow-wide">
+  <a class="back-link" href="/scratch/my-tickets">← My Scratch Tickets</a>
+  <div class="scratch-play type-<%= ticket.game_type %>">
+    <div class="scratch-card-top"><span class="eyebrow"><%= ticket.game_type %></span><span class="code"><%= ticket.public_id %></span></div>
+    <h1><%= ticket.title %></h1><p class="muted"><%= ticket.rules %></p>
+    <% if (ticket.status === 'revealed') { %>
+      <div class="scratch-result <%= Number(ticket.prize)>0?'win':'loss' %>"><span><%= Number(ticket.prize)>0?'Winner':'Revealed' %></span><strong><%= Number(ticket.prize)>0 ? fmt(ticket.prize,ticket.currency) : 'No prize this time' %></strong><small>Outcome locked at purchase · credited once</small></div>
+      <div class="scratch-actions"><a class="btn btn-p" href="/scratch">Play another</a><a class="btn btn-g" href="/scratch/ticket/<%= ticket.public_id %>/verify">Verify ticket</a></div>
+    <% } else { %>
+      <div id="scratchArea" class="scratch-area" data-type="<%= ticket.game_type %>">
+        <div class="scratch-under">
+          <% if (ticket.game_type==='match3') { %><div class="symbol-grid"><% for(let i=0;i<9;i++){ %><span>?</span><% } %></div><% } %>
+          <% if (ticket.game_type==='six') { %><div class="window-grid"><% for(let i=0;i<6;i++){ %><span>WINDOW</span><% } %></div><% } %>
+          <% if (ticket.game_type==='bonus') { %><div class="bonus-grid"><span>MAIN</span><span>LOCKED BONUS</span></div><% } %>
+          <% if (ticket.game_type==='single') { %><div class="single-window">YOUR PRIZE</div><% } %>
+        </div>
+        <canvas id="foil" aria-label="Scratch foil. Drag a finger, mouse or coin motion across the silver area."></canvas>
+      </div>
+      <div class="scratch-progress"><div><span id="scratchPct">0%</span> scratched</div><div class="progress-track"><span id="scratchBar"></span></div></div>
+      <p id="scratchHint" class="muted">Scratch at least 60% to reveal the locked result.</p>
+      <form id="revealForm" action="/scratch/ticket/<%= ticket.public_id %>/reveal" method="POST"><input type="hidden" name="_csrf" value="<%= csrf %>"><button class="btn btn-g btn-block" type="submit">Reveal without animation</button></form>
+    <% } %>
+  </div>
+  <div class="card mt"><span class="eyebrow">Pre-reveal commitment</span><div class="code"><%= ticket.outcome_commitment %></div></div>
+</section>
+<% if (ticket.status !== 'revealed') { %><script>
+(function(){
+ const canvas=document.getElementById('foil'), area=document.getElementById('scratchArea'), form=document.getElementById('revealForm'); if(!canvas||!area||!form)return;
+ const ctx=canvas.getContext('2d',{willReadFrequently:true}); let down=false, submitted=false;
+ function size(){const r=area.getBoundingClientRect();canvas.width=Math.max(280,Math.floor(r.width));canvas.height=Math.max(220,Math.floor(r.height));ctx.globalCompositeOperation='source-over';const g=ctx.createLinearGradient(0,0,canvas.width,canvas.height);g.addColorStop(0,'#9aa3ad');g.addColorStop(.5,'#e4e7eb');g.addColorStop(1,'#7d8792');ctx.fillStyle=g;ctx.fillRect(0,0,canvas.width,canvas.height);ctx.fillStyle='#25304c';ctx.font='700 22px system-ui';ctx.textAlign='center';ctx.fillText('SCRATCH HERE',canvas.width/2,canvas.height/2);ctx.globalCompositeOperation='destination-out';}
+ function point(e){const r=canvas.getBoundingClientRect(),p=e.touches?e.touches[0]:e;return{x:(p.clientX-r.left)*canvas.width/r.width,y:(p.clientY-r.top)*canvas.height/r.height};}
+ function scratch(e){if(!down)return;e.preventDefault();const p=point(e);ctx.beginPath();ctx.arc(p.x,p.y,26,0,Math.PI*2);ctx.fill();measure();}
+ let check=0;function measure(force){if(!force&&++check%3)return;const d=ctx.getImageData(0,0,canvas.width,canvas.height).data;let clear=0;for(let i=3;i<d.length;i+=16)if(d[i]<32)clear++;const pct=Math.min(100,Math.round(clear/(d.length/16)*100));document.getElementById('scratchPct').textContent=pct+'%';document.getElementById('scratchBar').style.width=pct+'%';if(pct>=60&&!submitted){submitted=true;document.getElementById('scratchHint').textContent='Revealing your locked result…';form.submit();}}
+ canvas.addEventListener('pointerdown',e=>{down=true;canvas.setPointerCapture(e.pointerId);scratch(e)});canvas.addEventListener('pointermove',scratch);canvas.addEventListener('pointerup',()=>{down=false;measure(true);});canvas.addEventListener('pointercancel',()=>{down=false;measure(true);});size();
+})();
+</script><% } %>

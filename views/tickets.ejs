@@ -1,0 +1,33 @@
+<section class="wrap section">
+  <h1 class="sec-title">My Tickets</h1>
+  <div class="card">
+    <% if (tickets && tickets.length) { %>
+    <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr><th>Ticket</th><th>Date</th><th>Draw</th><th>Pops</th><th>Wager</th><th>Total</th><th>Hits</th><th>Status</th></tr></thead>
+      <tbody>
+        <% tickets.forEach(function(t){ %>
+        <tr>
+          <td><a href="/ticket/<%= t.public_id %>"><span class="code"><%= t.public_id %></span></a></td>
+          <td><%= new Date(t.created_at).toLocaleString() %></td>
+          <td><%= t.draw_type %> &times; <%= t.num_draws %></td>
+          <td><%= t.pops.length %></td>
+          <td><%= fmt(t.wager, t.currency) %></td>
+          <td><%= fmt(t.total, t.currency) %></td>
+          <td><%= t.won_count %>/<%= t.entry_count %></td>
+          <td>
+            <% if (t.status === 'won') { %><span class="badge b-ok">WON</span>
+            <% } else if (t.status === 'lost') { %><span class="badge b-muted">LOST</span>
+            <% } else if (t.status === 'cancelled') { %><span class="badge b-err">CANCELLED</span>
+            <% } else { %><span class="badge b-info">ACTIVE</span><% } %>
+          </td>
+        </tr>
+        <% }) %>
+      </tbody>
+    </table>
+    </div>
+    <% } else { %>
+    <p class="muted">You haven't bought any tickets yet. <a href="/play">Play now</a>.</p>
+    <% } %>
+  </div>
+</section>

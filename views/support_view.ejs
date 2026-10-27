@@ -1,0 +1,29 @@
+<section class="wrap section narrow-wide">
+  <h1 class="sec-title"><%= ticket.subject %> <span class="badge <%= ticket.status === 'open' ? 'b-info' : 'b-muted' %>"><%= ticket.status %></span></h1>
+  <div class="card">
+    <div class="messages">
+      <% (messages || []).forEach(function(m){ %>
+      <div class="msg <%= m.mine ? 'mine' : '' %>">
+        <div class="msg-head">
+          <strong><%= m.mine ? 'You' : m.author_role %></strong>
+          <small class="muted"><%= new Date(m.created_at).toLocaleString() %></small>
+        </div>
+        <div class="msg-body"><%= m.body %></div>
+      </div>
+      <% }) %>
+    </div>
+    <% if (ticket.status === 'open') { %>
+    <form action="/support/<%= ticket.public_id %>" method="POST" class="mt">
+      <input type="hidden" name="_csrf" value="<%= csrf %>">
+      <div class="field">
+        <label for="message">Reply</label>
+        <textarea id="message" name="message" rows="4" required></textarea>
+      </div>
+      <button type="submit" class="btn btn-p">Send Reply</button>
+    </form>
+    <% } else { %>
+    <p class="muted mt">This ticket is closed. <a href="/support">Open a new ticket</a> if you need more help.</p>
+    <% } %>
+  </div>
+  <p class="mt"><a href="/support">&larr; Back to support</a></p>
+</section>

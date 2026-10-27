@@ -1,0 +1,19 @@
+<section class="wrap section narrow">
+  <div class="form-card fade-in">
+    <h1>Verify Withdrawal</h1>
+    <p class="muted">For your security, confirm this withdrawal with a one-time code.</p>
+    <div class="login-branding">
+      <div class="login-jackpot"><strong><%= methodName %></strong> · <%= fmt(amount, currency) %></div>
+      <div class="login-trust">Code sent to your <%= channel === 'email' ? 'email' : 'phone' %>: <strong><%= identifier %></strong></div>
+    </div>
+    <form action="/withdraw/verify" method="POST">
+      <input type="hidden" name="_csrf" value="<%= csrf %>">
+      <div class="field">
+        <label for="wdCode">6-digit code</label>
+        <input type="text" id="wdCode" name="code" inputmode="numeric" maxlength="6" placeholder="000000" autocomplete="one-time-code" required>
+      </div>
+      <button type="submit" class="btn btn-p btn-lg btn-block">Verify &amp; Submit Withdrawal →</button>
+    </form>
+    <p class="muted sm center"><a href="/withdraw/new">← Cancel and go back</a></p>
+  </div>
+</section>

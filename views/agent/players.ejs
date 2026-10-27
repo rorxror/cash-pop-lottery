@@ -1,0 +1,56 @@
+<section class="wrap section">
+  <h1 class="sec-title">My Players</h1>
+  <div class="agent-nav card">
+    <a href="/agent">Dashboard</a>
+    <a href="/agent/players" class="active">Players</a>
+    <a href="/agent/players/new">Add Player</a>
+    <a href="/agent/transfer">Transfer</a>
+    <a href="/agent/commissions">Commissions</a>
+  </div>
+  <div class="card mt">
+    <div class="card-h"><h2>Assigned players</h2></div>
+    <% if (players && players.length) { %>
+    <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr><th>Name</th><th>Email</th><th>Joined</th><th>Tickets</th></tr></thead>
+      <tbody>
+        <% players.forEach(function(p){ %>
+        <tr>
+          <td><%= p.name %></td>
+          <td><%= p.email %></td>
+          <td><%= new Date(p.created_at).toLocaleString() %></td>
+          <td><%= p.tickets %></td>
+        </tr>
+        <% }) %>
+      </tbody>
+    </table>
+    </div>
+    <% } else { %><p class="muted">No players assigned yet.</p><% } %>
+  </div>
+  <% if (unassigned && unassigned.length) { %>
+  <div class="card mt">
+    <div class="card-h"><h2>Unassigned players &mdash; claim them</h2></div>
+    <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr><th>Name</th><th>Email</th><th>Joined</th><th></th></tr></thead>
+      <tbody>
+        <% unassigned.forEach(function(p){ %>
+        <tr>
+          <td><%= p.name %></td>
+          <td><%= p.email %></td>
+          <td><%= new Date(p.created_at).toLocaleString() %></td>
+          <td class="right">
+            <form action="/agent/players/claim" method="POST" class="inline-form">
+              <input type="hidden" name="_csrf" value="<%= csrf %>">
+              <input type="hidden" name="user_id" value="<%= p.id %>">
+              <button type="submit" class="btn btn-p btn-sm">Claim</button>
+            </form>
+          </td>
+        </tr>
+        <% }) %>
+      </tbody>
+    </table>
+    </div>
+  </div>
+  <% } %>
+</section>

@@ -1,0 +1,172 @@
+<% if (typeof user !== 'undefined' && user) { %>
+<section class="welcome-bar wrap fade-in">
+  <div class="welcome-bar-in">
+    <span class="welcome-greet">👋 Welcome back, <strong><%= user.name.split(' ')[0] %></strong></span>
+    <span class="welcome-bal">Balance: <strong><%= fmt(walletBal(cur), cur) %></strong></span>
+    <span class="welcome-links">
+      <a href="/wallet" class="btn btn-g btn-sm">Wallet</a>
+      <a href="/tickets" class="btn btn-g btn-sm">My Tickets</a>
+      <a href="/play" class="btn btn-p btn-sm">Play Now</a>
+    </span>
+  </div>
+</section>
+<% } %>
+<section class="hero">
+  <div class="hero-float" aria-hidden="true">
+    <span class="fball f1">3</span>
+    <span class="fball f2">7</span>
+    <span class="fball f3">12</span>
+    <span class="fball f4">9</span>
+  </div>
+  <div class="wrap hero-in">
+    <div class="hero-copy">
+      <span class="hero-eyebrow">&#10022; Provably fair &middot; Draws daily</span>
+      <h1>Pick a number. <span class="gold-text">Pop a prize.</span></h1>
+      <p class="hero-sub">Cash Pop style lottery with draws every day &mdash; provably fair, transparent results, instant payouts.</p>
+      <div class="hero-cta">
+        <a href="/play" class="btn btn-p btn-lg">Play Now</a>
+        <a href="/fairness" class="btn btn-g btn-lg">How Fairness Works</a>
+      </div>
+      <div class="hero-stats">
+        <div class="hstat"><span class="n live-count" data-count="<%= stats.players %>" data-mode="<%= stats.mode %>"><%= stats.players %></span><span class="l"><%= stats.players === 1 ? "Player" : "Players" %></span></div>
+        <div class="hstat"><span class="n live-count" data-count="<%= stats.tickets_today %>" data-mode="<%= stats.mode %>"><%= stats.tickets_today %></span><span class="l">Tickets today</span></div>
+        <div class="hstat"><span class="n live-count" data-count="<%= stats.paid_out %>" data-mode="<%= stats.mode %>" data-money="1"><%= stats.paid_out_fmt %></span><span class="l">Paid out</span></div>
+      </div>
+    </div>
+    <div class="hero-teaser">
+      <div class="pslip-card">
+        <h3>Mini Playslip</h3>
+        <% const lucky = (new Date().getDate() * 7 + new Date().getMonth() * 3) % 15 + 1; %>
+        <div class="balls balls-sm">
+          <% for (let i=1; i<=15; i++) { %><span class="ball<%= i===lucky ? ' sel' : '' %>"><%= i %></span><% } %>
+        </div>
+        <p class="muted">Today&apos;s lucky number is <strong><%= lucky %></strong> &mdash; pick your pops.</p>
+        <a href="/play" class="btn btn-p btn-block pslip-cta">Build My Slip</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<% if (typeof nextDraw !== 'undefined' && nextDraw) { %>
+<section class="draw-banner">
+  <div class="wrap draw-banner-in">
+    <div class="draw-banner-copy">
+      <span class="draw-banner-kicker">Next draw</span>
+      <strong class="draw-banner-name"><%= nextDraw.label %></strong>
+      <span class="draw-banner-sub">Entries close when the timer hits zero</span>
+    </div>
+    <div class="draw-banner-timer">
+      <div class="countdown countdown-lg" data-close-at="<%= nextDraw.close_at %>">--:--:--</div>
+      <a href="/play" class="btn btn-p btn-lg">Enter Now</a>
+    </div>
+  </div>
+</section>
+<% } %>
+
+<section class="trust-row wrap">
+  <div class="trust-badge"><span class="trust-ico">&#10003;</span><div><strong>Provably Fair</strong><span>Every draw verifiable</span></div></div>
+  <div class="trust-badge"><span class="trust-ico">&#9889;</span><div><strong>Instant Payouts</strong><span>Winnings credited at once</span></div></div>
+  <div class="trust-badge"><span class="trust-ico">&#128274;</span><div><strong>Secure &amp; Licensed</strong><span>Your funds protected</span></div></div>
+  <div class="trust-badge"><span class="trust-ico">&#127942;</span><div><strong>Daily Draws</strong><span>Two chances every day</span></div></div>
+</section>
+
+<% if (typeof recentWins !== 'undefined' && recentWins && recentWins.length) { %>
+<div class="winners-ticker" aria-label="Recent verified winners">
+  <div class="ticker-label">🏆 Recent verified winners</div>
+  <div class="ticker-track" id="winnersTicker">
+    <% recentWins.concat(recentWins).forEach(function(w){ %>
+    <span class="ticker-item"><strong><%= w.name.split(' ')[0] %></strong> won <%= fmt(w.amount, w.currency || 'USD') %> <span class="verified-badge">✓ Verified</span></span>
+    <% }); %>
+  </div>
+</div>
+<% } %>
+
+<% if (draws && draws.length) { %>
+<section class="wrap section">
+  <div class="sec-head">
+    <h2 class="sec-title">Upcoming Draws</h2>
+    <button type="button" class="btn btn-g btn-sm collapse-toggle" data-target="upcomingDraws" data-start="shown" aria-expanded="true">Hide</button>
+  </div>
+  <div class="draw-cards collapsible" id="upcomingDraws">
+    <% draws.forEach(function(d){ %>
+    <div class="draw-card">
+      <div class="draw-type"><%= d.label %></div>
+      <div class="countdown" data-close-at="<%= d.close_at %>">--:--:--</div>
+      <div class="draw-hash muted">Seed hash: <span class="code"><%= d.seed_hash ? d.seed_hash.slice(0,16) + '...' : 'pending' %></span></div>
+      <a href="/play" class="btn btn-p btn-sm btn-block">Enter</a>
+    </div>
+    <% }) %>
+  </div>
+</section>
+<% } %>
+
+<% const _banner = content('home_banner'); %>
+<% if (_banner) { %>
+<section class="wrap section home-banner">
+  <%- _banner %>
+</section>
+<% } %>
+
+<section class="wrap section">
+  <h2 class="sec-title">How It Works</h2>
+  <div class="steps">
+    <%- content('how_it_works') %>
+  </div>
+</section>
+
+<% if (recentResults && recentResults.length) { %>
+<section class="wrap section">
+  <h2 class="sec-title">Recent Results</h2>
+  <div class="tbl-wrap">
+  <table class="tbl">
+    <thead><tr><th>Draw</th><th>Date</th><th>Winning Number</th></tr></thead>
+    <tbody>
+      <% recentResults.forEach(function(r){ %>
+      <tr>
+        <td><%= r.draw_type %><%= r.is_test ? ' <span class="badge b-warn">TEST</span>' : '' %></td>
+        <td><%= r.draw_date %></td>
+        <td><span class="ball ball-win"><%= r.winning_number %></span></td>
+      </tr>
+      <% }) %>
+    </tbody>
+  </table>
+  </div>
+  <div class="mt"><a href="/results" class="btn btn-g">All Results</a></div>
+</section>
+<% } %>
+
+<section class="wrap section winners-section">
+  <div class="sec-head">
+    <h2 class="sec-title">🏆 Latest Winners</h2>
+    <p class="muted">Real players, real payouts — paid instantly.</p>
+  </div>
+  <% if (typeof recentWins !== 'undefined' && recentWins && recentWins.length) { %>
+  <div class="winners-grid">
+    <% recentWins.slice(0, 6).forEach(function(w, i){ %>
+    <div class="winner-card<%= i === 0 ? ' winner-top' : '' %>">
+      <div class="winner-rank"><%= i === 0 ? '👑' : '#' + (i + 1) %></div>
+      <div class="winner-avatar"><%= w.name.charAt(0).toUpperCase() %></div>
+      <div class="winner-info">
+        <strong><%= w.name.split(' ')[0] %></strong>
+        <span class="winner-amount"><%= fmt(w.amount, w.currency || 'USD') %></span>
+        <span class="muted winner-date"><%= new Date(w.created_at).toLocaleDateString() %></span>
+      </div>
+    </div>
+    <% }); %>
+  </div>
+  <% } else { %>
+  <div class="winners-empty">
+    <div class="winners-empty-trophy">🏆</div>
+    <h3>No winners yet — could you be the first?</h3>
+    <p class="muted">Every draw is provably fair. Buy a ticket and your name could shine here.</p>
+    <a href="/play" class="btn btn-p btn-lg">Play Now</a>
+  </div>
+  <% } %>
+</section>
+
+<% const _testimonials = content('testimonials'); %>
+<% if (_testimonials) { %>
+<section class="wrap section">
+  <%- _testimonials %>
+</section>
+<% } %>

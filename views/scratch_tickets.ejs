@@ -1,0 +1,11 @@
+<section class="section wrap">
+  <div class="scratch-head"><div><span class="eyebrow">Player account</span><h1>My Scratch Tickets</h1></div><a class="btn btn-p" href="/scratch">Play Scratch</a></div>
+  <nav class="ticket-tabs" aria-label="Scratch ticket filters">
+    <a class="<%= tab==='unscratched'?'active':'' %>" href="/scratch/my-tickets?tab=unscratched">Unscratched <span><%= counts.unscratched || 0 %></span></a>
+    <a class="<%= tab==='scratched'?'active':'' %>" href="/scratch/my-tickets?tab=scratched">Scratched <span><%= counts.scratched || 0 %></span></a>
+    <a class="<%= tab==='history'?'active':'' %>" href="/scratch/my-tickets?tab=history">History <span><%= counts.history || 0 %></span></a>
+  </nav>
+  <% if (!tickets.length) { %><div class="card empty-state"><h2>No tickets in this view</h2><p class="muted">Choose another tab or pick a card from the scratch lobby.</p></div><% } else { %>
+  <div class="ticket-list"><% tickets.forEach(function(t){ %><article class="card ticket-row"><div><span class="eyebrow"><%= t.status %></span><h2><%= t.title %></h2><div class="code"><%= t.public_id %></div><p class="muted"><%= new Date(t.purchased_at).toLocaleString() %></p></div><div class="ticket-result"><strong><%= t.status==='revealed' ? (Number(t.prize)>0 ? 'Won '+fmt(t.prize,t.currency) : 'No prize') : fmt(t.price,t.currency) %></strong><a class="btn <%= t.status==='purchased'?'btn-p':'btn-g' %>" href="/scratch/ticket/<%= t.public_id %>"><%= t.status==='purchased'?'Scratch now':'View result' %></a></div></article><% }) %></div>
+  <% } %>
+</section>

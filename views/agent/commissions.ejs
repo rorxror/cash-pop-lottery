@@ -1,0 +1,30 @@
+<section class="wrap section">
+  <h1 class="sec-title">Commissions</h1>
+  <div class="agent-nav card">
+    <a href="/agent">Dashboard</a>
+    <a href="/agent/players">Players</a>
+    <a href="/agent/players/new">Add Player</a>
+    <a href="/agent/transfer">Transfer</a>
+    <a href="/agent/commissions" class="active">Commissions</a>
+  </div>
+  <div class="card mt">
+    <% if (rows && rows.length) { %>
+    <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr><th>Date</th><th>Player</th><th>Ticket</th><th>Rate</th><th>Commission</th></tr></thead>
+      <tbody>
+        <% rows.forEach(function(r){ %>
+        <tr>
+          <td><%= new Date(r.created_at).toLocaleString() %></td>
+          <td><%= r.user_name %></td>
+          <td><a href="/ticket/<%= r.ticket_public_id %>"><span class="code"><%= r.ticket_public_id %></span></a></td>
+          <td><%= r.rate %>%</td>
+          <td class="pos"><%= fmt(r.amount, r.currency) %></td>
+        </tr>
+        <% }) %>
+      </tbody>
+    </table>
+    </div>
+    <% } else { %><p class="muted">No commission entries yet.</p><% } %>
+  </div>
+</section>

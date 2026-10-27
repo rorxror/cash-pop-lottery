@@ -1,0 +1,36 @@
+<section class="wrap section narrow">
+  <div class="form-card">
+    <h1>Profile</h1>
+    <div class="verify-badges">
+      <span class="badge <%= user.status === 'active' ? 'b-ok' : 'b-warn' %>"><%= user.status %></span>
+    </div>
+    <form action="/profile" method="POST">
+      <input type="hidden" name="_csrf" value="<%= csrf %>">
+      <div class="field">
+        <label for="name">Full name</label>
+        <input type="text" id="name" name="name" value="<%= user.name %>" required>
+      </div>
+      <div class="field">
+        <label>Email</label>
+        <input type="email" value="<%= user.email %>" disabled readonly>
+        <small class="muted">Email cannot be changed here &mdash; contact support.</small>
+      </div>
+      <div class="field">
+        <label for="phone">Phone</label>
+        <input type="tel" id="phone" name="phone" value="<%= user.phone || '' %>">
+      </div>
+      <div class="field">
+        <label for="country">Country</label>
+        <input type="text" id="country" name="country" value="<%= user.country || '' %>">
+      </div>
+      <button type="submit" class="btn btn-p btn-lg btn-block">Save Changes</button>
+    </form>
+    <% if (user.referral_code) { %>
+    <div class="login-branding">
+      <div class="login-jackpot">🔗 Your referral link</div>
+      <p class="muted sm">Share this link — when friends register with it and buy tickets, you earn referral commission (when enabled by the operator).</p>
+      <p><span class="code" id="refLink"><%= (typeof baseUrl !== 'undefined' && baseUrl ? baseUrl : '') %>/register?ref=<%= user.referral_code %></span></p>
+    </div>
+    <% } %>
+  </div>
+</section>

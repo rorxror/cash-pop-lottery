@@ -1,0 +1,219 @@
+<section class="wrap section narrow">
+  <div class="form-card auth-card fade-in">
+    <div class="auth-logo">🎰</div>
+    <h1>Welcome back</h1>
+    <p class="login-value">Sign in to <strong>play draws</strong>, track your winnings, and get <strong>instant payouts</strong>.</p>
+
+    <% if (typeof formError !== 'undefined' && formError) { %><div class="flash f-err"><%= formError %></div><% } %>
+
+    <!-- Social (only when admin enabled + configured) -->
+    <% if ((typeof facebookOn !== 'undefined' && facebookOn) || (typeof googleOn !== 'undefined' && googleOn)) { %>
+    <div class="social-login">
+      <% if (typeof googleOn !== 'undefined' && googleOn) { %>
+      <a class="btn btn-google btn-block" href="/auth/google"><span class="social-ico">G</span> Continue with Google</a>
+      <% } %>
+      <% if (typeof facebookOn !== 'undefined' && facebookOn) { %>
+      <a class="btn btn-fb btn-block" href="/auth/facebook"><span class="social-ico">f</span> Continue with Facebook</a>
+      <% } %>
+    </div>
+    <div class="divider"><span>or sign in with</span></div>
+    <% } %>
+
+    <!-- Sign-in method: Password (default) | One-time code (only if admin enabled OTP) -->
+    <% const otpAny = (typeof phoneOtpOn !== 'undefined' && phoneOtpOn) || (typeof emailOtpOn !== 'undefined' && emailOtpOn); %>
+    <div class="segmented auth-methods" role="tablist">
+      <button type="button" class="seg active" data-method="password" role="tab">🔑 Password</button>
+      <% if (otpAny) { %>
+      <button type="button" class="seg" data-method="otp" role="tab">📱 One-time code</button>
+      <% } %>
+    </div>
+
+    <!-- PASSWORD SIGN-IN (primary) -->
+    <div id="loginPw">
+      <form id="pwForm" method="POST" action="/login">
+        <input type="hidden" name="_csrf" value="<%= csrf %>">
+        <div class="field">
+          <label for="pwIdentifier">Email or phone number</label>
+          <input type="text" id="pwIdentifier" name="email" placeholder="you@example.com or +1234567890" autocomplete="username" required>
+        </div>
+        <div class="field">
+          <label for="pwPassword">Password</label>
+          <input type="password" id="pwPassword" name="password" placeholder="Your password" autocomplete="current-password" required>
+        </div>
+        <button type="submit" class="btn btn-p btn-lg btn-block">Sign In →</button>
+      </form>
+      <p class="muted sm center"><a href="/forgot">Forgot password?</a></p>
+    </div>
+
+    <!-- OTP SIGN-IN (secondary, admin toggle only) -->
+    <% if (otpAny) { %>
+    <div id="loginOtp" hidden>
+      <div class="segmented auth-otp-types" role="tablist">
+        <% if (typeof phoneOtpOn === 'undefined' || phoneOtpOn) { %>
+        <button type="button" class="seg active" data-type="phone" role="tab">📱 Phone</button>
+        <% } %>
+        <% if (typeof emailOtpOn === 'undefined' || emailOtpOn) { %>
+        <button type="button" class="seg<%= (typeof phoneOtpOn !== 'undefined' && !phoneOtpOn) ? ' active' : '' %>" data-type="email" role="tab">✉️ Email</button>
+        <% } %>
+      </div>
+      <div id="otpStep1">
+        <div class="field">
+          <label for="otpIdentifier" id="otpLabel">Phone number</label>
+          <div id="otpPhoneRow" class="phone-row">
+            <select id="otpCc" aria-label="Country dial code">
+              <% (typeof phoneCountries !== 'undefined' ? phoneCountries : []).forEach(function(c){ %>
+              <option value="<%= c.dial %>" <%= c.iso === 'US' ? 'selected' : '' %>><%= c.name %> (+<%= c.dial %>)</option>
+              <% }) %>
+            </select>
+            <input type="tel" id="otpPhoneLocal" placeholder="Phone number" autocomplete="tel">
+          </div>
+          <input type="text" id="otpIdentifier" placeholder="you@example.com" autocomplete="email" hidden>
+        </div>
+        <button type="button" class="btn btn-p btn-lg btn-block" id="otpRequestBtn">Send Code</button>
+        <p class="muted sm center" id="otpHint">We'll text you a 6-digit code.</p>
+      </div>
+      <div id="otpStep2" hidden>
+        <p class="muted center">Enter the 6-digit code sent to <strong id="otpSentTo"></strong></p>
+        <div class="field">
+          <label for="otpCode">Verification code</label>
+          <input type="text" id="otpCode" inputmode="numeric" maxlength="6" placeholder="000000" autocomplete="one-time-code">
+        </div>
+        <button type="button" class="btn btn-p btn-lg btn-block" id="otpVerifyBtn">Verify &amp; Continue</button>
+        <p class="muted sm center"><a href="#" id="otpResend">Resend code</a> · <a href="#" id="otpBack">← Change number</a></p>
+      </div>
+      <!-- Profile step for FIRST-TIME OTP users (registration details preserved) -->
+      <div id="authStepProfile" hidden>
+        <h2 style="font-size:22px;font-weight:700;letter-spacing:-0.3px;text-align:center;margin-bottom:4px;">Complete your profile</h2>
+        <p class="muted center">Welcome! Just one more step to finish your registration.</p>
+        <div class="field">
+          <label for="authFullName">Full name</label>
+          <input type="text" id="authFullName" placeholder="Your full name" autocomplete="name">
+        </div>
+        <label class="muted sm" style="display:flex;gap:8px;align-items:flex-start;margin:12px 0;">
+          <input type="checkbox" id="authAgree" style="min-height:auto;width:18px;margin-top:2px;">
+          <span>I agree to the Terms &amp; Privacy Policy. I confirm I am 18 or older.</span>
+        </label>
+        <button type="button" class="btn btn-p btn-lg btn-block" id="authProfileBtn">Complete Registration →</button>
+      </div>
+      <div class="flash f-err" id="otpError" hidden></div>
+    </div>
+    <% } %>
+
+    <div class="login-branding">
+      <div class="login-jackpot">🎰 <strong>Daily Draws</strong> · Provably Fair · Instant Payouts</div>
+      <div class="login-trust">🔒 Secure &amp; Licensed · 18+ only · Play responsibly</div>
+    </div>
+    <p class="muted center">Don't have an account? <a href="/register"><strong>Register</strong></a></p>
+    <p class="text-caption center">By continuing, you agree to our Terms &amp; Privacy Policy.</p>
+  </div>
+</section>
+
+<script>
+(function () {
+  // Method tabs: Password (default) / OTP
+  var methodSegs = document.querySelectorAll('.auth-methods .seg');
+  var pwPane = document.getElementById('loginPw');
+  var otpPane = document.getElementById('loginOtp');
+  methodSegs.forEach(function (b) {
+    b.addEventListener('click', function () {
+      methodSegs.forEach(function (x) { x.classList.toggle('active', x === b); });
+      var m = b.dataset.method;
+      if (pwPane) pwPane.hidden = (m !== 'password');
+      if (otpPane) otpPane.hidden = (m !== 'otp');
+    });
+  });
+
+  // Password form: route identifier to email or phone field before submit
+  var pwForm = document.getElementById('pwForm');
+  if (pwForm) pwForm.addEventListener('submit', function () {
+    var v = document.getElementById('pwIdentifier').value.trim();
+    var inp = document.getElementById('pwIdentifier');
+    if (v.indexOf('@') === -1) {
+      inp.name = 'phone';
+    } else {
+      inp.name = 'email';
+    }
+  });
+
+  // OTP flow (only rendered when admin enabled OTP)
+  var otpPaneEl = document.getElementById('loginOtp');
+  if (!otpPaneEl) return;
+  var type = 'phone';
+  var phoneOtpOn = <%= (typeof phoneOtpOn === 'undefined' || phoneOtpOn) ? 'true' : 'false' %>;
+  var emailOtpOn = <%= (typeof emailOtpOn === 'undefined' || emailOtpOn) ? 'true' : 'false' %>;
+  var segs = document.querySelectorAll('.auth-otp-types .seg');
+  var label = document.getElementById('otpLabel');
+  var input = document.getElementById('otpIdentifier');
+  var hint = document.getElementById('otpHint');
+  var step1 = document.getElementById('otpStep1');
+  var step2 = document.getElementById('otpStep2');
+  var stepProfile = document.getElementById('authStepProfile');
+  var err = document.getElementById('otpError');
+  var sentTo = document.getElementById('otpSentTo');
+  var identifier = '';
+  var csrfToken = '';
+  function showErr(m) { err.textContent = m; err.hidden = false; }
+  function hideErr() { err.hidden = true; }
+  var phoneRow = document.getElementById('otpPhoneRow');
+  var phoneLocal = document.getElementById('otpPhoneLocal');
+  var ccSel = document.getElementById('otpCc');
+  function setType(t) {
+    type = t;
+    segs.forEach(function (b) { b.classList.toggle('active', b.dataset.type === t); });
+    if (t === 'phone') {
+      label.textContent = 'Phone number';
+      phoneRow.hidden = false; input.hidden = true;
+      hint.textContent = "We'll text you a 6-digit code.";
+    } else {
+      label.textContent = 'Email address';
+      phoneRow.hidden = true; input.hidden = false; input.type = 'email';
+      hint.textContent = "We'll email you a 6-digit code.";
+    }
+  }
+  segs.forEach(function (b) { b.addEventListener('click', function () { setType(b.dataset.type); }); });
+  if (document.querySelector('.auth-otp-types .seg[data-type="email"].active')) setType('email');
+  document.getElementById('otpRequestBtn').addEventListener('click', async function () {
+    hideErr();
+    if (type === 'phone') {
+      var cc = ccSel.value.replace(/\D/g, '');
+      var local = phoneLocal.value.replace(/\D/g, '');
+      identifier = (cc && local) ? ('+' + cc + local) : '';
+    } else {
+      identifier = input.value.trim();
+    }
+    if (!identifier) return showErr(type === 'phone' ? 'Please enter your phone number.' : 'Please enter your email address.');
+    var r = await fetch('/login/otp/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: type, identifier: identifier }) });
+    var d = await r.json().catch(function () { return {}; });
+    if (!r.ok) return showErr(d.error || 'Could not send code. Please try again.');
+    sentTo.textContent = identifier;
+    step1.hidden = true; step2.hidden = false;
+    document.getElementById('otpCode').focus();
+  });
+  document.getElementById('otpVerifyBtn').addEventListener('click', async function () {
+    hideErr();
+    var code = document.getElementById('otpCode').value.trim();
+    if (code.length !== 6) return showErr('Please enter the 6-digit code.');
+    var r = await fetch('/login/otp/verify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: type, identifier: identifier, code: code }) });
+    var d = await r.json().catch(function () { return {}; });
+    if (!r.ok) return showErr(d.error || 'Invalid code. Please try again.');
+    if (d.needsProfile) { if (d.csrf) csrfToken = d.csrf; step2.hidden = true; stepProfile.hidden = false; document.getElementById('authFullName').focus(); return; }
+    window.location.href = d.redirect || '/';
+  });
+  document.getElementById('otpResend').addEventListener('click', async function (e) {
+    e.preventDefault(); hideErr();
+    var r = await fetch('/login/otp/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: type, identifier: identifier }) });
+    if (!r.ok) showErr('Could not resend code. Please wait and try again.');
+  });
+  document.getElementById('otpBack').addEventListener('click', function (e) { e.preventDefault(); hideErr(); step2.hidden = true; step1.hidden = false; input.focus(); });
+  document.getElementById('authProfileBtn').addEventListener('click', async function () {
+    hideErr();
+    var nm = document.getElementById('authFullName').value.trim();
+    if (nm.length < 2) return showErr('Please enter your full name.');
+    if (!document.getElementById('authAgree').checked) return showErr('Please accept the Terms & Privacy Policy.');
+    var r = await fetch('/login/complete-profile', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-csrf-token': csrfToken }, body: JSON.stringify({ name: nm, agree: true }) });
+    var d = await r.json().catch(function () { return {}; });
+    if (!r.ok) return showErr(d.error || 'Could not save your profile. Please try again.');
+    window.location.href = d.redirect || '/';
+  });
+})();
+</script>

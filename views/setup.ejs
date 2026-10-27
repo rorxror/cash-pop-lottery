@@ -1,0 +1,17 @@
+<div class="form-card">
+  <h2>🎰 Welcome — Set up your lottery</h2>
+  <p class="muted">Create the operator (admin) account. This page disappears forever after setup.</p>
+  <% if (typeof formError !== 'undefined' && formError) { %><div class="flash f-err"><%= formError %></div><% } %>
+  <form method="POST" action="/setup">
+    <input type="hidden" name="_csrf" value="<%= csrf %>">
+    <div class="field"><label>Site name *</label><input type="text" name="site_name" value="Cash Pop Lottery" required></div>
+    <div class="field"><label>Base currency *</label>
+      <select name="base_currency"><% currencies.forEach(c => { %><option value="<%= c.code %>" <%= c.code === 'USD' ? 'selected' : '' %>><%= c.code %></option><% }) %></select>
+    </div>
+    <div class="field"><label>Your name *</label><input type="text" name="name" required></div>
+    <div class="field"><label>Admin email *</label><input type="email" name="email" required></div>
+    <div class="field"><label>Password (min 8 chars) *</label><input type="password" name="password" required></div>
+    <div class="field"><label>Confirm password *</label><input type="password" name="password2" required></div>
+    <button class="btn btn-p" type="submit">Create admin &amp; launch</button>
+  </form>
+</div>
