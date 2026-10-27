@@ -100,21 +100,39 @@ router.get('/', async (req, res) => {
   const soldAll = await req.db.get('SELECT COALESCE(SUM(total),0) AS s FROM tickets');
   const prizeAll = await req.db.get("SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE type = 'win'");
   const overdueDraws = await req.db.get("SELECT COUNT(*) AS c FROM draws WHERE status = 'scheduled' AND close_at < ?", [now()]);
+  // Settled-only RTP: never show a projected percentage as if it were real.
+  // Until a draw has actually settled with real stakes, the honest value is "—".
+  const settled = await req.db.get(
+    `SELECT COALESCE(SUM(t.wager),0) AS staked, COALESCE(SUM(te.win_amount),0) AS paid
+     FROM ticket_entries te JOIN tickets t ON t.id = te.ticket_id JOIN draws d ON d.id = te.draw_id
+     WHERE d.status = 'settled' AND te.status IN ('won','lost')`);
+  const rtpValue = settled.staked > 0 ? (settled.paid / settled.staked * 100).toFixed(1) + '%' : '—';
+  // Login breakdown, last 30 days, from real login_history rows. Country is
+  // NOT recorded (no geo-IP service is configured), so only browser + OS are
+  // shown — no invented country donut.
+  const loginRows = await req.db.query('SELECT browser, os FROM login_history WHERE created_at > ?', [now() - 30 * 86400000]);
+  const share = (key) => { const m = {}; for (const r of loginRows) { const k = r[key] || 'Unknown'; m[k] = (m[k] || 0) + 1; } return Object.entries(m).sort((a, b) => b[1] - a[1]).slice(0, 6); };
+  const shareBars = (title, entries) => loginRows.length
+    ? ui.card(title, entries.map(([k, c]) => `<div class="share-row"><span class="share-k">${esc(k)}</span><span class="share-bar"><span style="width:${Math.round(c / loginRows.length * 100)}%"></span></span><span class="share-v">${c} (${Math.round(c / loginRows.length * 100)}%)</span></div>`).join(''))
+    : ui.card(title, '<p class="muted">No logins in the last 30 days.</p>');
+  const loginCards = `<div class="grid2">${shareBars('Logins by browser (last 30 days)', share('browser'))}${shareBars('Logins by OS (last 30 days)', share('os'))}</div>
+    <p class="muted">Country breakdown is not shown: logins do not record a country (no geo-IP service configured) — nothing is guessed.</p>`;
   const body = `
     ${ui.kpis([
-      { n: money(req, soldAll.s, getS(req.settings, 'base_currency', 'USD')), l: 'Sold amount (all time)' },
-      { n: money(req, prizeAll.s, getS(req.settings, 'base_currency', 'USD')), l: 'Given prize (all time)' },
-      { n: money(req, soldAll.s - prizeAll.s, getS(req.settings, 'base_currency', 'USD')), l: (soldAll.s - prizeAll.s) >= 0 ? 'Profit (sold − prize)' : 'Loss (sold − prize)' },
-      { n: overdueDraws.c, l: 'Overdue draws — settle now' },
-      { n: users.c, l: 'Players' },
-      { n: ticketsToday.c, l: 'Tickets (24h)' },
-      { n: money(req, ticketsToday.s, getS(req.settings, 'base_currency', 'USD')), l: 'Staked (24h)' },
-      { n: money(req, winsToday.s, getS(req.settings, 'base_currency', 'USD')), l: 'Paid out (24h)' },
-      { n: pendDep.c, l: 'Pending deposits' },
-      { n: pendWd.c, l: 'Pending withdrawals' },
-      { n: openSup.c, l: 'Open support tickets' },
-      { n: (avgRtp * 100).toFixed(1) + '%', l: 'Avg RTP (projected)' },
+      { n: money(req, soldAll.s, getS(req.settings, 'base_currency', 'USD')), l: 'Sold amount (all time)', href: R(req, '/reports?type=business') },
+      { n: money(req, prizeAll.s, getS(req.settings, 'base_currency', 'USD')), l: 'Given prize (all time)', href: R(req, '/reports?type=business') },
+      { n: money(req, soldAll.s - prizeAll.s, getS(req.settings, 'base_currency', 'USD')), l: (soldAll.s - prizeAll.s) >= 0 ? 'Profit (sold − prize)' : 'Loss (sold − prize)', href: R(req, '/reports?type=business') },
+      { n: overdueDraws.c, l: 'Overdue draws — settle now', href: R(req, '/draws') },
+      { n: users.c, l: 'Players', href: R(req, '/users') },
+      { n: ticketsToday.c, l: 'Tickets (24h)', href: R(req, '/tickets') },
+      { n: money(req, ticketsToday.s, getS(req.settings, 'base_currency', 'USD')), l: 'Staked (24h)', href: R(req, '/reports?type=business') },
+      { n: money(req, winsToday.s, getS(req.settings, 'base_currency', 'USD')), l: 'Paid out (24h)', href: R(req, '/reports?type=business') },
+      { n: pendDep.c, l: 'Pending deposits', href: R(req, '/deposits?status=pending') },
+      { n: pendWd.c, l: 'Pending withdrawals', href: R(req, '/withdrawals?status=pending') },
+      { n: openSup.c, l: 'Open support tickets', href: R(req, '/support?status=open') },
+      { n: rtpValue, l: 'RTP (settled draws only)', href: R(req, '/reports?type=business') },
     ])}
+    ${loginCards}
     ${ui.card('Exposure & profit projection', heat + expTable)}
     ${ui.card('Recent audit activity', ui.table(['Time', 'Actor', 'Action', 'Detail'],
       (await req.db.query('SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 8')).map(a =>
@@ -290,6 +308,10 @@ router.get('/users/:id', async (req, res) => {
         { key: 'name', label: 'Name', type: 'text', value: u.name, required: true },
         { key: 'email', label: 'Email', type: 'text', value: u.email },
         { key: 'phone', label: 'Phone', type: 'text', value: u.phone },
+        { key: 'address', label: 'Address', type: 'text', value: u.address },
+        { key: 'city', label: 'City', type: 'text', value: u.city },
+        { key: 'state', label: 'State', type: 'text', value: u.state },
+        { key: 'zip', label: 'Zip / Postal code', type: 'text', value: u.zip },
         { key: 'country', label: 'Country', type: 'text', value: u.country },
         { key: 'kyc_status', label: 'KYC', type: 'select', options: ['none', 'pending', 'verified', 'rejected'], value: u.kyc_status },
         { key: 'agent_id', label: 'Agent (blank = unassigned)', type: 'text', value: u.agent_id || '' },
@@ -340,8 +362,11 @@ router.get('/users/:id', async (req, res) => {
 router.post('/users/:id', async (req, res) => {
   const u = await req.db.get('SELECT * FROM users WHERE id = ?', [req.params.id]);
   if (!u) return notFound(req, res, 'User not found.');
-  await req.db.run('UPDATE users SET name = ?, phone = ?, country = ?, kyc_status = ?, notes = ?, agent_id = ? WHERE id = ?',
-    [req.body.name.trim(), String(req.body.phone || '').slice(0, 32), String(req.body.country || '').slice(0, 64),
+  await req.db.run('UPDATE users SET name = ?, phone = ?, address = ?, city = ?, state = ?, zip = ?, country = ?, kyc_status = ?, notes = ?, agent_id = ? WHERE id = ?',
+    [req.body.name.trim(), String(req.body.phone || '').slice(0, 32),
+     String(req.body.address || '').slice(0, 255), String(req.body.city || '').slice(0, 128),
+     String(req.body.state || '').slice(0, 128), String(req.body.zip || '').slice(0, 32),
+     String(req.body.country || '').slice(0, 64),
      req.body.kyc_status, String(req.body.notes || '').slice(0, 2000), req.body.agent_id ? parseInt(req.body.agent_id, 10) : null, u.id]);
   if (req.body.email && validEmail(req.body.email) && req.body.email.toLowerCase() !== u.email) {
     await req.db.run('UPDATE users SET email = ? WHERE id = ?', [req.body.email.trim().toLowerCase(), u.id]);
@@ -528,12 +553,16 @@ router.get('/deposits', async (req, res) => {
   const page = pageOf(req), status = req.query.status || '';
   const counts = { all: (await req.db.get('SELECT COUNT(*) AS c FROM deposits')).c };
   for (const s of ['pending', 'approved', 'rejected', 'revoked', 'expired']) counts[s] = (await req.db.get('SELECT COUNT(*) AS c FROM deposits WHERE status = ?', [s])).c;
+  const baseCur = getS(req.settings, 'base_currency', 'USD');
+  const depSums = {};
+  for (const s of ['pending', 'approved', 'rejected', 'revoked', 'expired']) depSums[s] = (await req.db.get('SELECT COALESCE(SUM(net),0) AS s FROM deposits WHERE status = ?', [s])).s;
+  const depStrip = `<div class="sumstrip"><span>Successful: <strong>${money(req, depSums.approved, baseCur)}</strong></span><span>Pending: <strong>${money(req, depSums.pending, baseCur)}</strong></span><span>Rejected: <strong>${money(req, depSums.rejected, baseCur)}</strong></span><span>Revoked: <strong>${money(req, depSums.revoked, baseCur)}</strong></span><span>Expired: <strong>${money(req, depSums.expired, baseCur)}</strong></span></div>`;
   const where = status ? 'WHERE d.status = ?' : '', params = status ? [status] : [];
   const total = (await req.db.get(`SELECT COUNT(*) AS c FROM deposits d ${where}`, params)).c;
   const rows = await req.db.query(
     `SELECT d.*, u.email, m.name AS method_name FROM deposits d JOIN users u ON u.id = d.user_id LEFT JOIN payment_methods m ON m.id = d.method_id
      ${where} ORDER BY d.created_at DESC LIMIT ? OFFSET ?`, [...params, PER, (page - 1) * PER]);
-  const body = moneyTabs(req, R(req, '/deposits'), counts, status) + ui.table(['ID', 'Player', 'Method', 'Amount', 'Charge', 'Net', 'Status', 'When', ''],
+  const body = depStrip + moneyTabs(req, R(req, '/deposits'), counts, status) + ui.table(['ID', 'Player', 'Method', 'Amount', 'Charge', 'Net', 'Status', 'When', ''],
     rows.map(x => [`<span class="code">${esc(x.public_id)}</span>`, esc(x.email), esc(x.method_name || '—'),
       money(req, x.amount, x.currency), money(req, x.charge, x.currency), money(req, x.net, x.currency),
       ui.statusBadge(x.status), d(x.created_at), `<a class="btn btn-sm" href="${R(req, '/deposits/' + x.id)}">Review</a>`])) +
@@ -596,12 +625,16 @@ router.get('/withdrawals', async (req, res) => {
   const page = pageOf(req), status = req.query.status || '';
   const counts = { all: (await req.db.get('SELECT COUNT(*) AS c FROM withdrawals')).c };
   for (const s of ['pending', 'approved', 'rejected', 'revoked']) counts[s] = (await req.db.get('SELECT COUNT(*) AS c FROM withdrawals WHERE status = ?', [s])).c;
+  const wdBaseCur = getS(req.settings, 'base_currency', 'USD');
+  const wdSums = {};
+  for (const s of ['pending', 'approved', 'rejected', 'revoked']) wdSums[s] = (await req.db.get('SELECT COALESCE(SUM(net),0) AS s FROM withdrawals WHERE status = ?', [s])).s;
+  const wdStrip = `<div class="sumstrip"><span>Approved: <strong>${money(req, wdSums.approved, wdBaseCur)}</strong></span><span>Pending: <strong>${money(req, wdSums.pending, wdBaseCur)}</strong></span><span>Rejected: <strong>${money(req, wdSums.rejected, wdBaseCur)}</strong></span><span>Revoked: <strong>${money(req, wdSums.revoked, wdBaseCur)}</strong></span></div>`;
   const where = status ? 'WHERE w.status = ?' : '', params = status ? [status] : [];
   const total = (await req.db.get(`SELECT COUNT(*) AS c FROM withdrawals w ${where}`, params)).c;
   const rows = await req.db.query(
     `SELECT w.*, u.email, m.name AS method_name FROM withdrawals w JOIN users u ON u.id = w.user_id LEFT JOIN payment_methods m ON m.id = w.method_id
      ${where} ORDER BY w.created_at DESC LIMIT ? OFFSET ?`, [...params, PER, (page - 1) * PER]);
-  const body = moneyTabs(req, R(req, '/withdrawals'), counts, status) + ui.table(['ID', 'Player', 'Method', 'Amount', 'Charge', 'Net payout', 'Status', 'When', ''],
+  const body = wdStrip + moneyTabs(req, R(req, '/withdrawals'), counts, status) + ui.table(['ID', 'Player', 'Method', 'Amount', 'Charge', 'Net payout', 'Status', 'When', ''],
     rows.map(x => [`<span class="code">${esc(x.public_id)}</span>`, esc(x.email), esc(x.method_name || '—'),
       money(req, x.amount, x.currency), money(req, x.charge, x.currency), money(req, x.net, x.currency),
       ui.statusBadge(x.status), d(x.created_at), `<a class="btn btn-sm" href="${R(req, '/withdrawals/' + x.id)}">Review</a>`])) +
@@ -794,7 +827,7 @@ router.get('/reports', async (req, res) => {
     <button class="btn btn-sm" type="submit">Apply</button></form>`;
   let body = `<div class="tabs">${tabs}</div>` + dateForm;
   if (type === 'business') {
-    const days = [];
+    const days = []; const bars = [];
     for (let ts = from; ts <= to; ts += 86400000) {
       const e = Math.min(ts + 86399999, to);
       const sales = (await req.db.get('SELECT COALESCE(SUM(total),0) AS s, COUNT(*) AS c FROM tickets WHERE created_at BETWEEN ? AND ?', [ts, e]));
@@ -803,8 +836,13 @@ router.get('/reports', async (req, res) => {
       const wds = (await req.db.get("SELECT COALESCE(SUM(net),0) AS s FROM withdrawals WHERE status='approved' AND decided_at BETWEEN ? AND ?", [ts, e])).s;
       const users = (await req.db.get("SELECT COUNT(*) AS c FROM users WHERE role='player' AND created_at BETWEEN ? AND ?", [ts, e])).c;
       days.push([new Date(ts).toISOString().slice(0, 10), sales.c, money(req, sales.s, 'USD'), money(req, wins, 'USD'), money(req, sales.s - wins, 'USD'), money(req, deps, 'USD'), money(req, wds, 'USD'), users]);
+      bars.push({ date: new Date(ts).toISOString().slice(0, 10), staked: sales.s, paid: wins });
     }
-    body += ui.card('Business report', ui.table(['Date', 'Tickets', 'Staked', 'Paid out', 'GGR', 'Deposits', 'Withdrawals', 'New users'], days));
+    const maxBar = Math.max(1, ...bars.map(b => b.staked));
+    const barsHtml = bars.length ? ui.card('Daily staked vs paid out', bars.map(b =>
+      `<div class="daybar"><span class="daybar-d">${b.date}</span><span class="daybar-track"><span class="daybar-fill stake" style="width:${Math.round(b.staked / maxBar * 100)}%"></span><span class="daybar-fill paid" style="width:${Math.round(b.paid / maxBar * 100)}%"></span></span><span class="daybar-v">${money(req, b.staked, 'USD')} staked · ${money(req, b.paid, 'USD')} paid</span></div>`).join('')
+      + '<p class="muted">Gold = staked, green = paid out. Bars are scaled to the biggest day in the selected range.</p>') : '';
+    body += barsHtml + ui.card('Business report', ui.table(['Date', 'Tickets', 'Staked', 'Paid out', 'GGR', 'Deposits', 'Withdrawals', 'New users'], days));
   } else if (type === 'login') {
     const rows = await req.db.query('SELECT * FROM login_history WHERE created_at BETWEEN ? AND ? ORDER BY created_at DESC LIMIT 500', [from, to]);
     const grp = (key) => { const m = {}; for (const r of rows) m[r[key] || '—'] = (m[r[key] || '—'] || 0) + 1; return Object.entries(m).sort((a, b) => b[1] - a[1]); };
@@ -963,15 +1001,22 @@ router.get('/notifications', async (req, res) => {
       <div class="field"><label>Recipient</label><select name="to">
         <option value="all">All active players</option>
         <option value="seg:with_balance">With balance</option>
+        <option value="seg:empty_balance">Empty balance</option>
         <option value="seg:deposited">Have deposited</option>
+        <option value="seg:not_deposited">Never deposited</option>
+        <option value="seg:pending_deposit">Pending deposit</option>
         <option value="seg:pending_withdrawal">Pending withdrawal</option>
+        <option value="seg:top_depositors">Top 10 depositors</option>
         <option value="seg:inactive_7d">Inactive 7+ days (no login)</option>
         ${players.map(u => `<option value="${u.id}">${esc(u.email)} (${esc(u.name)})</option>`).join('')}
       </select></div>
       <div class="field"><label>Subject</label><input type="text" name="subject" required maxlength="150"></div>
       <div class="field"><label>Message</label><textarea name="message" rows="5" required></textarea></div>
+      <div class="field"><label>Start from # (1 = first recipient in the audience list)</label><input type="number" name="start_from" value="1" min="1"></div>
+      <div class="field"><label>Per batch (0 = send all at once)</label><input type="number" name="per_batch" value="0" min="0"></div>
+      <div class="field"><label>Cooling period between batches (seconds, 0 = no batching)</label><input type="number" name="cooling" value="0" min="0"></div>
       <div class="mt"><button class="btn btn-p" type="submit">Send</button></div></form>
-      <p class="muted">Sends an email via the configured SMTP provider (or logs to the outbox when no provider is configured — nothing breaks).</p>`);
+      <p class="muted">Batching: the first batch sends now; later batches are queued with cooling-period spacing and sent by the "Notification batches" cron job (every 5 minutes) or the "Process due now" button in the Outbox. Sends an email via the configured SMTP provider (or logs to the outbox when no provider is configured — nothing breaks).</p>`);
   } else if (tab === 'outbox') {
     const oq = (req.query.oq || '').trim(), ofrom = req.query.ofrom || '', oto = req.query.oto || '';
     const ow = [], op = [];
@@ -983,9 +1028,12 @@ router.get('/notifications', async (req, res) => {
     body += `<form method="GET" class="filters"><input type="hidden" name="tab" value="outbox">
       <input type="text" name="oq" value="${esc(oq)}" placeholder="Search email / subject">
       <input type="date" name="ofrom" value="${esc(ofrom)}"><input type="date" name="oto" value="${esc(oto)}">
-      <button class="btn btn-sm" type="submit">Filter</button></form>` +
+      <button class="btn btn-sm" type="submit">Filter</button></form>
+    <form method="POST" action="${R(req, '/notifications/process-due')}" style="margin-bottom:16px"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm" type="submit">Process due now (send queued batches whose cooling period elapsed)</button></form>` +
     ui.table(['When', 'Channel', 'To', 'Subject', 'Status', 'Error', ''], rows.map(l =>
-      [d(l.created_at), esc(l.channel), esc(l.to_addr), esc(l.subject), ui.statusBadge(l.status), esc(l.error || '—'),
+      [d(l.created_at), esc(l.channel), esc(l.to_addr), esc(l.subject),
+       ui.statusBadge(l.status) + (l.status === 'queued' && l.scheduled_at ? `<br><span class="muted">batch ${l.batch_no || '—'} · due ${d(l.scheduled_at)}</span>` : ''),
+       esc(l.error || '—'),
        `<a class="btn btn-sm" href="${R(req, '/notifications/log/' + l.id)}">Detail</a>`]));
   } else {
     const smtp = !!process.env.SMTP_HOST, sms = !!(process.env.TWILIO_SID && process.env.TWILIO_TOKEN);
@@ -1010,22 +1058,64 @@ router.post('/notifications/send', async (req, res) => {
   const { subject, message } = req.body;
   if (!subject || !message) { await req.setFlash('error', 'Subject and message are required.'); return res.redirect(R(req, '/notifications?tab=send')); }
   let targets;
-  if (req.body.to === 'all') targets = await req.db.query("SELECT email, name FROM users WHERE role = 'player' AND status = 'active'");
-  else if (req.body.to === 'seg:with_balance') targets = await req.db.query("SELECT u.email, u.name FROM users u WHERE u.role = 'player' AND u.status = 'active' AND EXISTS (SELECT 1 FROM wallets w WHERE w.user_id = u.id AND w.balance > 0)");
-  else if (req.body.to === 'seg:deposited') targets = await req.db.query("SELECT DISTINCT u.email, u.name FROM users u JOIN deposits dd ON dd.user_id = u.id AND dd.status = 'approved' WHERE u.role = 'player' AND u.status = 'active'");
-  else if (req.body.to === 'seg:pending_withdrawal') targets = await req.db.query("SELECT DISTINCT u.email, u.name FROM users u JOIN withdrawals ww ON ww.user_id = u.id AND ww.status = 'pending' WHERE u.role = 'player' AND u.status = 'active'");
-  else if (req.body.to === 'seg:inactive_7d') targets = await req.db.query("SELECT email, name FROM users WHERE role = 'player' AND status = 'active' AND (last_login_at IS NULL OR last_login_at < ?)", [now() - 7 * 86400000]);
+  if (req.body.to === 'all') targets = await req.db.query("SELECT id, email, name FROM users WHERE role = 'player' AND status = 'active' ORDER BY id");
+  else if (req.body.to === 'seg:with_balance') targets = await req.db.query("SELECT u.id, u.email, u.name FROM users u WHERE u.role = 'player' AND u.status = 'active' AND EXISTS (SELECT 1 FROM wallets w WHERE w.user_id = u.id AND w.balance > 0) ORDER BY u.id");
+  else if (req.body.to === 'seg:empty_balance') targets = await req.db.query("SELECT u.id, u.email, u.name FROM users u WHERE u.role = 'player' AND u.status = 'active' AND NOT EXISTS (SELECT 1 FROM wallets w WHERE w.user_id = u.id AND w.balance > 0) ORDER BY u.id");
+  else if (req.body.to === 'seg:deposited') targets = await req.db.query("SELECT DISTINCT u.id, u.email, u.name FROM users u JOIN deposits dd ON dd.user_id = u.id AND dd.status = 'approved' WHERE u.role = 'player' AND u.status = 'active' ORDER BY u.id");
+  else if (req.body.to === 'seg:not_deposited') targets = await req.db.query("SELECT u.id, u.email, u.name FROM users u WHERE u.role = 'player' AND u.status = 'active' AND NOT EXISTS (SELECT 1 FROM deposits dd WHERE dd.user_id = u.id AND dd.status = 'approved') ORDER BY u.id");
+  else if (req.body.to === 'seg:pending_deposit') targets = await req.db.query("SELECT DISTINCT u.id, u.email, u.name FROM users u JOIN deposits dd ON dd.user_id = u.id AND dd.status = 'pending' WHERE u.role = 'player' AND u.status = 'active' ORDER BY u.id");
+  else if (req.body.to === 'seg:pending_withdrawal') targets = await req.db.query("SELECT DISTINCT u.id, u.email, u.name FROM users u JOIN withdrawals ww ON ww.user_id = u.id AND ww.status = 'pending' WHERE u.role = 'player' AND u.status = 'active' ORDER BY u.id");
+  else if (req.body.to === 'seg:top_depositors') targets = await req.db.query("SELECT u.id, u.email, u.name FROM users u JOIN deposits dd ON dd.user_id = u.id AND dd.status = 'approved' WHERE u.role = 'player' AND u.status = 'active' GROUP BY u.id ORDER BY SUM(dd.net) DESC LIMIT 10");
+  else if (req.body.to === 'seg:inactive_7d') targets = await req.db.query("SELECT id, email, name FROM users WHERE role = 'player' AND status = 'active' AND (last_login_at IS NULL OR last_login_at < ?) ORDER BY id", [now() - 7 * 86400000]);
   else {
-    const u = await req.db.get('SELECT email, name FROM users WHERE id = ?', [req.body.to]);
+    const u = await req.db.get('SELECT id, email, name FROM users WHERE id = ?', [req.body.to]);
     targets = u ? [u] : [];
   }
+  // Batching: start_from is a 1-based index into the audience list; per_batch
+  // splits the remainder into batches; batch 1 sends now, later batches are
+  // queued with cooling-period spacing (sent by cron or "Process due now").
+  const startFrom = Math.max(1, parseInt(req.body.start_from, 10) || 1);
+  const perBatch = Math.max(0, parseInt(req.body.per_batch, 10) || 0);
+  const cooling = Math.max(0, parseInt(req.body.cooling, 10) || 0);
+  const sliced = targets.slice(startFrom - 1);
+  let sent = 0, failed = 0, queued = 0;
+  if (!perBatch || cooling <= 0 || sliced.length <= perBatch) {
+    for (const t of sliced) {
+      const r = await notify.sendRaw(req.db, req.settings, 'email', t.email, subject, message);
+      if (r.status === 'sent') sent++; else failed++;
+    }
+  } else {
+    const batches = [];
+    for (let i = 0; i < sliced.length; i += perBatch) batches.push(sliced.slice(i, i + perBatch));
+    for (let bi = 0; bi < batches.length; bi++) {
+      if (bi === 0) {
+        for (const t of batches[bi]) {
+          const r = await notify.sendRaw(req.db, req.settings, 'email', t.email, subject, message);
+          if (r.status === 'sent') sent++; else failed++;
+        }
+      } else {
+        const at = now() + cooling * 1000 * bi;
+        for (const t of batches[bi]) {
+          await req.db.run("INSERT INTO notifications_log (channel, to_addr, subject, body, status, error, created_at, batch_no, scheduled_at) VALUES ('email', ?, ?, ?, 'queued', '', ?, ?, ?)", [t.email, subject, message, now(), bi + 1, at]);
+          queued++;
+        }
+      }
+    }
+  }
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'notify.send', entity: 'notification', entityId: '', detail: { to: req.body.to, sent, failed, queued, startFrom, perBatch, cooling, subject }, ip: req.ip });
+  await req.setFlash('success', `Notification processed for ${sliced.length} player(s): ${sent} sent, ${failed} failed, ${queued} queued in later batches (see Outbox for reasons).`);
+  res.redirect(R(req, '/notifications?tab=outbox'));
+});
+router.post('/notifications/process-due', async (req, res) => {
+  const notify = require('../lib/notify');
+  const due = await req.db.query("SELECT * FROM notifications_log WHERE status = 'queued' AND scheduled_at > 0 AND scheduled_at <= ? ORDER BY scheduled_at LIMIT 200", [now()]);
   let sent = 0, failed = 0;
-  for (const t of targets) {
-    const r = await notify.sendRaw(req.db, req.settings, 'email', t.email, subject, message);
+  for (const row of due) {
+    const r = await notify.sendQueued(req.db, req.settings, row);
     if (r.status === 'sent') sent++; else failed++;
   }
-  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'notify.send', entity: 'notification', entityId: '', detail: { to: req.body.to, sent, failed, subject }, ip: req.ip });
-  await req.setFlash('success', `Notification processed for ${targets.length} player(s): ${sent} sent, ${failed} failed (see Outbox for reasons).`);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'notify.process_due', entity: 'notification', entityId: '', detail: { due: due.length, sent, failed }, ip: req.ip });
+  await req.setFlash('success', `Due batches processed: ${sent} sent, ${failed} failed (${due.length} due).`);
   res.redirect(R(req, '/notifications?tab=outbox'));
 });
 router.get('/notifications/:id', async (req, res) => {
@@ -1098,10 +1188,12 @@ router.get('/pages/:id', async (req, res) => {
 router.post('/pages/:id', async (req, res) => {
   const slug = req.body.slug.trim().toLowerCase();
   if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug)) { await req.setFlash('error', 'Invalid slug.'); return res.redirect(R(req, '/pages/' + req.params.id)); }
-  await req.db.run('UPDATE pages SET name=?, slug=?, title=?, meta_title=?, meta_desc=?, body=?, status=? WHERE id=?',
-    [req.body.name.trim(), slug, req.body.title.trim(), req.body.meta_title || '', req.body.meta_desc || '', req.body.body || '', req.body.status, req.params.id]);
-  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'page.update', entity: 'page', entityId: slug, detail: {}, ip: req.ip });
-  await req.setFlash('success', 'Page saved.');
+  try {
+    await req.db.run('UPDATE pages SET name=?, slug=?, title=?, meta_title=?, meta_desc=?, body=?, status=? WHERE id=?',
+      [req.body.name.trim(), slug, req.body.title.trim(), req.body.meta_title || '', req.body.meta_desc || '', req.body.body || '', req.body.status || 'draft', req.params.id]);
+    await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'page.update', entity: 'page', entityId: slug, detail: {}, ip: req.ip });
+    await req.setFlash('success', 'Page saved.');
+  } catch (e) { await req.setFlash('error', 'Could not save page: ' + e.message); }
   res.redirect(R(req, '/pages/' + req.params.id));
 });
 router.post('/pages/:id/delete', async (req, res) => {

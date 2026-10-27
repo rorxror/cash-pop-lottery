@@ -3,7 +3,8 @@ const express = require('express');
 const playerRouter = express.Router();
 const adminRouter = express.Router();
 const { requireLogin, requireRole, rateLimit } = require('../lib/auth');
-const { now, randHex, sha256, toMinor } = require('../lib/util');
+const { now, randHex, sha256, toMinor, esc } = require('../lib/util');
+const ui = require('../lib/admin-ui');
 const { buyTicket, revealTicket, launchSeries, responsibleStatus, logEvent } = require('../lib/scratch');
 
 playerRouter.get('/scratch', async (req, res) => {
@@ -113,11 +114,34 @@ adminRouter.use(requireRole('admin'));
 adminRouter.get('/', async (req, res) => {
   const series = await req.db.query(
     `SELECT s.*, (SELECT COUNT(*) FROM scratch_tickets t WHERE t.series_id=s.id) AS sold,
+      (SELECT COUNT(*) FROM scratch_tickets t WHERE t.series_id=s.id AND t.status='revealed') AS revealed,
       (SELECT COALESCE(SUM(price),0) FROM scratch_tickets t WHERE t.series_id=s.id) AS revenue,
       (SELECT COALESCE(SUM(prize),0) FROM scratch_tickets t WHERE t.series_id=s.id AND t.status='revealed') AS paid,
       (SELECT COALESCE(SUM(amount*quantity),0) FROM scratch_prize_tiers p WHERE p.series_id=s.id) AS prize_pool
      FROM scratch_series s ORDER BY s.created_at DESC`);
-  res.render('scratch_admin', { metaTitle: 'Admin · Scratch Series', metaDesc: '', series });
+  const fmt = (minor, cur) => (Number(minor || 0) / 100).toFixed(2) + ' ' + (cur || 'USD');
+  const base = req.adminPath + '/scratch';
+  const body = ui.card('Scratch series', ui.table(['Title', 'Game', 'Price', 'Sold / total', 'Revenue', 'Paid out', 'Prize pool', 'Status', 'Enabled', 'Actions'],
+    series.map(s => [
+      esc(s.title), esc(s.game_type), fmt(s.price, s.currency), `${s.sold} / ${s.total_tickets}`,
+      fmt(s.revenue, s.currency), fmt(s.paid, s.currency), fmt(s.prize_pool, s.currency),
+      ui.statusBadge(s.status), s.enabled ? ui.badge('on', 'ok') : ui.badge('off', 'muted'),
+      `<form method="POST" action="${base}/${s.id}/launch" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm" data-confirm="Launch this series? Outcomes lock on launch.">Launch</button></form>
+       <form method="POST" action="${base}/${s.id}/toggle" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm">${s.enabled ? 'Disable' : 'Enable'}</button></form>
+       <form method="POST" action="${base}/${s.id}/stop" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm btn-d" data-confirm="Stop this series?">Stop</button></form>`,
+    ]))) +
+    ui.card('Create series', `<p class="muted">New series start as drafts. Review the payout math, then launch — outcomes lock on launch and are provably fair.</p>` +
+      ui.formHtml(base + '/create', [
+        { key: 'title', label: 'Title', type: 'text', required: true },
+        { key: 'slug', label: 'Slug (blank = from title)', type: 'text' },
+        { key: 'game_type', label: 'Game type', type: 'select', options: ['single', 'match3', 'six', 'bonus'] },
+        { key: 'currency', label: 'Currency', type: 'text', value: 'USD' },
+        { key: 'price', label: 'Ticket price (major units, e.g. 1.00)', type: 'text', required: true },
+        { key: 'total_tickets', label: 'Total tickets', type: 'number', required: true },
+        { key: 'tiers', label: 'Prize tiers (one per line: amount:quantity:label)', type: 'textarea', required: true },
+        { key: 'rules', label: 'Rules', type: 'textarea' },
+      ], { csrf: req.csrfToken, submit: 'Create draft' }));
+  res.send(ui.layout({ adminPath: req.adminPath, section: '/scratch', title: 'Scratch', body, csrf: req.csrfToken, flash: req.flashData || {}, assetV: req.app.locals.assetV || '1' }));
 });
 
 adminRouter.post('/create', async (req, res) => {

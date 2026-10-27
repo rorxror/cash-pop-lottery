@@ -98,6 +98,12 @@ img, video, iframe, embed { max-width: 100%; height: auto; }
 
 /* ---------- Layout utilities ---------- */
 .wrap { max-width: var(--container); margin: 0 auto; padding-left: var(--gutter); padding-right: var(--gutter); width: 100%; }
+/* Auto-fit guard: no page may ever scroll sideways on any screen width
+   (PC, laptop, tablet, iPad, iPhone, Android). Any wide element is clipped
+   instead of pushing the layout into a "zoomed" state. */
+html, body { overflow-x: hidden; }
+@supports (overflow: clip) { html, body { overflow-x: clip; } }
+img, video, svg { max-width: 100%; }
 .section { padding-top: var(--sp-8); padding-bottom: var(--sp-8); }
 .section.narrow, .narrow { max-width: 640px; margin-left: auto; margin-right: auto; }
 .narrow-wide { max-width: 860px; margin-left: auto; margin-right: auto; }
@@ -972,7 +978,16 @@ body {
 .adm-side nav a:hover { background: rgba(0,0,0,0.05); }
 .adm-side nav a.active { background: rgba(0,113,227,0.1); color: #0071e3; font-weight: 600; }
 .adm-main { padding: 32px; }
-.adm-top h1 { font-size: 28px; font-weight: 700; letter-spacing: -0.5px; margin-bottom: 24px; }
+/* NOTE: the base theme's --white variable is actually dark navy (#17203a)
+   and --navy-900 is light — so the base .adm-top (background: var(--white))
+   renders as a dark bar with an invisible dark title. These Apple overrides
+   pin real white/dark values instead of renaming the global variables. */
+.adm-top { background: #fff; border-bottom: 1px solid rgba(60,60,67,0.12); }
+.adm-top h1 { font-size: 28px; font-weight: 700; letter-spacing: -0.5px; margin-bottom: 24px; color: #1d1d1f; }
+.adm .field input[type="text"], .adm .field input[type="email"], .adm .field input[type="password"],
+.adm .field input[type="number"], .adm .field input[type="tel"], .adm .field select, .adm .field textarea {
+  background: #fff; color: #1d1d1f; border-color: rgba(60,60,67,0.2);
+}
 .adm .card, .adm-main .card {
   background: #fff; border-radius: 20px;
   box-shadow: 0 4px 16px rgba(0,0,0,0.08), 0 1px 4px rgba(0,0,0,0.04);
@@ -990,6 +1005,39 @@ body {
 .adm input[type="checkbox"]:checked { background: #34c759; }
 .adm input[type="checkbox"]::after { content: ''; position: absolute; top: 2px; left: 2px; width: 27px; height: 27px; border-radius: 50%; background: #fff; box-shadow: 0 2px 4px rgba(0,0,0,0.2); transition: transform 0.2s; }
 .adm input[type="checkbox"]:checked::after { transform: translateX(20px); }
+/* Apple KPI cards: white, dark numbers, gold only as hover accent */
+.adm .kpi { background: #fff; border-radius: 20px; box-shadow: 0 4px 16px rgba(0,0,0,0.08), 0 1px 4px rgba(0,0,0,0.04); border: 1px solid rgba(60,60,67,0.08); padding: 20px 24px; }
+.adm .kpi .n { color: #1d1d1f; font-size: 28px; font-weight: 700; letter-spacing: -0.5px; }
+.adm .kpi .l { color: #86868b; }
+.adm .kpi-link { text-decoration: none; color: inherit; }
+.adm .kpi-link:hover { text-decoration: none; box-shadow: 0 8px 24px rgba(0,0,0,0.12); }
+.adm .kpi-link:hover .n { color: #0071e3; }
+/* Share bars (login breakdown: browser / OS) */
+.share-row { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+.share-k { flex: 0 0 120px; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.share-bar { flex: 1; height: 10px; background: rgba(60,60,67,0.1); border-radius: 999px; overflow: hidden; }
+.share-bar span { display: block; height: 100%; background: #0071e3; border-radius: 999px; }
+.share-v { flex: 0 0 110px; text-align: right; font-size: 13px; color: #86868b; }
+/* Daily bars (business report: staked vs paid out) */
+.daybar { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+.daybar-d { flex: 0 0 92px; font-size: 13px; color: #86868b; }
+.daybar-track { flex: 1; height: 12px; background: rgba(60,60,67,0.08); border-radius: 999px; overflow: hidden; position: relative; }
+.daybar-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 999px; }
+.daybar-fill.stake { background: #d9940d; }
+.daybar-fill.paid { background: #34c759; }
+.daybar-v { flex: 0 0 230px; font-size: 13px; color: #1d1d1f; text-align: right; }
+/* Summary strips (deposits / withdrawals totals by status) */
+.sumstrip { display: flex; flex-wrap: wrap; gap: 12px 24px; background: #fff; border: 1px solid rgba(60,60,67,0.08); border-radius: 16px; padding: 16px 20px; margin-bottom: 16px; box-shadow: 0 4px 16px rgba(0,0,0,0.06); }
+.sumstrip span { font-size: 15px; color: #1d1d1f; }
+.sumstrip strong { font-weight: 700; }
+@media (max-width: 640px) {
+  .adm-main { padding: 16px; }
+  .adm-top h1 { font-size: 24px; }
+  .adm .card-b { padding: 16px; }
+  .daybar-v { display: none; }
+  .share-k { flex-basis: 84px; }
+  .share-v { flex-basis: 84px; }
+}
 
 /* ---------- Login page premium polish ---------- */
 .login-branding { text-align: center; margin: var(--sp-5) 0 var(--sp-3); padding: var(--sp-4); background: linear-gradient(135deg, #fffdf5, #fdf8ec); border: 1px solid var(--gold-border); border-radius: var(--r-md); }
@@ -1166,10 +1214,10 @@ h1, h2 { font-weight: 800; }
   text-shadow: 0 1px 3px rgba(120,70,0,.5);
   animation: floaty 7s ease-in-out infinite;
 }
-.fball.f1 { top: 10%; right: 6%; width: 66px; height: 66px; font-size: 24px; }
-.fball.f2 { top: 60%; right: 22%; width: 46px; height: 46px; font-size: 17px; animation-delay: -2.2s; }
-.fball.f3 { top: 22%; right: 34%; width: 34px; height: 34px; font-size: 13px; animation-delay: -4.1s; opacity: .75; }
-.fball.f4 { top: 74%; right: 5%; width: 27px; height: 27px; font-size: 11px; animation-delay: -1.2s; opacity: .65; }
+.fball.f1 { top: 10%; right: 2%; width: 66px; height: 66px; font-size: 24px; }
+.fball.f2 { top: 64%; right: 6%; width: 46px; height: 46px; font-size: 17px; animation-delay: -2.2s; }
+.fball.f3 { top: 34%; right: 3%; width: 34px; height: 34px; font-size: 13px; animation-delay: -4.1s; opacity: .75; }
+.fball.f4 { top: 82%; right: 8%; width: 27px; height: 27px; font-size: 11px; animation-delay: -1.2s; opacity: .65; }
 @keyframes floaty { 0%, 100% { transform: translateY(0) rotate(-5deg); } 50% { transform: translateY(-18px) rotate(6deg); } }
 @media (max-width: 1024px) { .hero-float { display: none; } }
 
