@@ -60,7 +60,7 @@ router.post('/:rail', express.raw({ type: '*/*' }), async (req, res) => {
     // Exact provider_txn_id match first; then a QUOTED user_data value match
     // (user_data is JSON, so quoting avoids short-ref false positives).
     const dep = await req.db.get(
-      `SELECT * FROM deposits WHERE provider_txn_id = ? OR user_data LIKE ? ORDER BY created_at DESC LIMIT 1`,
+      `SELECT * FROM deposits WHERE provider_txn_id = ? OR LOWER(user_data) LIKE LOWER(?) ORDER BY created_at DESC LIMIT 1`,
       [ev.ref, '%"' + ev.ref.replace(/[%_\\]/g, '') + '"%']);
     if (dep) {
       depositId = dep.id;

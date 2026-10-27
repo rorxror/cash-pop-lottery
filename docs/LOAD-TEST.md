@@ -33,3 +33,14 @@ v14 code, warmed-up process. Numbers are indicative, not production capacity.
   nodemailer, qrcode + optional mysql2). The operator MUST run `npm audit`
   on a machine with registry access before real-money launch and fix any
   non-breaking findings; this is an environment limitation, not a clean bill.
+
+## v15 Postgres load test (demo localhost, PostgreSQL 16, same script)
+- Run 1: 20 concurrent x 200 requests -> 200/200 OK, 0 errors, 93 req/s,
+  p50 184ms, p95 392ms, p99 521ms.
+- Run 2: 50 concurrent x 500 requests -> 500/500 OK, 0 errors, 130 req/s,
+  p50 333ms, p95 723ms, p99 832ms.
+- Slower than the v14 SQLite run (expected: Postgres round-trips), still
+  zero errors at both levels. Demo server still 200 afterwards.
+- npm audit re-tried for v15 (adds `pg`): STILL blocked by the same sandbox
+  policy — honestly unrun, NOT claimed clean; operator must run it with
+  registry access.

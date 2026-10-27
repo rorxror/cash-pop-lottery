@@ -129,7 +129,10 @@ router.post('/play/buy', requireLogin, async (req, res) => {
 router.get('/tickets', requireLogin, async (req, res) => {
   const tickets = await req.db.query('SELECT * FROM tickets WHERE user_id = ? ORDER BY created_at DESC LIMIT 100', [req.user.id]);
   for (const t of tickets) {
-    const c = await req.db.get('SELECT COUNT(*) AS n, SUM(status = ?) AS w FROM ticket_entries WHERE ticket_id = ?', ['won', t.id]);
+    // CASE WHEN, not SUM(status = ?): SQLite/MySQL treat a comparison as
+    // 1/0, but Postgres returns a boolean and sum(boolean) does not exist
+    // (this 500'd /tickets on Postgres with error 42883).
+    const c = await req.db.get('SELECT COUNT(*) AS n, COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END),0) AS w FROM ticket_entries WHERE ticket_id = ?', ['won', t.id]);
     t.entry_count = c.n; t.won_count = c.w || 0;
     t.pops = JSON.parse(t.pops || '[]');
   }
@@ -191,7 +194,9 @@ router.get('/deposit/new', requireLogin, async (req, res) => {
 router.post('/deposit/new', requireLogin, async (req, res) => {
   const policy = depositPolicy(req.settings, req.user);
   if (!policy.allowed) return res.status(403).render('error', { status: 403, message: policy.reason });
-  const method = await req.db.get("SELECT * FROM payment_methods WHERE id = ? AND enabled = 1 AND kind IN ('deposit','both')", [req.body.method_id]);
+  const methodId = parseInt(req.body.method_id, 10);
+  if (!methodId) return res.status(400).render('error', { status: 400, message: 'Invalid deposit method.' });
+  const method = await req.db.get("SELECT * FROM payment_methods WHERE id = ? AND enabled = 1 AND kind IN ('deposit','both')", [methodId]);
   if (!method) return res.status(400).render('error', { status: 400, message: 'Invalid deposit method.' });
   const amount = toMinor(req.body.amount);
   if (amount === null || amount <= 0) return res.status(400).render('error', { status: 400, message: 'Enter a valid amount.' });
@@ -245,7 +250,9 @@ router.get('/withdraw/new', requireLogin, async (req, res) => {
 router.post('/withdraw/new', requireLogin, async (req, res) => {
   const policy = withdrawalPolicy(req.settings, req.user);
   if (!policy.allowed) return res.status(403).render('error', { status: 403, message: policy.reason });
-  const method = await req.db.get("SELECT * FROM payment_methods WHERE id = ? AND enabled = 1 AND kind IN ('withdrawal','both')", [req.body.method_id]);
+  const methodId = parseInt(req.body.method_id, 10);
+  if (!methodId) return res.status(400).render('error', { status: 400, message: 'Invalid withdrawal method.' });
+  const method = await req.db.get("SELECT * FROM payment_methods WHERE id = ? AND enabled = 1 AND kind IN ('withdrawal','both')", [methodId]);
   if (!method) return res.status(400).render('error', { status: 400, message: 'Invalid withdrawal method.' });
   const amount = toMinor(req.body.amount);
   if (amount === null || amount <= 0) return res.status(400).render('error', { status: 400, message: 'Enter a valid amount.' });

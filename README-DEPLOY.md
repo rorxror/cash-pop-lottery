@@ -143,3 +143,30 @@ these. Live automation needs:
   enrollment (Admin → Security) before enabling `admin_totp_required`.
 - Ops docs: docs/THREAT-MODEL.md, docs/INCIDENT-RESPONSE.md,
   docs/LOAD-TEST.md (includes the npm-audit sandbox limitation).
+
+## Switching to Postgres (recommended for production, v15)
+- Set `DB_DRIVER=postgres` and `DATABASE_URL` (Render: create a Postgres
+  Basic database, then copy its Internal Database URL into the service's
+  environment as `DATABASE_URL` and redeploy). `DATABASE_URL` alone also
+  implies postgres; an explicit `DB_DRIVER` wins.
+- SSL: any non-localhost `DATABASE_URL` host gets SSL automatically
+  (Render Postgres requires it; `rejectUnauthorized: false` because Render
+  uses its own CA). Localhost demo DBs run without SSL. `PGSSLMODE=require`
+  forces SSL; `PGHOST`/`PGPORT`/`PGUSER`/`PGPASSWORD`/`PGDATABASE` may be
+  used instead of a URL.
+- All money/timestamps are BIGINT (epoch-ms, minor units — no 32-bit
+  overflow); `pg` is a HARD dependency, not optional, so a build can never
+  skip it and fail boot. App SQL keeps `?` placeholders; the adapter
+  translates them to `$1, $2, ...`. Case-insensitive search uses
+  `LOWER(col) LIKE LOWER(?)` on all drivers (Postgres `LIKE` is
+  case-sensitive, unlike SQLite/MySQL).
+- Migrating existing data: boot the app against the target Postgres once
+  (creates the schema + boot seeds), STOP it (maintenance mode is NOT
+  enough — the in-process cron keeps writing draws/reports while HTTP is
+  gated), then run:
+  `TRANSFER_WIPE_TARGET=1 TARGET_DATABASE_URL=... SQLITE_PATH=... node scripts/migrate-sqlite-to-postgres.js`
+  The script wipes every app row in the target and re-inserts the source
+  rows with original ids inside one transaction (any failure rolls back),
+  then resets each integer-id sequence past MAX(id). Verify afterwards:
+  row counts match, admin login works, and a newly registered user gets an
+  id above the transferred max.

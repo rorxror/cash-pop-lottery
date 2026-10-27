@@ -24,7 +24,7 @@ const ejs = require('ejs');
 const { openDB } = require('./lib/db');
 const { migrate } = require('./lib/migrations');
 const { ensureScratchSchema } = require('./lib/scratch');
-const { getSettings, getS, getBool, getCurrencies } = require('./lib/settings');
+const { getSettings, getS, getBool, getCurrencies, keyCol } = require('./lib/settings');
 const { loadSession, csrfToken, checkCsrf, touchSession, destroySession } = require('./lib/auth');
 const { fmtMoney, parseAmountList, now } = require('./lib/util');
 const { getExtensions } = require('./lib/extensions');
@@ -203,7 +203,7 @@ async function boot() {
         impersonatorName = adm ? adm.name : ('#' + req.sessionData.impersonated_by);
       }
 
-      const blocks = await db.query('SELECT `key`, body FROM content_blocks').catch(() => []);
+      const blocks = await db.query(`SELECT ${keyCol(driver)}, body FROM content_blocks`).catch(() => []);
       const blockMap = Object.fromEntries(blocks.map(b => [b.key, b.body]));
       const exts = await getExtensions(db).catch(() => ({}));
       req.exts = exts;

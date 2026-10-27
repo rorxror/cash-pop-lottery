@@ -4,6 +4,7 @@
 const express = require('express');
 const router = express.Router();
 const { sha256 } = require('../lib/util');
+const { keyCol } = require('../lib/settings');
 const { deriveWinningNumberLegacy, deriveWinningNumberFair, combineSeed, publicDrawInfo } = require('../lib/draws');
 
 function resolveContent(body, blocks) {
@@ -61,7 +62,7 @@ router.get('/page/:slug', async (req, res) => {
   const pg = await req.db.get('SELECT * FROM pages WHERE slug = ? AND status = ?', [req.params.slug, 'published']);
   if (!pg) return res.status(404).render('error', { status: 404, message: 'Page not found.' });
   const blocks = {};
-  for (const b of await req.db.query('SELECT `key`, body FROM content_blocks')) blocks[b.key] = b.body;
+  for (const b of await req.db.query(`SELECT ${keyCol(req.driver)}, body FROM content_blocks`)) blocks[b.key] = b.body;
   res.render('cms', {
     metaTitle: pg.meta_title || pg.title, metaDesc: pg.meta_desc || '',
     pg: { ...pg, body: resolveContent(pg.body, blocks) },

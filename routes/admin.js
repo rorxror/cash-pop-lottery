@@ -7,7 +7,7 @@ const express = require('express');
 const router = express.Router();
 const QRCode = require('qrcode');
 const { now, randHex, sha256, hashPassword, validEmail, toMinor, esc, fromMinor } = require('../lib/util');
-const { getS, getBool, setSetting, getCurrencies, getSettings } = require('../lib/settings');
+const { getS, getBool, setSetting, getCurrencies, getSettings, keyCol } = require('../lib/settings');
 const { requireLogin, requireRole, createSession, destroySession, destroyUserSessions, verifyTotp } = require('../lib/auth');
 const { decideDeposit, decideWithdrawal, getBalances, postLedger, markWithdrawalPaid, settleAgentCommissions, releaseReferralCredits } = require('../lib/money');
 const { RAILS, getRail, isBlockedRail } = require('../lib/rails');
@@ -45,6 +45,13 @@ router.use(requireLogin, requireRole('admin'));
    safety + draws + flags, super = everything). Stealth above still runs
    first, so outsiders never see a 403 — only the plain 404. */
 router.use(rbacMiddleware);
+/* Numeric :id guard: every admin :id param is a numeric DB id (public ids use
+   :publicId, content uses :key). A crafted non-numeric id (e.g. empty) would
+   otherwise reach Postgres as '' and 500 with 22P02 — return 404 instead. */
+router.param('id', (req, res, next, id) => {
+  if (!/^\d+$/.test(id)) return notFound(req, res, 'Not found.');
+  next();
+});
 
 /* ---------- helpers ---------- */
 function adminPath(req) { return req.adminPath; }
@@ -260,7 +267,7 @@ router.get('/tickets', async (req, res) => {
   const page = pageOf(req);
   const where = [], params = [];
   if (req.query.status) { where.push('t.status = ?'); params.push(req.query.status); }
-  if (req.query.q) { where.push('(t.public_id LIKE ? OR u.email LIKE ?)'); params.push('%' + req.query.q + '%', '%' + req.query.q + '%'); }
+  if (req.query.q) { where.push('(LOWER(t.public_id) LIKE LOWER(?) OR LOWER(u.email) LIKE LOWER(?))'); params.push('%' + req.query.q + '%', '%' + req.query.q + '%'); }
   const w = where.length ? 'WHERE ' + where.join(' AND ') : '';
   const total = (await req.db.get(`SELECT COUNT(*) AS c FROM tickets t JOIN users u ON u.id = t.user_id ${w}`, params)).c;
   const rows = await req.db.query(
@@ -271,12 +278,46 @@ router.get('/tickets', async (req, res) => {
     { key: 'q', label: 'Ticket ID or email' },
   ], req.query) + ui.table(['Ticket', 'Player', 'Pops', 'Wager', 'Draws', 'Total', 'Status', 'HMAC', 'Bought'],
     rows.map(t => [
-      `<span class="code">${esc(t.public_id)}</span>`, esc(t.email),
+      `<a href="${R(req, '/tickets/' + t.id)}"><span class="code">${esc(t.public_id)}</span></a>`, esc(t.email),
       JSON.parse(t.pops || '[]').join(', '), money(req, t.wager, t.currency),
       `${t.draw_type} ×${t.num_draws}`, money(req, t.total, t.currency),
       ui.statusBadge(t.status), `<span class="code">${esc(t.hmac.slice(0, 10))}…</span>`, d(t.created_at),
     ])) + ui.paginate(R(req, '/tickets'), page, PER, total);
   res.send(shell(req, '/tickets', 'Tickets', body));
+});
+
+/* Ticket detail (v15: the tickets list previously had no drill-down — an
+   admin could not open a single ticket at all). Read-only. */
+router.get('/tickets/:id', async (req, res) => {
+  const t = await req.db.get(`SELECT t.*, u.email, u.name AS user_name FROM tickets t JOIN users u ON u.id = t.user_id WHERE t.id = ?`, [req.params.id]);
+  if (!t) return notFound(req, res, 'Ticket not found.');
+  const entries = await req.db.query(
+    `SELECT te.*, d.draw_type, d.draw_date, d.winning_number, d.status AS draw_status FROM ticket_entries te JOIN draws d ON d.id = te.draw_id WHERE te.ticket_id = ? ORDER BY d.close_at`, [t.id]);
+  let pops = [];
+  try { pops = JSON.parse(t.pops || '[]'); } catch {}
+  const body = ui.card('Ticket ' + t.public_id, `
+    <div class="grid2"><div>
+      ${ui.table(['Field', 'Value'], [
+        ['Player', `${esc(t.user_name)} (${esc(t.email)})`],
+        ['Pops', pops.join(', ')],
+        ['Wager per pop', money(req, t.wager, t.currency)],
+        ['Draws', `${t.draw_type} ×${t.num_draws}`],
+        ['Total', money(req, t.total, t.currency)],
+        ['Status', ui.statusBadge(t.status)],
+        ['HMAC', `<span class="code">${esc(t.hmac)}</span>`],
+        ['IP', esc(t.ip || '—')],
+        ['Bought', d(t.created_at)],
+      ])}
+    </div><div>
+      <h4>Draw entries</h4>
+      ${entries.length ? ui.table(['Draw', 'Date', 'Winning', 'Entry status', 'Win'], entries.map(e => [
+        esc(e.draw_type), esc(e.draw_date),
+        e.winning_number == null ? '—' : String(e.winning_number),
+        ui.statusBadge(e.status), money(req, e.win_amount || 0, t.currency),
+      ])) : '<p class="muted">No entries.</p>'}
+    </div></div>
+    <div class="btn-row mt"><a class="btn" href="${R(req, '/tickets')}">← Back to tickets</a> <a class="btn" href="${R(req, '/users/' + t.user_id)}">View player</a></div>`);
+  res.send(shell(req, '/tickets', 'Ticket ' + t.public_id, body));
 });
 
 module.exports = router;
@@ -298,7 +339,7 @@ router.get('/users', async (req, res) => {
   else if (f === 'mobile_unverified') where.push('COALESCE(u.mobile_verified,0) = 0');
   else if (f === 'with_balance') where.push('EXISTS (SELECT 1 FROM wallets w WHERE w.user_id = u.id AND w.balance > 0)');
   else if (f === 'kyc_pending') where.push("u.kyc_status = 'pending'");
-  if (q) { where.push('(u.email LIKE ? OR u.name LIKE ? OR u.phone LIKE ?)'); params.push(`%${q}%`, `%${q}%`, `%${q}%`); }
+  if (q) { where.push('(LOWER(u.email) LIKE LOWER(?) OR LOWER(u.name) LIKE LOWER(?) OR LOWER(u.phone) LIKE LOWER(?))'); params.push(`%${q}%`, `%${q}%`, `%${q}%`); }
   const w = 'WHERE ' + where.join(' AND ');
   // live badges
   const badges = {};
@@ -1127,7 +1168,7 @@ router.post('/extensions/:key', async (req, res) => {
     if (f.required && !v) { await req.setFlash('error', `"${f.label}" is required.`); return res.redirect(R(req, '/extensions/' + e.key)); }
     config[f.key] = v;
   }
-  await setExtension(req.db, e.key, { enabled: !!req.body.enabled, config });
+  await setExtension(req.db, e.key, { enabled: !!req.body.enabled, config }, req.driver);
   // mirror well-known keys into env-backed settings where the frontend reads them
   if (e.key === 'recaptcha' && config.site_key) { process.env.RECAPTCHA_SITE_KEY = config.site_key; }
   await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'extension.update', entity: 'extension', entityId: e.key, detail: { enabled: !!req.body.enabled }, ip: req.ip });
@@ -1137,7 +1178,7 @@ router.post('/extensions/:key', async (req, res) => {
 router.post('/extensions/:key/toggle', async (req, res) => {
   const e = (await getExtensions(req.db))[req.params.key];
   if (!e) return notFound(req, res, 'Extension not found.');
-  await setExtension(req.db, e.key, { enabled: !e.enabled });
+  await setExtension(req.db, e.key, { enabled: !e.enabled }, req.driver);
   await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'extension.toggle', entity: 'extension', entityId: e.key, detail: { enabled: !e.enabled }, ip: req.ip });
   res.redirect(R(req, '/extensions'));
 });
@@ -1180,7 +1221,7 @@ router.get('/notifications', async (req, res) => {
   } else if (tab === 'outbox') {
     const oq = (req.query.oq || '').trim(), ofrom = req.query.ofrom || '', oto = req.query.oto || '';
     const ow = [], op = [];
-    if (oq) { ow.push('(to_addr LIKE ? OR subject LIKE ?)'); op.push('%' + oq + '%', '%' + oq + '%'); }
+    if (oq) { ow.push('(LOWER(to_addr) LIKE LOWER(?) OR LOWER(subject) LIKE LOWER(?))'); op.push('%' + oq + '%', '%' + oq + '%'); }
     if (ofrom) { ow.push('created_at >= ?'); op.push(new Date(ofrom + 'T00:00:00Z').getTime()); }
     if (oto) { ow.push('created_at <= ?'); op.push(new Date(oto + 'T23:59:59Z').getTime()); }
     const owq = ow.length ? 'WHERE ' + ow.join(' AND ') : '';
@@ -1311,7 +1352,7 @@ router.get('/pages', async (req, res) => {
         [esc(p.name), `<span class="code">/page/${esc(p.slug)}</span>`, esc(p.title), esc(p.meta_title || '—'), ui.statusBadge(p.status),
          `<a class="btn btn-sm" href="${R(req, '/pages/' + p.id)}">Edit</a>`]));
   } else {
-    const rows = await req.db.query('SELECT * FROM content_blocks ORDER BY `key`');
+    const rows = await req.db.query(`SELECT * FROM content_blocks ORDER BY ${keyCol(req.driver)}`);
     body += ui.table(['Key', 'Title', 'Updated', ''], rows.map(b =>
       [`<span class="code">${esc(b.key)}</span>`, esc(b.title), d(b.updated_at), `<a class="btn btn-sm" href="${R(req, '/content/' + encodeURIComponent(b.key))}">Edit</a>`]));
   }
@@ -1363,7 +1404,7 @@ router.post('/pages/:id/delete', async (req, res) => {
   res.redirect(R(req, '/pages'));
 });
 router.get('/content/:key', async (req, res) => {
-  const b = await req.db.get('SELECT * FROM content_blocks WHERE `key` = ?', [req.params.key]);
+  const b = await req.db.get(`SELECT * FROM content_blocks WHERE ${keyCol(req.driver)} = ?`, [req.params.key]);
   if (!b) return notFound(req, res, 'Content block not found.');
   res.send(shell(req, '/pages', 'Content — ' + b.key,
     ui.card('Content block', ui.formHtml(R(req, '/content/' + encodeURIComponent(b.key)), [
@@ -1372,7 +1413,7 @@ router.get('/content/:key', async (req, res) => {
     ], { csrf: req.csrfToken, submit: 'Save content', grid: false }))));
 });
 router.post('/content/:key', async (req, res) => {
-  await req.db.run('UPDATE content_blocks SET title = ?, body = ?, updated_at = ? WHERE `key` = ?',
+  await req.db.run(`UPDATE content_blocks SET title = ?, body = ?, updated_at = ? WHERE ${keyCol(req.driver)} = ?`,
     [req.body.title || '', req.body.body || '', now(), req.params.key]);
   await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'content.update', entity: 'content', entityId: req.params.key, detail: {}, ip: req.ip });
   await req.setFlash('success', 'Content saved.');
@@ -1420,7 +1461,7 @@ router.post('/cron/:id/toggle', async (req, res) => {
 /* Global login history (ViserLab-style report: IP, browser, OS, success) */
 router.get('/login-history', async (req, res) => {
   const page = pageOf(req), q = (req.query.q || '').trim();
-  const where = q ? 'WHERE lh.email LIKE ?' : '', params = q ? ['%' + q + '%'] : [];
+  const where = q ? 'WHERE LOWER(lh.email) LIKE LOWER(?)' : '', params = q ? ['%' + q + '%'] : [];
   const total = (await req.db.get(`SELECT COUNT(*) AS c FROM login_history lh ${where}`, params)).c;
   const rows = await req.db.query(
     `SELECT lh.*, u.name FROM login_history lh LEFT JOIN users u ON u.id = lh.user_id
@@ -1834,7 +1875,7 @@ router.post('/security/totp/disable', async (req, res) => {
 /* ============================================================ AUDIT TRAIL */
 router.get('/audit', async (req, res) => {
   const page = pageOf(req), q = req.query.q || '';
-  const where = q ? 'WHERE action LIKE ? OR entity LIKE ? OR detail LIKE ?' : '';
+  const where = q ? 'WHERE LOWER(action) LIKE LOWER(?) OR LOWER(entity) LIKE LOWER(?) OR LOWER(detail) LIKE LOWER(?)' : '';
   const params = q ? [`%${q}%`, `%${q}%`, `%${q}%`] : [];
   const total = (await req.db.get(`SELECT COUNT(*) AS c FROM audit_log ${where}`, params)).c;
   const rows = await req.db.query(`SELECT * FROM audit_log ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`, [...params, PER, (page - 1) * PER]);
