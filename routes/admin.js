@@ -18,6 +18,22 @@ const notify = require('../lib/notify');
 const audit = require('../lib/audit');
 const ui = require('../lib/admin-ui');
 
+/* STEALTH: the admin panel must not exist for anyone but a logged-in admin.
+   Logged-out visitors used to be redirected to /login and logged-in players
+   got 403 — both responses CONFIRM an admin area lives at this URL. Now any
+   non-admin request to any admin path gets a plain 404, identical to a
+   nonexistent page: no login form, no "access denied", no signal at all.
+   Probes are recorded in the audit trail. The existing guards stay behind
+   this as a second layer. */
+router.use(async (req, res, next) => {
+  if (!req.user || req.user.role !== 'admin') {
+    try {
+      await audit.log(req.db, { actorId: null, actorRole: 'anonymous', action: 'admin.probe', entity: 'admin', entityId: '', detail: { path: req.path }, ip: req.ip });
+    } catch (e) { /* audit failure must never reveal the panel */ }
+    return res.status(404).render('error', { status: 404, message: 'Page not found.' });
+  }
+  next();
+});
 router.use(requireLogin, requireRole('admin'));
 
 /* ---------- helpers ---------- */

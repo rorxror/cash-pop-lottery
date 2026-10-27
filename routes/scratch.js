@@ -110,6 +110,19 @@ playerRouter.get('/scratch/:slug', async (req, res) => {
   res.render('scratch_detail', { metaTitle: series.title, metaDesc: '', series, tiers });
 });
 
+/* STEALTH (same rule as routes/admin.js): non-admin requests to the scratch
+   admin path get a plain 404 — never a login redirect or 403 — so the path
+   reveals nothing to anyone guessing URLs. */
+adminRouter.use(async (req, res, next) => {
+  if (!req.user || req.user.role !== 'admin') {
+    try {
+      const audit = require('../lib/audit');
+      await audit.log(req.db, { actorId: null, actorRole: 'anonymous', action: 'admin.probe', entity: 'admin', entityId: '', detail: { path: '/scratch' + req.path }, ip: req.ip });
+    } catch (e) { /* audit failure must never reveal the panel */ }
+    return res.status(404).render('error', { status: 404, message: 'Page not found.' });
+  }
+  next();
+});
 adminRouter.use(requireRole('admin'));
 adminRouter.get('/', async (req, res) => {
   const series = await req.db.query(
