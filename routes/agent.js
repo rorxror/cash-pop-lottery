@@ -3,7 +3,7 @@
    delegated user creation, float-funded wallet transfers, commissions. */
 const express = require('express');
 const router = express.Router();
-const { now, randHex, validEmail, hashPassword } = require('../lib/util');
+const { now, randHex, validEmail, hashPassword, normalizeEmail, normalizePhone } = require('../lib/util');
 const { getS } = require('../lib/settings');
 const { requireLogin, requireRole } = require('../lib/auth');
 const { getBalances, postLedger } = require('../lib/money');
@@ -65,12 +65,17 @@ router.post('/players/new', async (req, res) => {
   if (!name || !validEmail(email) || !password || password.length < 6) {
     return res.render('agent/create_user', { metaTitle: 'Create Player', metaDesc: '', formError: 'Name, valid email and a 6+ character password are required.' });
   }
-  const emailLc = email.trim().toLowerCase();
+  const emailLc = normalizeEmail(email);
+  const phoneNorm = normalizePhone(phone);
   const ex = await req.db.get('SELECT id FROM users WHERE email = ?', [emailLc]);
   if (ex) return res.render('agent/create_user', { metaTitle: 'Create Player', metaDesc: '', formError: 'Email already registered.' });
+  if (phoneNorm) {
+    const exPhone = await req.db.get('SELECT id FROM users WHERE phone = ?', [phoneNorm]);
+    if (exPhone) return res.render('agent/create_user', { metaTitle: 'Create Player', metaDesc: '', formError: 'Phone number already registered.' });
+  }
   const r = await req.db.run(
     'INSERT INTO users (email, phone, name, password_hash, role, status, agent_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-    [emailLc, String(phone || '').trim(), name.trim(), hashPassword(password), 'player', 'active', aid, now()]);
+    [emailLc, phoneNorm, name.trim(), hashPassword(password), 'player', 'active', aid, now()]);
   await audit.log(req.db, { actorId: req.user.id, actorRole: req.user.role, action: 'agent.player_create', entity: 'user', entityId: r.id, detail: { email: emailLc, agent_id: aid }, ip: req.ip });
   await req.setFlash('success', 'Player account created.');
   res.redirect('/agent/players');

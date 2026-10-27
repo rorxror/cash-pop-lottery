@@ -75,6 +75,9 @@
 /* ---------- Reset / base ---------- */
 *, *::before, *::after { box-sizing: border-box; }
 html { -webkit-text-size-adjust: 100%; scroll-padding-top: 96px; }
+/* Zoom lock: no double-tap zoom on buttons/links (viewport user-scalable=no
+   blocks pinch zoom; this stops the remaining double-tap zoom path). */
+button, .btn, a { touch-action: manipulation; }
 body {
   margin: 0;
   font-family: var(--font);

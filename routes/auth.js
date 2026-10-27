@@ -3,7 +3,7 @@
    logout, password reset, Google OAuth, custom captcha + reCAPTCHA hooks. */
 const express = require('express');
 const router = express.Router();
-const { validEmail, hashPassword, verifyPassword, sha256, randHex, now, strongPassword } = require('../lib/util');
+const { validEmail, hashPassword, verifyPassword, sha256, randHex, now, strongPassword, normalizeEmail, normalizePhone } = require('../lib/util');
 const { getS, getBool, getCurrencies } = require('../lib/settings');
 const { createSession, getSession, destroySession, rateLimit, verifyTotp, useBackupCode, parseUA, csrfToken, touchSession } = require('../lib/auth');
 const { getExtension, extEnabled } = require('../lib/extensions');
@@ -222,12 +222,14 @@ router.post('/register', rateLimit({ windowMs: 3600000, max: 20, keyFn: r => 're
 
   const { name, email, password, password_confirm, otp_code, agree } = req.body;
   // Phone = dial code + local number (combined client-side; recombine server-side as fallback)
+  // Canonicalized: the same number in any spelling (+1 555..., +1555...) is one identity.
   let phone = String(req.body.phone || '').trim();
   if (!phone && req.body.phone_cc && req.body.phone_local) {
     const cc = String(req.body.phone_cc).replace(/\D/g, '');
     const local = String(req.body.phone_local).replace(/\D/g, '');
     if (cc && local) phone = '+' + cc + local;
   }
+  phone = normalizePhone(phone);
   // Admin-blocked countries are rejected server-side (dropdown also hides them)
   if (phone) {
     const { isBlockedPhone } = require('../lib/phone-countries');
@@ -244,9 +246,15 @@ router.post('/register', rateLimit({ windowMs: 3600000, max: 20, keyFn: r => 're
     if (!otp_code || !(await consumeOtpCode(req.db, otp_code))) return render('Invalid or expired signup code. Ask the operator for a valid code.');
   }
 
-  const emailLc = email.trim().toLowerCase();
+  const emailLc = normalizeEmail(email);
   const ex = await req.db.get('SELECT id FROM users WHERE email = ?', [emailLc]);
   if (ex) return render('An account with this email already exists.');
+  // Same phone, second account: blocked. (Password is NOT unique: a different
+  // email/phone with the same password registers fine, as it should.)
+  if (phone) {
+    const exPhone = await req.db.get('SELECT id FROM users WHERE phone = ?', [phone]);
+    if (exPhone) return render('An account with this phone number already exists.');
+  }
 
   // Referral: ?ref=CODE on the register link credits the referrer (ViserLab-style)
   let referredBy = null;
@@ -257,7 +265,7 @@ router.post('/register', rateLimit({ windowMs: 3600000, max: 20, keyFn: r => 're
   }
   const r = await req.db.run(
     'INSERT INTO users (email, phone, name, password_hash, role, status, referred_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-    [emailLc, String(phone || '').trim(), name.trim(), hashPassword(password), 'player', 'active', referredBy, now()]);
+    [emailLc, phone, name.trim(), hashPassword(password), 'player', 'active', referredBy, now()]);
   // Referral code for the new player (used in their invite link)
   await req.db.run('UPDATE users SET referral_code = ? WHERE id = ?', ['CP' + r.id.toString(36).toUpperCase(), r.id]);
   const u = await req.db.get('SELECT * FROM users WHERE id = ?', [r.id]);
@@ -303,10 +311,11 @@ router.post('/reset/:token', async (req, res) => {
 /* ---------- OTP Login (phone/email, no password) ---------- */
 router.post('/login/otp/request', loginLimiter, async (req, res) => {
   const idType = req.body.id_type === 'phone' ? 'phone' : 'email';
-  const identifier = String(req.body.identifier || '').trim().toLowerCase();
+  const rawId = String(req.body.identifier || '').trim();
+  const identifier = idType === 'phone' ? normalizePhone(rawId) : normalizeEmail(rawId);
   if (idType === 'email' && !validEmail(identifier))
     return res.status(400).json({ ok: false, error: 'Enter a valid email.' });
-  if (idType === 'phone' && !/^\+?[0-9]{7,15}$/.test(identifier.replace(/[\s-]/g, '')))
+  if (idType === 'phone' && !/^\+?[0-9]{7,15}$/.test(identifier))
     return res.status(400).json({ ok: false, error: 'Enter a valid phone number.' });
   if (idType === 'phone' && !getBool(req.settings, 'phone_otp_enabled', true))
     return res.status(400).json({ ok: false, error: 'Phone login is disabled.' });
@@ -320,20 +329,32 @@ router.post('/login/otp/request', loginLimiter, async (req, res) => {
 
 router.post('/login/otp/verify', loginLimiter, async (req, res) => {
   const idType = req.body.id_type === 'phone' ? 'phone' : 'email';
-  const identifier = String(req.body.identifier || '').trim().toLowerCase();
+  const rawId = String(req.body.identifier || '').trim();
+  const identifier = idType === 'phone' ? normalizePhone(rawId) : normalizeEmail(rawId);
   const code = String(req.body.code || '').trim();
   const v = await otpLib.verifyOtp(req.db, identifier, idType, code);
   if (!v.ok) return res.status(400).json({ ok: false, error: v.error });
-  // Find or create user
-  const field = idType === 'phone' ? 'phone' : 'email';
-  let u = await req.db.get(`SELECT * FROM users WHERE ${field} = ?`, [identifier]);
+  // Find or create user. Phone: the same number with/without '+' is one identity,
+  // so a form-registered +1555... account is found by a bare 1555... OTP login.
+  let u = null;
+  if (idType === 'phone') {
+    const alt = identifier.startsWith('+') ? identifier.slice(1) : '+' + identifier;
+    u = await req.db.get('SELECT * FROM users WHERE phone = ? OR phone = ?', [identifier, alt]);
+  } else {
+    u = await req.db.get('SELECT * FROM users WHERE email = ?', [identifier]);
+  }
   let isNew = false;
   if (!u) {
     if (!getBool(req.settings, 'registration_enabled', true))
       return res.status(403).json({ ok: false, error: 'Registration is disabled.' });
+    // Phone-only accounts have no real email. The email column is UNIQUE + NOT NULL,
+    // so a second phone-only account used to crash on ''. Use an unroutable,
+    // phone-derived placeholder instead (unique by construction: the phone itself
+    // was just proven unused). Real email can be added to the profile later.
+    const otpEmail = idType === 'email' ? identifier : 'phone' + identifier.replace(/\D/g, '') + '@phone.local';
     const r = await req.db.run(
       'INSERT INTO users (email, phone, name, password_hash, role, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [idType === 'email' ? identifier : '', idType === 'phone' ? identifier : '', identifier.split('@')[0], '', 'player', 'active', now()]);
+      [otpEmail, idType === 'phone' ? identifier : '', identifier.split('@')[0], '', 'player', 'active', now()]);
     u = await req.db.get('SELECT * FROM users WHERE id = ?', [r.id]);
     await audit.log(req.db, { actorId: u.id, actorRole: 'player', action: 'user.register_otp', entity: 'user', entityId: u.id, detail: { idType }, ip: req.ip });
     isNew = true;
