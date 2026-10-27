@@ -1582,6 +1582,31 @@ body.has-cookie { padding-bottom: 150px; }
   font-size: 16px; color: #1D1D1F; transition: background 0.15s ease;
 }
 .cur-item:hover { background: rgba(60,60,67,0.08); }
+/* Mobile header fix: below 640px .head-right becomes a full-width left-aligned
+   row, so the currency picker sits on the LEFT edge. A right:0 menu then hangs
+   off the left side of the screen (measured: menu from about -200px). On phones
+   both header menus anchor to their trigger's LEFT edge instead, and neither
+   menu may ever exceed the viewport width. The user menu gets the same fix:
+   on narrow phones its pill can wrap onto its own row, which would push its
+   right:0 dropdown off the left edge the same way. */
+@media (max-width: 640px) {
+  .cur-menu, .user-menu-links {
+    left: 0; right: auto;
+    max-width: calc(100vw - 32px);
+  }
+}
+/* Mobile homepage motion: .hero-float was display:none below 1024px, so the
+   floating gold balls — the homepage's most visible motion — existed only on
+   PC while phones got a dead-static hero (ticker/banner/countdown all move on
+   both, count-up runs on load on both). Show the balls on phones too, scaled
+   down so they decorate the hero edge instead of covering the centered copy. */
+@media (max-width: 1024px) {
+  .hero-float { display: block; }
+  .fball.f1 { width: 44px; height: 44px; font-size: 16px; top: 8%; right: 3%; }
+  .fball.f2 { width: 32px; height: 32px; font-size: 12px; top: 58%; right: 8%; }
+  .fball.f3 { width: 24px; height: 24px; font-size: 10px; top: 30%; right: 5%; opacity: .6; }
+  .fball.f4 { width: 20px; height: 20px; font-size: 9px; top: 78%; right: 10%; opacity: .55; }
+}
 .cur-item.sel { background: rgba(0,113,227,0.10); }
 .cur-item-code { font-weight: 600; }
 .cur-item-bal { margin-left: auto; color: #86868B; font-size: 14px; }
