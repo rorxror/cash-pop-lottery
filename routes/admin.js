@@ -937,10 +937,12 @@ router.post('/support/:publicId/reply', async (req, res) => {
 });
 router.post('/support/:publicId/close', async (req, res) => {
   await req.db.run("UPDATE support_tickets SET status='closed', updated_at=? WHERE public_id=?", [now(), req.params.publicId]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'support.close', entity: 'support', entityId: req.params.publicId, detail: {}, ip: req.ip });
   res.redirect(R(req, '/support/' + req.params.publicId));
 });
 router.post('/support/:publicId/reopen', async (req, res) => {
   await req.db.run("UPDATE support_tickets SET status='open', updated_at=? WHERE public_id=?", [now(), req.params.publicId]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'support.reopen', entity: 'support', entityId: req.params.publicId, detail: {}, ip: req.ip });
   res.redirect(R(req, '/support/' + req.params.publicId));
 });
 
