@@ -453,7 +453,7 @@ router.post('/users/:id/login-as', async (req, res) => {
   if (!u || u.role === 'admin') return notFound(req, res, 'User not found.');
   const sid = await createSession(req.db, u.id, { ip: req.ip, ua: req.headers['user-agent'], extra: { impersonated_by: req.user.id, impersonated_name: req.user.name } });
   await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'user.login_as', entity: 'user', entityId: u.id, detail: {}, ip: req.ip });
-  res.cookie('sid', sid, { httpOnly: true, sameSite: 'lax', maxAge: 7 * 24 * 3600 * 1000 });
+  res.cookie('sid', sid, { httpOnly: true, sameSite: 'lax', secure: req.secure || getBool(req.settings, 'force_ssl', false), maxAge: 7 * 24 * 3600 * 1000 });
   res.redirect('/');
 });
 
@@ -1410,12 +1410,17 @@ router.post('/settings/hero-stats', async (req, res) => {
   res.redirect(R(req, '/settings'));
 });
 router.post('/settings/prizes', async (req, res) => {
-  const rows = await req.db.query('SELECT pops_count FROM prize_table');
+  // Multipliers are RTP: multiplier/15. Clamp to 1..15 (RTP <= 100%) — the
+  // old code accepted any value >= 1, so an admin could set x100 and make
+  // the house pay out 6.6x stakes. Audit old AND new values (was {}).
+  const rows = await req.db.query('SELECT pops_count, multiplier FROM prize_table');
+  const changes = {};
   for (const r of rows) {
-    const v = Math.max(1, parseInt(req.body['mult_' + r.pops_count], 10) || 5);
+    const v = Math.min(15, Math.max(1, parseInt(req.body['mult_' + r.pops_count], 10) || 5));
+    if (v !== r.multiplier) changes[r.pops_count] = { from: r.multiplier, to: v };
     await req.db.run('UPDATE prize_table SET multiplier = ? WHERE pops_count = ?', [v, r.pops_count]);
   }
-  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'settings.prizes', entity: 'settings', entityId: '', detail: {}, ip: req.ip });
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'settings.prizes', entity: 'settings', entityId: '', detail: { changes }, ip: req.ip });
   await req.setFlash('success', 'Prize table saved.');
   res.redirect(R(req, '/settings'));
 });

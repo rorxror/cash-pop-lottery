@@ -99,9 +99,11 @@ router.post('/transfer', async (req, res) => {
   if (!target || !amount || amount <= 0) { await req.setFlash('error', 'Invalid player or amount.'); return res.redirect('/agent/transfer'); }
   try {
     await req.db.transaction(async (tx) => {
-      const f = await tx.get('SELECT * FROM agent_floats WHERE agent_id = ? AND currency = ?', [aid, currency]);
-      if (!f || f.balance < amount) throw new Error('Insufficient float balance.');
-      await tx.run('UPDATE agent_floats SET balance = balance - ? WHERE agent_id = ? AND currency = ?', [amount, aid, currency]);
+      // Atomic float debit: the guarded UPDATE + affected-row check closes
+      // the same double-spend race as the wallet ledger (two concurrent
+      // transfers cannot both pass the balance check).
+      const f = await tx.run('UPDATE agent_floats SET balance = balance - ? WHERE agent_id = ? AND currency = ? AND balance >= ?', [amount, aid, currency, amount]);
+      if (f.changes === 0) throw new Error('Insufficient float balance.');
       await postLedger(tx, { userId: toUser, currency, type: 'agent_funding', amount, refType: 'agent_transfer', refId: String(aid), meta: { note, agent_id: aid } });
       await tx.run('INSERT INTO agent_transfers (from_agent, to_user, currency, amount, note, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)',
         [aid, toUser, currency, amount, note, now(), req.user.id]);

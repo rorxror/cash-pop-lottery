@@ -16,7 +16,7 @@ async function anonSession(req, res) {
   // logged-out forms (login/register captcha, CSRF) need a session to persist
   if (req.sess) return;
   const sid = await createSession(req.db, 0, { ip: req.ip, ua: req.headers['user-agent'] || '' });
-  res.cookie('sid', sid, { httpOnly: true, sameSite: 'lax', maxAge: 3600000 });
+  res.cookie('sid', sid, { httpOnly: true, sameSite: 'lax', secure: req.secure || getBool(req.settings, 'force_ssl', false), maxAge: 3600000 });
   const sess = await getSession(req.db, sid);
   req.sess = sess; req.sessionData = sess ? sess.data : {};
   req.csrfToken = csrfToken(req.sessionData);
@@ -320,14 +320,23 @@ router.post('/login/otp/request', loginLimiter, async (req, res) => {
     return res.status(400).json({ ok: false, error: 'Enter a valid email.' });
   if (idType === 'phone' && !/^\+?[0-9]{7,15}$/.test(identifier))
     return res.status(400).json({ ok: false, error: 'Enter a valid phone number.' });
-  if (idType === 'phone' && !getBool(req.settings, 'phone_otp_enabled', true))
+  // Fail closed: OTP login is OFF unless the admin explicitly enabled it.
+  if (idType === 'phone' && !getBool(req.settings, 'phone_otp_enabled', false))
     return res.status(400).json({ ok: false, error: 'Phone login is disabled.' });
-  if (idType === 'email' && !getBool(req.settings, 'email_otp_enabled', true))
+  if (idType === 'email' && !getBool(req.settings, 'email_otp_enabled', false))
     return res.status(400).json({ ok: false, error: 'Email login is disabled.' });
-  const code = await otpLib.createOtp(req.db, identifier, idType);
+  let code;
+  try {
+    code = await otpLib.createOtp(req.db, identifier, idType);
+  } catch (e) {
+    return res.status(429).json({ ok: false, error: e.message });
+  }
   const result = await otpLib.sendOtp(req.db, req.settings, identifier, idType, code);
-  await audit.log(req.db, { actorId: 0, actorRole: 'anon', action: 'otp.requested', entity: 'otp', entityId: '', detail: { idType }, ip: req.ip });
-  res.json({ ok: true, via: result.via, demoCode: result.code || null });
+  await audit.log(req.db, { actorId: 0, actorRole: 'anon', action: 'otp.requested', entity: 'otp', entityId: '', detail: { idType, sent: result.sent }, ip: req.ip });
+  // NEVER return the code: if no provider sent it, the user must see an
+  // error, not a code that logs them in (previous demo-mode takeover hole).
+  if (!result.sent) return res.status(503).json({ ok: false, error: 'Could not send the code. Please try again later or use your password.' });
+  res.json({ ok: true, via: result.via });
 });
 
 router.post('/login/otp/verify', loginLimiter, async (req, res) => {
@@ -362,6 +371,13 @@ router.post('/login/otp/verify', loginLimiter, async (req, res) => {
     await audit.log(req.db, { actorId: u.id, actorRole: 'player', action: 'user.register_otp', entity: 'user', entityId: u.id, detail: { idType }, ip: req.ip });
     isNew = true;
   }
+  // OTP login must be exactly as strict as password login: staff accounts
+  // never log in by OTP, blocked/pending accounts stay out, and accounts
+  // with authenticator 2FA must use password + TOTP (no 2FA bypass via OTP).
+  if (u.role !== 'player') return res.status(403).json({ ok: false, error: 'Staff accounts cannot sign in with a code. Use your password.' });
+  if (u.status === 'banned') { await recordLogin(req, u.id, identifier, false); return res.status(403).json({ ok: false, error: 'This account has been blocked. Contact support.' }); }
+  if (u.status === 'pending_review') { await recordLogin(req, u.id, identifier, false); return res.status(403).json({ ok: false, error: 'Your account is pending review.' }); }
+  if (u.totp_secret) { await recordLogin(req, u.id, identifier, false); return res.status(403).json({ ok: false, error: 'This account has two-factor authentication enabled. Please sign in with your password.' }); }
   await recordLogin(req, u.id, identifier, true);
   // NEW USER: details are NOT lost — collect name + terms before full login (registration step preserved)
   if (isNew) {

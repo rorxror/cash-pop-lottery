@@ -43,6 +43,13 @@ function parseCookies(req) {
 }
 
 async function boot() {
+  // Production secret guard (2026-10-27 audit fix): ticket HMACs are signed
+  // with TICKET_HMAC_SECRET. The old fallback 'dev-secret-change-me' is
+  // public (it sits in the repo), so anyone could forge ticket proofs.
+  // A production boot without a real secret refuses to start.
+  if (process.env.NODE_ENV === 'production' &&
+      (!process.env.TICKET_HMAC_SECRET || process.env.TICKET_HMAC_SECRET === 'dev-secret-change-me'))
+    throw new Error('TICKET_HMAC_SECRET must be set to a long random value in production');
   await migrate(db, driver);
   await ensureScratchSchema(db, driver);
   console.log(`[db] ${driver} ready`);
@@ -131,8 +138,14 @@ async function boot() {
     next();
   });
   app.use((req, res, next) => { req.cookies = parseCookies(req); next(); });
-  app.use(express.urlencoded({ extended: true, limit: '2mb' }));
-  app.use(express.json({ limit: '2mb' }));
+  // Webhook routes verify HMAC signatures over the RAW body, so the global
+  // body parsers must skip /webhooks/* — otherwise express.json() consumes
+  // the stream first and the route-level express.raw() sees a parsed object
+  // instead of bytes, making every valid signature fail.
+  const skipWebhooks = (parser) => (req, res, next) =>
+    req.path.startsWith('/webhooks/') ? next() : parser(req, res, next);
+  app.use(skipWebhooks(express.urlencoded({ extended: true, limit: '2mb' })));
+  app.use(skipWebhooks(express.json({ limit: '2mb' })));
   app.use(express.static(path.join(__dirname, 'public'), { maxAge: '1h' }));
 
   // admin path: settings override > env > default (non-guessable)
@@ -276,9 +289,11 @@ async function boot() {
     }
     return router;
   }
-  // Safety net: never let a stray rejection take the process down
-  process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', e));
-  process.on('uncaughtException', (e) => console.error('[uncaughtException]', e));
+  // Fatal errors must NOT be swallowed: the old handlers only logged and kept
+  // running in an unknown state with real money on the line. Log, then exit
+  // so the process manager restarts from a clean state.
+  process.on('unhandledRejection', (e) => { console.error('[unhandledRejection]', e); process.exit(1); });
+  process.on('uncaughtException', (e) => { console.error('[uncaughtException]', e); process.exit(1); });
 
   app.use('/', wrapAsync(require('./routes/setup')));
   app.use('/', wrapAsync(require('./routes/site')));

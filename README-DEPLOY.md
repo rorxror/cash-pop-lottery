@@ -16,8 +16,10 @@ dependencies only (no native modules), SQLite built in, MySQL optional.
 3. In the Node.js app panel open **Run NPM Install** (installs
    `express`, `ejs`, `qrcode`, `nodemailer` — all pure JS).
 4. Add environment variables (see `.env.example`):
-   - `SESSION_SECRET` — long random string (required)
-   - `TICKET_HMAC_SECRET` — another long random string (required)
+   - `TICKET_HMAC_SECRET` — long random string (required; in production the
+     app refuses to start without it — never leave the dev default)
+   - Note: sessions use random opaque IDs and need no signing secret, so
+     `SESSION_SECRET` is NOT required by the code (older docs listed it).
    - `ADMIN_PATH` — e.g. `/ops-9f2c1a-console` (your hidden admin URL;
      default is `/ops-7f3a9c-console` — change it)
    - `BASE_URL` — `https://yourdomain.com`

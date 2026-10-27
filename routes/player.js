@@ -47,6 +47,13 @@ router.post('/play/buy', requireLogin, async (req, res) => {
   if (!req.wagerOptions.includes(wager)) return fail('Invalid wager amount.');
   if (!['DAY', 'EVE', 'BOTH'].includes(drawType)) return fail('Invalid draw type.');
 
+  // Responsible play: self-exclusion / cooling-off blocks the lottery too,
+  // not just scratch (previously only scratch checked this).
+  try {
+    const { enforceAccountPlayable } = require('../lib/scratch');
+    await enforceAccountPlayable(req.db, req.user.id);
+  } catch (e) { return fail(e.message); }
+
   // find upcoming draws (server-side — never trust client draw ids)
   const types = drawType === 'BOTH' ? ['DAY', 'EVE'] : [drawType];
   const drawIds = [];
@@ -192,13 +199,10 @@ router.post('/deposit/new', requireLogin, async (req, res) => {
   try {
     const { publicId } = await createDeposit(req.db, { userId: req.user.id, method, amountMinor: amount, userData });
     await audit.log(req.db, { actorId: req.user.id, actorRole: 'player', action: 'deposit.create', entity: 'deposit', entityId: publicId, detail: { amount, method: method.name }, ip: req.ip });
-    // auto-approve small deposits when policy allows
-    const autoLimit = parseInt(getS(req.settings, 'auto_approve_deposit_limit', '0'), 10) || 0;
-    if (policy.mode === 'auto' && autoLimit > 0 && amount <= autoLimit) {
-      const d = await req.db.get('SELECT id FROM deposits WHERE public_id = ?', [publicId]);
-      const { decideDeposit } = require('../lib/money');
-      await decideDeposit(req.db, d.id, 'approve', null);
-    }
+    // NO auto-approve: a deposit is credited ONLY by a verified provider
+    // webhook or an admin approving against a bank statement entry. The old
+    // code approved small "auto" deposits with zero payment verification —
+    // free money for anyone who submitted a request.
     await req.setFlash('success', 'Deposit request submitted. It will be credited after review.');
     res.redirect('/wallet');
   } catch (e) {
@@ -243,8 +247,16 @@ router.post('/withdraw/new', requireLogin, async (req, res) => {
     const channel = req.user.email ? 'email' : 'phone';
     const identifier = channel === 'email' ? req.user.email : req.user.phone;
     if (!identifier) return res.status(400).render('error', { status: 400, message: 'Add an email or phone to your profile before withdrawing.' });
-    const code = await otpLib.createOtp(req.db, identifier, channel);
-    await otpLib.sendOtp(req.db, req.settings, identifier, channel, code);
+    let code;
+    try {
+      code = await otpLib.createOtp(req.db, identifier, channel);
+    } catch (e) {
+      return res.status(429).render('error', { status: 429, message: e.message });
+    }
+    const sent = await otpLib.sendOtp(req.db, req.settings, identifier, channel, code);
+    // Fail closed: if the code could not be delivered, do NOT park the user
+    // on a verify screen for a code that will never arrive.
+    if (!sent.sent) return res.status(503).render('error', { status: 503, message: 'Could not send the verification code. Please try again later or contact support.' });
     const { touchSession } = require('../lib/auth');
     await touchSession(req.db, req.sess.id, { pending_withdrawal: { method_id: method.id, amount, userData } });
     return res.render('withdraw_verify', {
