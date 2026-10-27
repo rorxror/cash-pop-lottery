@@ -1576,4 +1576,6 @@ body.has-cookie { padding-bottom: 150px; }
    baseline-shifted above the text. Flex + fixed box size + small top margin
    lines the box up with the first line of text on every screen size. */
 .form-card .field.check label { display: flex; align-items: flex-start; gap: 10px; font-weight: 400; }
-.form-card .field.check label input[type="checkbox"] { flex-shrink: 0; width: 18px; height: 18px; margin-top: 3px; accent-color: #0071e3; cursor: pointer; }
+.form-card .field.check label input[type="checkbox"] { flex-shrink: 0; width: 20px; height: 20px; min-width: 0; min-height: 0; margin: 2px 0 0 0; accent-color: #0071e3; cursor: pointer; }
+/* Guard: the 48px min-height for text fields must never stretch checkboxes/radios */
+.field input[type="checkbox"], .field input[type="radio"] { min-height: 0; }
