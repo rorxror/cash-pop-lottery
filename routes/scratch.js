@@ -150,7 +150,8 @@ adminRouter.get('/', async (req, res) => {
       esc(s.title), esc(s.game_type), fmt(s.price, s.currency), `${s.sold} / ${s.total_tickets}`,
       fmt(s.revenue, s.currency), fmt(s.paid, s.currency), fmt(s.prize_pool, s.currency),
       ui.statusBadge(s.status), s.enabled ? ui.badge('on', 'ok') : ui.badge('off', 'muted'),
-      `<form method="POST" action="${base}/${s.id}/launch" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm" data-confirm="Launch this series? Outcomes lock on launch.">Launch</button></form>
+      `<a class="btn btn-sm" href="${base}/${s.id}">Detail</a>
+       <form method="POST" action="${base}/${s.id}/launch" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm" data-confirm="Launch this series? Outcomes lock on launch.">Launch</button></form>
        <form method="POST" action="${base}/${s.id}/toggle" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm">${s.enabled ? 'Disable' : 'Enable'}</button></form>
        <form method="POST" action="${base}/${s.id}/stop" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm btn-d" data-confirm="Stop this series?">Stop</button></form>`,
     ]))) +
@@ -166,6 +167,58 @@ adminRouter.get('/', async (req, res) => {
         { key: 'rules', label: 'Rules', type: 'textarea' },
       ], { csrf: req.csrfToken, submit: 'Create draft' }));
   res.send(ui.layout({ adminPath: req.adminPath, section: '/scratch', title: 'Scratch', body, csrf: req.csrfToken, flash: req.flashData || {}, assetV: req.app.locals.assetV || '1' }));
+});
+
+/* v16: series detail — the inventory dashboard the list page never had.
+   Per-AMOUNT breakdown (not per tier row: outcomes store a prize value, not
+   a tier id, so two tiers sharing one amount cannot be told apart — the
+   per-amount view is the accurate one), plus theoretical RTP (prize pool /
+   total sales if sold out) and live RTP (actually paid / actually taken).
+   A prize amount with 0 remaining is flagged: the operator can see a prize
+   pool running dry before players do. */
+adminRouter.get('/:id', async (req, res) => {
+  const series = await req.db.get('SELECT * FROM scratch_series WHERE id = ?', [req.params.id]);
+  const base = req.adminPath + '/scratch';
+  if (!series) return res.send(ui.layout({ adminPath: req.adminPath, section: '/scratch', title: 'Scratch', body: ui.card('Not found', '<p class="muted">No such series.</p>'), csrf: req.csrfToken, flash: req.flashData || {}, assetV: req.app.locals.assetV || '1' }));
+  const tiers = await req.db.query('SELECT amount,quantity,label FROM scratch_prize_tiers WHERE series_id=? ORDER BY amount DESC', [series.id]);
+  const breakdown = series.status === 'draft' ? [] : await req.db.query(
+    `SELECT o.prize AS amount, COUNT(*) AS total,
+       COALESCE(SUM(CASE WHEN o.ticket_id IS NOT NULL THEN 1 ELSE 0 END),0) AS sold,
+       COALESCE(SUM(CASE WHEN o.ticket_id IS NULL THEN 1 ELSE 0 END),0) AS remaining
+     FROM scratch_outcomes o WHERE o.series_id=? GROUP BY o.prize ORDER BY o.prize DESC`, [series.id]);
+  const st = await req.db.get(
+    `SELECT (SELECT COUNT(*) FROM scratch_tickets t WHERE t.series_id=?) AS sold,
+       (SELECT COUNT(*) FROM scratch_tickets t WHERE t.series_id=? AND t.status='revealed') AS revealed,
+       (SELECT COALESCE(SUM(price),0) FROM scratch_tickets t WHERE t.series_id=?) AS revenue,
+       (SELECT COALESCE(SUM(prize),0) FROM scratch_tickets t WHERE t.series_id=? AND t.status='revealed') AS paid,
+       (SELECT COALESCE(SUM(amount*quantity),0) FROM scratch_prize_tiers p WHERE p.series_id=?) AS prize_pool`,
+    [series.id, series.id, series.id, series.id, series.id]);
+  const fmt = (minor, cur) => (Number(minor || 0) / 100).toFixed(2) + ' ' + (cur || 'USD');
+  const gross = Number(series.price) * Number(series.total_tickets);
+  const theoretical = gross > 0 ? (Number(st.prize_pool) / gross * 100) : 0;
+  const live = Number(st.revenue) > 0 ? (Number(st.paid) / Number(st.revenue) * 100) : 0;
+  const exhausted = breakdown.filter(b => Number(b.amount) > 0 && Number(b.remaining) === 0);
+  const warn = exhausted.length
+    ? `<p><strong>⚠ Inventory warning:</strong> these prize amounts are exhausted (all claimed): ${exhausted.map(b => fmt(b.amount, series.currency)).join(', ')}. Remaining tickets can only win smaller prizes or nothing.</p>`
+    : '<p class="muted">No prize amount exhausted.</p>';
+  const body = ui.card(`Series — ${esc(series.title)}`, ui.table(['Field', 'Value'], [
+    ['Game', esc(series.game_type)], ['Price', fmt(series.price, series.currency)],
+    ['Tickets', `${st.sold} sold / ${series.total_tickets} total · ${st.revealed} revealed`],
+    ['Status', ui.statusBadge(series.status)], ['Enabled', series.enabled ? 'on' : 'off'],
+    ['Revenue (taken)', fmt(st.revenue, series.currency)],
+    ['Paid out (revealed wins)', fmt(st.paid, series.currency)],
+    ['Prize pool (all tiers)', fmt(st.prize_pool, series.currency)],
+    ['Theoretical RTP (pool / full sales)', theoretical.toFixed(1) + '%'],
+    ['Live RTP (paid / taken)', live.toFixed(1) + '%'],
+  ]) + warn) +
+    ui.card('Prize inventory by amount', series.status === 'draft'
+      ? '<p class="muted">Draft series — outcomes lock on launch. Tier plan:</p>' + ui.table(['Prize', 'Quantity', 'Label'], tiers.map(t => [fmt(t.amount, series.currency), t.quantity, esc(t.label || '')]))
+      : ui.table(['Prize', 'Total outcomes', 'Claimed (sold)', 'Remaining', 'Status'], breakdown.map(b => [
+        fmt(b.amount, series.currency), b.total, b.sold, b.remaining,
+        Number(b.amount) > 0 && Number(b.remaining) === 0 ? '⚠ exhausted' : (Number(b.remaining) === 0 ? 'gone' : 'live')]))) +
+    ui.card('Tier plan', ui.table(['Prize', 'Quantity', 'Label'], tiers.map(t => [fmt(t.amount, series.currency), t.quantity, esc(t.label || '')]))) +
+    `<p><a class="btn" href="${base}">← Back to series list</a></p>`;
+  res.send(ui.layout({ adminPath: req.adminPath, section: '/scratch', title: 'Scratch — ' + series.title, body, csrf: req.csrfToken, flash: req.flashData || {}, assetV: req.app.locals.assetV || '1' }));
 });
 
 adminRouter.post('/create', async (req, res) => {

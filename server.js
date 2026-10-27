@@ -315,7 +315,11 @@ async function boot() {
     const isAdmin = req.user && req.user.role === 'admin';
     if (isAdmin) return next();
     const adminPath = req.adminPath || '/ops-7f3a9c-console';
-    if (req.path.startsWith(adminPath)) return next();
+    // v16: exact match or a real sub-path only. The old startsWith(adminPath)
+    // also matched /ops-7f3a9c-consoleXYZ, letting a non-admin skip the
+    // maintenance page for a guessed prefix (the admin router itself still
+    // 404'd them, but the maintenance bypass itself was sloppy).
+    if (req.path === adminPath || req.path.startsWith(adminPath + '/')) return next();
     if (req.path === '/login' || req.path === '/logout' || req.path === '/impersonate/exit') return next();
     if (req.path.startsWith('/webhooks/')) return next();
     if (req.path === '/healthz') return next();
@@ -343,6 +347,27 @@ async function boot() {
         const adminPath = req.adminPath || '/ops-7f3a9c-console';
         if (req.path === adminPath + '/security' || req.path.startsWith(adminPath + '/security/') || req.path === '/logout' || req.path === '/impersonate/exit') return next();
         return res.redirect(adminPath + '/security');
+      }
+    } catch {}
+    next();
+  });
+
+  // v16: profile-completion gate. OTP signups create the account before name
+  // + terms are collected. That step used to live ONLY in the session, so a
+  // user could dismiss the modal and play forever without a name or terms,
+  // and logging out lost the step entirely. Now users.profile_completed
+  // persists it, and incomplete users can only reach the completion page
+  // (or log out) until they finish. Checked fresh every request, like the
+  // forced-action gate above, so completing takes effect immediately.
+  app.use(async (req, res, next) => {
+    if (!req.user) return next();
+    try {
+      const u = await db.get('SELECT profile_completed FROM users WHERE id = ?', [req.user.id]);
+      if (u && Number(u.profile_completed) === 0) {
+        if (req.path === '/login/complete-profile' || req.path === '/logout' || req.path === '/impersonate/exit') return next();
+        if (req.path.startsWith('/style.css') || req.path.startsWith('/app.js') || req.path === '/favicon.ico') return next();
+        if (req.method === 'GET') return res.redirect('/login/complete-profile');
+        return res.status(403).json({ ok: false, error: 'Please complete your profile first.' });
       }
     } catch {}
     next();

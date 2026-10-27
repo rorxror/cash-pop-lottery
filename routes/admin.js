@@ -380,6 +380,7 @@ router.get('/users/:id', async (req, res) => {
   const agents = await req.db.query("SELECT id, name FROM users WHERE role = 'agent' ORDER BY name");
   const flags = await req.db.query('SELECT * FROM account_flags WHERE user_id = ? ORDER BY created_at DESC LIMIT 20', [u.id]);
   const refCredits = await req.db.query('SELECT * FROM referral_credits WHERE referrer_id = ? ORDER BY created_at DESC LIMIT 20', [u.id]);
+  const referrer = u.referred_by ? await req.db.get('SELECT id, email FROM users WHERE id = ?', [u.referred_by]) : null;
   const body = `
   <div class="grid2">
     <div>${ui.card('Biodata', ui.formHtml(R(req, '/users/' + u.id), [
@@ -426,6 +427,17 @@ router.get('/users/:id', async (req, res) => {
     </div>
     <div>
       ${ui.card('Wallets', ui.table(['Currency', 'Balance'], wallets.map(w => [w.currency, money(req, w.balance, w.currency)])))}
+      ${ui.card('Verification & account flags (v16: registration data the old detail page never showed)', ui.table(['Field', 'Value'], [
+        ['Email verified', u.email_verified ? '✓ Yes' : '✗ No'],
+        ['Phone verified', u.mobile_verified ? '✓ Yes' : '✗ No'],
+        ['Referral code', esc(u.referral_code || '—')],
+        ['Referred by', referrer ? ('#' + referrer.id + ' — ' + esc(referrer.email)) : '—'],
+        ['Two-factor (TOTP)', u.totp_secret ? '✓ Enabled' : '✗ Off'],
+        ['Forced password reset', u.force_password_reset ? 'Yes — user must reset on next sign-in' : 'No'],
+        ['Forced TOTP enrollment', u.force_totp_enroll ? 'Yes' : 'No'],
+        ['Payout details last changed', u.payout_updated_at ? d(u.payout_updated_at) : 'Never'],
+        ['Profile completed', (u.profile_completed === 0) ? '✗ Pending (signed up via OTP, name/terms not yet collected)' : '✓ Yes'],
+      ]))}
       ${ui.card('Fraud flags', flags.length ? ui.table(['When', 'Flag', 'Detail', 'Reviewed'], flags.map(f => [d(f.created_at), esc(f.flag_type), `<span class="code">${esc(String(f.detail).slice(0, 120))}</span>`, f.reviewed_at ? '✓ ' + d(f.reviewed_at) : `<a class="btn btn-sm" href="${R(req, '/flags')}">Review</a>`])) : '<p class="muted">No flags.</p>')}
       ${ui.card('Referral credits (pending = awaiting referee deposit + wagering)', ui.table(['When', 'Referee', 'Amount', 'Status'], refCredits.map(c => [d(c.created_at), '#' + c.referee_id, money(req, c.amount, c.currency), ui.statusBadge(c.status)])))}
       ${ui.card('Recent tickets', ui.table(['Ticket', 'Total', 'Status', 'When'], tickets.map(t =>
@@ -999,6 +1011,16 @@ router.get('/methods/:id/credentials', async (req, res) => {
 router.post('/methods/:id/credentials', async (req, res) => {
   const m = await req.db.get('SELECT * FROM payment_methods WHERE id = ?', [req.params.id]);
   if (!m) return notFound(req, res, 'Method not found.');
+  // v16: FAIL CLOSED. The old code saved gateway secrets in PLAINTEXT when
+  // CREDENTIAL_ENCRYPTION_KEY was not configured (with only a warning on the
+  // page). A DB dump then leaked provider keys. Now saving is refused until
+  // the key is set — the operator sets the key and re-saves (existing
+  // plaintext rows are re-encrypted on re-save).
+  if (!keyConfigured()) {
+    await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'method.credentials_blocked', entity: 'method', entityId: m.id, detail: { reason: 'no encryption key' }, ip: req.ip });
+    await req.setFlash('error', 'Credentials NOT saved: CREDENTIAL_ENCRYPTION_KEY is not configured, so secrets would be stored in plaintext. Set the key (Render → Environment) and save again.');
+    return res.redirect(R(req, '/methods/' + m.id + '/credentials'));
+  }
   const rail = getRail(m.rail);
   for (const f of (rail ? rail.credentialFields : [])) {
     let v = String(req.body[f.key] || '');

@@ -125,6 +125,14 @@ router.post('/login', loginLimiter, async (req, res) => {
   if (req.body.totp_code && req.sessionData.pending_user_id) {
     const u = await req.db.get('SELECT * FROM users WHERE id = ?', [req.sessionData.pending_user_id]);
     if (!u) return render({ formError: 'Session expired. Please sign in again.' });
+    // v16: per-user TOTP fail limit. The IP limiter (30/15min) does not stop
+    // a distributed attack against ONE account; login_history already records
+    // failures, so count them (password + TOTP failures together) and refuse
+    // to even verify after 10 in 15 minutes.
+    try {
+      const fails = await req.db.get('SELECT COUNT(*) AS c FROM login_history WHERE user_id = ? AND success = 0 AND created_at > ?', [u.id, now() - 15 * 60 * 1000]);
+      if (fails && Number(fails.c) >= 10) return render({ formError: 'Too many failed sign-in attempts. Please wait 15 minutes and try again.' });
+    } catch {}
     let ok = verifyTotp(u.totp_secret, req.body.totp_code);
     let usedBackup = false;
     if (!ok && u.backup_codes) {
@@ -419,8 +427,8 @@ router.post('/login/otp/verify', loginLimiter, async (req, res) => {
     // was just proven unused). Real email can be added to the profile later.
     const otpEmail = idType === 'email' ? identifier : 'phone' + identifier.replace(/\D/g, '') + '@phone.local';
     const r = await req.db.run(
-      'INSERT INTO users (email, phone, name, password_hash, role, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [otpEmail, idType === 'phone' ? identifier : '', identifier.split('@')[0], '', 'player', 'active', now()]);
+      'INSERT INTO users (email, phone, name, password_hash, role, status, profile_completed, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [otpEmail, idType === 'phone' ? identifier : '', identifier.split('@')[0], '', 'player', 'active', 0, now()]);
     u = await req.db.get('SELECT * FROM users WHERE id = ?', [r.id]);
     await audit.log(req.db, { actorId: u.id, actorRole: 'player', action: 'user.register_otp', entity: 'user', entityId: u.id, detail: { idType }, ip: req.ip });
     isNew = true;
@@ -448,38 +456,74 @@ router.post('/login/otp/verify', loginLimiter, async (req, res) => {
 /* ---------- Complete profile (registration details for first-time users) ----------
    A first-time user who verified via OTP/password lands here BEFORE full login.
    This preserves the old register form's details (full name + terms agreement)
-   inside the unified flow — no detail is lost, and returning users never see it. */
+   inside the unified flow — no detail is lost, and returning users never see it.
+   v16: the step is now PERSISTED (users.profile_completed) and enforced by a
+   server gate (server.js) — previously it lived only in the session, so a
+   user could dismiss the modal and play forever without a name or terms, and
+   logging out lost the step entirely. The GET page below is the gate's
+   destination, so an incomplete user always has a way to finish. */
+router.get('/login/complete-profile', async (req, res) => {
+  // v16: admit on the PERSISTENT flag, not the session flag — a user who
+  // dismissed the modal and later logged back in has no session flag left,
+  // but still has profile_completed=0. Gating on the session flag here
+  // would redirect-loop them (gate -> page -> '/' -> gate ...).
+  if (!req.user) return res.redirect('/login');
+  const u = await req.db.get('SELECT profile_completed FROM users WHERE id = ?', [req.user.id]);
+  if (u && Number(u.profile_completed) !== 0) return res.redirect('/');
+  let token = req.sessionData._csrf;
+  if (!token) {
+    const { csrfToken: mkToken, touchSession: ts } = require('../lib/auth');
+    token = mkToken({});
+    await ts(req.db, req.sess.id, { _csrf: token });
+  }
+  res.render('complete_profile', { metaTitle: 'Complete Your Profile', metaDesc: '', csrf: token });
+});
 router.post('/login/complete-profile', async (req, res) => {
-  if (!req.sess || !req.sessionData.profile_pending)
-    return res.status(401).json({ ok: false, error: 'Session expired. Please sign in again.' });
+  if (!req.sess) return res.status(401).json({ ok: false, error: 'Session expired. Please sign in again.' });
+  const u = await req.db.get('SELECT * FROM users WHERE id = ?', [req.sess.user_id]);
+  if (!u) return res.status(401).json({ ok: false, error: 'Session expired. Please sign in again.' });
+  // v16: accept EITHER the session flag (fresh OTP signup) or the persistent
+  // flag (returning incomplete user) — but never a user who already completed.
+  if (!req.sessionData.profile_pending && Number(u.profile_completed) !== 0)
+    return res.status(401).json({ ok: false, error: 'Profile already complete.' });
   const name = String(req.body.name || '').trim();
   if (name.length < 2) return res.status(400).json({ ok: false, error: 'Please enter your full name.' });
   if (!req.body.agree) return res.status(400).json({ ok: false, error: 'Please accept the Terms & Privacy Policy.' });
-  const u = await req.db.get('SELECT * FROM users WHERE id = ?', [req.sess.user_id]);
-  if (!u) return res.status(401).json({ ok: false, error: 'Session expired. Please sign in again.' });
-  await req.db.run('UPDATE users SET name = ? WHERE id = ?', [name, u.id]);
+  await req.db.run('UPDATE users SET name = ?, profile_completed = 1 WHERE id = ?', [name, u.id]);
   const { touchSession } = require('../lib/auth');
   await touchSession(req.db, req.sess.id, { profile_pending: null });
   await audit.log(req.db, { actorId: u.id, actorRole: 'player', action: 'user.profile_completed', entity: 'user', entityId: u.id, detail: {}, ip: req.ip });
   notify.send(req.db, req.settings, 'email', 'welcome', u.email, { name }).catch(() => {});
+  // v16: the page form posts as urlencoded (redirect), the modal posts JSON.
+  if ((req.headers['content-type'] || '').includes('application/x-www-form-urlencoded')) {
+    await req.setFlash('success', 'Welcome! Your profile is complete.');
+    return res.redirect('/');
+  }
   return res.json({ ok: true, redirect: '/', firstName: name.split(' ')[0] });
 });
 
 /* ---------- Facebook OAuth ---------- */
-router.get('/auth/facebook', (req, res) => {
+router.get('/auth/facebook', async (req, res) => {
   const id = process.env.FACEBOOK_APP_ID;
   if (!getBool(req.settings, 'facebook_oauth_enabled', false) || !id)
     return res.status(503).render('error', { status: 503, message: 'Facebook sign-in is not configured yet.' });
   const redirect = encodeURIComponent((process.env.BASE_URL || '') + '/auth/facebook/callback');
   const state = randHex(12);
-  if (req.sess) require('../lib/auth').touchSession(req.db, req.sess.id, { oauth_state: state });
+  // v16: ALWAYS store the state, even for logged-out visitors. The old code
+  // only stored it when a session already existed, so an anonymous start
+  // left the callback check skipped entirely (OAuth CSRF / login-CSRF).
+  if (!req.sess) await anonSession(req, res);
+  await require('../lib/auth').touchSession(req.db, req.sess.id, { oauth_state: state });
   res.redirect(`https://www.facebook.com/v18.0/dialog/oauth?client_id=${id}&redirect_uri=${redirect}&state=${state}&scope=email,public_profile`);
 });
 router.get('/auth/facebook/callback', async (req, res) => {
   try {
     const id = process.env.FACEBOOK_APP_ID, secret = process.env.FACEBOOK_APP_SECRET;
     if (!id || !secret) throw new Error('not configured');
-    if (req.sessionData.oauth_state && req.query.state !== req.sessionData.oauth_state) throw new Error('bad state');
+    // v16: STRICT state check — a missing stored state now FAILS instead of
+    // skipping validation, and the state is single-use (cleared after check).
+    if (!req.sessionData.oauth_state || req.query.state !== req.sessionData.oauth_state) throw new Error('bad state');
+    if (req.sess) await require('../lib/auth').touchSession(req.db, req.sess.id, { oauth_state: null });
     const redirect = (process.env.BASE_URL || '') + '/auth/facebook/callback';
     const tok = await fetch(`https://graph.facebook.com/v18.0/oauth/access_token?client_id=${id}&client_secret=${secret}&redirect_uri=${encodeURIComponent(redirect)}&code=${req.query.code}`);
     const tj = await tok.json();
@@ -507,20 +551,24 @@ router.get('/auth/facebook/callback', async (req, res) => {
 });
 
 /* ---------- Google OAuth (ready; needs client ID/secret) ---------- */
-router.get('/auth/google', (req, res) => {
+router.get('/auth/google', async (req, res) => {
   const id = process.env.GOOGLE_CLIENT_ID;
   if (!getBool(req.settings, 'google_oauth_enabled', false) || !id)
     return res.status(503).render('error', { status: 503, message: 'Google sign-in is not configured yet. The operator needs to add the Google OAuth credentials.' });
   const redirect = encodeURIComponent((process.env.BASE_URL || '') + '/auth/google/callback');
   const state = randHex(12);
-  if (req.sess) require('../lib/auth').touchSession(req.db, req.sess.id, { oauth_state: state });
+  // v16: same anonymous-start fix as Facebook (see above).
+  if (!req.sess) await anonSession(req, res);
+  await require('../lib/auth').touchSession(req.db, req.sess.id, { oauth_state: state });
   res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?client_id=${id}&redirect_uri=${redirect}&response_type=code&scope=openid%20email%20profile&state=${state}`);
 });
 router.get('/auth/google/callback', async (req, res) => {
   try {
     const id = process.env.GOOGLE_CLIENT_ID, secret = process.env.GOOGLE_CLIENT_SECRET;
     if (!id || !secret) throw new Error('not configured');
-    if (req.sessionData.oauth_state && req.query.state !== req.sessionData.oauth_state) throw new Error('bad state');
+    // v16: STRICT single-use state check (see Facebook callback).
+    if (!req.sessionData.oauth_state || req.query.state !== req.sessionData.oauth_state) throw new Error('bad state');
+    if (req.sess) await require('../lib/auth').touchSession(req.db, req.sess.id, { oauth_state: null });
     const redirect = (process.env.BASE_URL || '') + '/auth/google/callback';
     const tok = await fetch('https://oauth2.googleapis.com/token', {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -531,6 +579,9 @@ router.get('/auth/google/callback', async (req, res) => {
     const me = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', { headers: { Authorization: 'Bearer ' + tj.access_token } });
     const profile = await me.json();
     if (!profile.email) throw new Error('no email from Google');
+    // v16: Google tells us whether it verified this email — refuse an
+    // explicitly unverified one instead of trusting any returned address.
+    if ('verified_email' in profile && !profile.verified_email) throw new Error('email not verified by Google');
     const emailLc = String(profile.email).toLowerCase();
     let u = await req.db.get('SELECT * FROM users WHERE email = ?', [emailLc]);
     if (!u) {
@@ -540,6 +591,13 @@ router.get('/auth/google/callback', async (req, res) => {
         [emailLc, '', String(profile.name || emailLc.split('@')[0]), '', 'player', 'active', 1, now()]);
       u = await req.db.get('SELECT * FROM users WHERE id = ?', [r.id]);
       await audit.log(req.db, { actorId: u.id, actorRole: 'player', action: 'user.register_oauth', entity: 'user', entityId: u.id, detail: { provider: 'google' }, ip: req.ip });
+    } else if (!u.email_verified) {
+      // v16: an existing password-registered user who signs in via Google has
+      // just proven ownership of this email — mark it verified so the
+      // verified-contact gate (deposits/withdrawals) stops blocking them.
+      // Previously they stayed unverified forever despite Google's proof.
+      await req.db.run('UPDATE users SET email_verified = 1 WHERE id = ?', [u.id]);
+      u.email_verified = 1;
     }
     if (u.status === 'banned') throw new Error('account blocked');
     await recordLogin(req, u.id, emailLc, true);

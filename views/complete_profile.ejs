@@ -1,0 +1,20 @@
+<section class="wrap section narrow">
+  <div class="form-card auth-card fade-in">
+    <div class="auth-logo">🎰</div>
+    <h1>Complete your profile</h1>
+    <p class="login-value">Just one step left — your full name and agreement to the Terms &amp; Privacy Policy.</p>
+    <form method="POST" action="/login/complete-profile">
+      <input type="hidden" name="_csrf" value="<%= csrf %>">
+      <div class="field">
+        <label for="cpName">Full name</label>
+        <input type="text" id="cpName" name="name" placeholder="Your full name" autocomplete="name" required>
+      </div>
+      <label class="check">
+        <input type="checkbox" name="agree" value="1" required>
+        <span>I accept the Terms &amp; Privacy Policy.</span>
+      </label>
+      <button class="btn btn-p btn-block" type="submit">Continue</button>
+    </form>
+    <p class="muted" style="margin-top:12px">Already have an account? <a href="/logout">Sign out</a> and sign in again.</p>
+  </div>
+</section>

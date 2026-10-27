@@ -4,7 +4,7 @@
 const express = require('express');
 const router = express.Router();
 const QRCode = require('qrcode');
-const { now, randHex, hmac, sha256, hashPassword, verifyPassword, toMinor, esc } = require('../lib/util');
+const { now, randHex, hmac, sha256, hashPassword, verifyPassword, toMinor, esc, signTicket } = require('../lib/util');
 const { getS, getBool, getCurrencies, getSettings } = require('../lib/settings');
 const { requireLogin } = require('../lib/auth');
 const { getBalances, postLedger, depositPolicy, withdrawalPolicy, chargeFor, createDeposit, createWithdrawal, checkWithdrawalRules, notePayoutDetails, releaseReferralCredits } = require('../lib/money');
@@ -26,10 +26,6 @@ router.get('/play', requireLogin, async (req, res) => {
     wagerOptions, prizeTable, maxDraws: parseInt(getS(req.settings, 'max_draws', '7'), 10) || 7, balance: bal,
   });
 });
-
-function signTicket(secret, t) {
-  return hmac(secret, [t.public_id, t.user_id, t.pops, t.wager, t.draw_ids, t.total, t.currency].join('|'));
-}
 
 router.post('/play/buy', requireLogin, async (req, res) => {
   const settings = req.settings;
@@ -82,6 +78,15 @@ router.post('/play/buy', requireLogin, async (req, res) => {
     };
     ticket.hmac = signTicket(secret, ticket);
     const ticketId = await req.db.transaction(async (tx) => {
+      // v16: the draws were selected OUTSIDE this transaction. If the cron
+      // settled one in between, entries inserted for it would sit 'pending'
+      // forever on an already-settled draw — money taken, no outcome, no
+      // re-settle. Re-check inside the txn: any non-scheduled draw fails
+      // the whole purchase cleanly (the debit rolls back with it).
+      for (const did of drawIds) {
+        const d = await tx.get("SELECT status FROM draws WHERE id = ?", [did]);
+        if (!d || d.status !== 'scheduled') throw new Error('A selected draw just closed — please buy again for the next draws.');
+      }
       // atomic debit
       await postLedger(tx, { userId: req.user.id, currency, type: 'ticket_purchase', amount: -total, refType: 'ticket', refId: publicId, meta: { pops, wager, draws: drawIds.length, bundle_discount: bundleDiscount } });
       const r = await tx.run(
