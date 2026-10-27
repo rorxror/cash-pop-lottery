@@ -24,8 +24,9 @@
         <label for="phoneLocal">Phone</label>
         <div class="phone-row">
           <select id="phoneCc" name="phone_cc" aria-label="Country dial code">
+            <option value="" selected disabled>Select country code</option>
             <% (typeof phoneCountries !== 'undefined' ? phoneCountries : []).forEach(function(c){ %>
-            <option value="<%= c.dial %>" <%= c.iso === 'US' ? 'selected' : '' %>><%= c.name %> (+<%= c.dial %>)</option>
+            <option value="<%= c.dial %>"><%= c.name %> (+<%= c.dial %>)</option>
             <% }) %>
           </select>
           <input type="tel" id="phoneLocal" name="phone_local" placeholder="Phone number" autocomplete="tel">

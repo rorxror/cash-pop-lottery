@@ -19,14 +19,16 @@
     <div class="divider"><span>or sign in with</span></div>
     <% } %>
 
-    <!-- Sign-in method: Password (default) | One-time code (only if admin enabled OTP) -->
+    <!-- Sign-in method tabs: ONLY when both methods exist. With OTP off
+         (the default), a lone "Password" tab is visual noise, so no tabs render
+         and the password form stands alone. -->
     <% const otpAny = (typeof phoneOtpOn !== 'undefined' && phoneOtpOn) || (typeof emailOtpOn !== 'undefined' && emailOtpOn); %>
+    <% if (otpAny) { %>
     <div class="segmented auth-methods" role="tablist">
       <button type="button" class="seg active" data-method="password" role="tab">🔑 Password</button>
-      <% if (otpAny) { %>
       <button type="button" class="seg" data-method="otp" role="tab">📱 One-time code</button>
-      <% } %>
     </div>
+    <% } %>
 
     <!-- PASSWORD SIGN-IN (primary) -->
     <div id="loginPw">

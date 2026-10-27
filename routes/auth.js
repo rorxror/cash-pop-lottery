@@ -224,6 +224,9 @@ router.post('/register', rateLimit({ windowMs: 3600000, max: 20, keyFn: r => 're
   // Phone = dial code + local number (combined client-side; recombine server-side as fallback)
   // Canonicalized: the same number in any spelling (+1 555..., +1555...) is one identity.
   let phone = String(req.body.phone || '').trim();
+  if (!phone && req.body.phone_local && String(req.body.phone_local).replace(/\D/g, '') && !req.body.phone_cc) {
+    return render('Please choose your country code for your phone number.');
+  }
   if (!phone && req.body.phone_cc && req.body.phone_local) {
     const cc = String(req.body.phone_cc).replace(/\D/g, '');
     const local = String(req.body.phone_local).replace(/\D/g, '');

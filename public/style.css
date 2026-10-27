@@ -304,6 +304,11 @@ img, video, svg { max-width: 100%; }
 .pslip-card { text-align: center; }
 .pslip-card .pslip-cta { max-width: 264px; margin-left: auto; margin-right: auto; }
 .play-grid { display: grid; grid-template-columns: 1.6fr 1fr; gap: var(--sp-5); align-items: start; }
+/* Grid blowout fix: a grid item's default min-width:auto lets its widest
+   unbreakable content (here the prize table inside the slip steps) force the
+   whole column wider than the screen on phones. min-width:0 lets the column
+   shrink to its track; the table then scrolls inside .tbl-wrap as designed. */
+.play-grid > *, .grid2 > *, .pslip > * { min-width: 0; }
 
 /* ---------- Paper-slip style steps ---------- */
 .pslip { display: flex; flex-direction: column; gap: var(--sp-5); }
