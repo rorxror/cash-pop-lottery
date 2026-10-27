@@ -39,24 +39,47 @@ async function captchaHtml(req) {
   const ext = await getExtension(req.db, 'custom_captcha');
   return extEnabled(ext) ? newCaptcha(req) : '';
 }
+/* Third-party captcha widgets (v14): reCAPTCHA + hCaptcha + Turnstile all
+   render through the same recaptchaHtml slot so templates need no change.
+   Script tags carry the per-request CSP nonce (see server.js). */
 async function recaptchaHtml(req) {
-  const ext = await getExtension(req.db, 'recaptcha');
-  if (!extEnabled(ext) || !ext.config.site_key) return '';
-  return `<div class="g-recaptcha" data-sitekey="${ext.config.site_key}"></div><script src="https://www.google.com/recaptcha/api.js" async defer></script>`;
+  const nonce = req.cspNonce ? ` nonce="${req.cspNonce}"` : '';
+  let html = '';
+  const rc = await getExtension(req.db, 'recaptcha');
+  if (extEnabled(rc) && rc.config.site_key) html += `<div class="g-recaptcha" data-sitekey="${rc.config.site_key}"></div><script src="https://www.google.com/recaptcha/api.js" async defer${nonce}></script>`;
+  const hc = await getExtension(req.db, 'hcaptcha');
+  if (extEnabled(hc) && hc.config.site_key) html += `<div class="h-captcha" data-sitekey="${hc.config.site_key}"></div><script src="https://js.hcaptcha.com/1/api.js" async defer${nonce}></script>`;
+  const ts = await getExtension(req.db, 'turnstile');
+  if (extEnabled(ts) && ts.config.site_key) html += `<div class="cf-turnstile" data-sitekey="${ts.config.site_key}"></div><script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer${nonce}></script>`;
+  return html;
 }
-async function checkRecaptcha(req) {
-  const ext = await getExtension(req.db, 'recaptcha');
-  if (!extEnabled(ext) || !ext.config.secret_key) return true; // not configured => skip
-  const token = req.body['g-recaptcha-response'];
+async function verifyProvider(key, ext, req) {
+  const field = key === 'recaptcha' ? 'g-recaptcha-response' : key === 'hcaptcha' ? 'h-captcha-response' : 'cf-turnstile-response';
+  const token = req.body[field];
   if (!token) return false;
+  const url = key === 'recaptcha' ? 'https://www.google.com/recaptcha/api/siteverify'
+    : key === 'hcaptcha' ? 'https://hcaptcha.com/siteverify'
+    : 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
   try {
-    const r = await fetch('https://www.google.com/recaptcha/api/siteverify', {
+    const r = await fetch(url, {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ secret: ext.config.secret_key, response: token, remoteip: req.ip }).toString(),
     });
     const j = await r.json();
     return !!j.success;
   } catch { return false; }
+}
+/* Unified captcha check (v14): every ENABLED provider must verify; when no
+   provider is enabled, verification passes (nothing to check). */
+async function verifyCaptcha(req) {
+  const capExt = await getExtension(req.db, 'custom_captcha');
+  if (extEnabled(capExt) && !checkCaptcha(req)) return false;
+  for (const key of ['recaptcha', 'hcaptcha', 'turnstile']) {
+    const ext = await getExtension(req.db, key);
+    if (!extEnabled(ext) || !ext.config.secret_key) continue;
+    if (!(await verifyProvider(key, ext, req))) return false;
+  }
+  return true;
 }
 
 async function recordLogin(req, userId, email, success) {
@@ -96,9 +119,7 @@ router.post('/login', loginLimiter, async (req, res) => {
     googleOn: getBool(req.settings, 'google_oauth_enabled', false) && !!process.env.GOOGLE_CLIENT_ID,
     formError: vars.formError,
   });
-  if (!(await checkRecaptcha(req))) return render({ formError: 'Captcha verification failed.' });
-  const capExt = await getExtension(req.db, 'custom_captcha');
-  if (extEnabled(capExt) && !checkCaptcha(req)) return render({ formError: 'Wrong answer to the security check.' });
+  if (!(await verifyCaptcha(req))) return render({ formError: 'Captcha verification failed.' });
 
   // TOTP challenge step
   if (req.body.totp_code && req.sessionData.pending_user_id) {
@@ -166,6 +187,11 @@ async function finishLogin(req, res, u, welcomeMsg) {
   const sid = await createSession(req.db, u.id, { ip: req.ip, ua: req.headers['user-agent'], extra });
   if (req.sess) await destroySession(req.db, req.sess.id);
   await req.db.run('UPDATE users SET last_login_at = ?, last_login_ip = ? WHERE id = ?', [now(), req.ip, u.id]);
+  // Device/IP duplicate detection (v14): flags only, never blocks login.
+  try {
+    const { checkSharedDevice } = require('../lib/flags');
+    await checkSharedDevice(req.db, u.id, req.ip, req.headers['user-agent'] || '');
+  } catch {}
   res.cookie('sid', sid, { httpOnly: true, sameSite: 'lax', secure: req.secure || getBool(req.settings, 'force_ssl', false), maxAge: 7 * 24 * 3600 * 1000 });
   const dest = u.role === 'admin' ? (req.adminPath || '/') : (u.role === 'agent' ? '/agent' : '/');
   res.redirect(dest);
@@ -183,7 +209,7 @@ router.post('/logout', async (req, res) => {
    sign-in is for returning players. No merged/OTP-first confusion. */
 router.get('/register', async (req, res) => {
   if (!getBool(req.settings, 'registration_enabled', true))
-    return res.render('error', { status: 403, message: 'Registration is currently disabled.' });
+    return res.status(403).render('error', { status: 403, message: 'Registration is currently disabled.' });
   if (req.user) return res.redirect('/');
   const capExt2 = await getExtension(req.db, 'custom_captcha');
   if (extEnabled(capExt2)) await anonSession(req, res);
@@ -215,10 +241,8 @@ router.post('/register', rateLimit({ windowMs: 3600000, max: 20, keyFn: r => 're
     otpEnabled: getBool(req.settings, 'otp_registration', false),
     captchaHtml: await captchaHtml(req), recaptchaHtml: await recaptchaHtml(req), googleOn: false,
   });
-  if (!getBool(req.settings, 'registration_enabled', true)) return res.render('error', { status: 403, message: 'Registration is currently disabled.' });
-  if (!(await checkRecaptcha(req))) return render('Captcha verification failed.');
-  const capExt = await getExtension(req.db, 'custom_captcha');
-  if (extEnabled(capExt) && !checkCaptcha(req)) return render('Wrong answer to the security check.');
+  if (!getBool(req.settings, 'registration_enabled', true)) return res.status(403).render('error', { status: 403, message: 'Registration is currently disabled.' });
+  if (!(await verifyCaptcha(req))) return render('Captcha verification failed.');
 
   const { name, email, password, password_confirm, otp_code, agree } = req.body;
   // Phone = dial code + local number (combined client-side; recombine server-side as fallback)
@@ -242,6 +266,10 @@ router.post('/register', rateLimit({ windowMs: 3600000, max: 20, keyFn: r => 're
   if (!validEmail(email)) return render('Please enter a valid email.');
   const pwErr = strongPassword(password, getBool(req.settings, 'secure_password', true));
   if (pwErr) return render(pwErr);
+  if (getBool(req.settings, 'breached_password_check', true)) {
+    const { isBreached } = require('../lib/breached');
+    if (await isBreached(password)) return render('This password has appeared in a data breach. Please choose a different password.');
+  }
   if (password !== password_confirm) return render('Passwords do not match.');
   if (getBool(req.settings, 'policy_agreement', true) && !agree) return render('You must accept the terms to register.');
 
@@ -273,6 +301,11 @@ router.post('/register', rateLimit({ windowMs: 3600000, max: 20, keyFn: r => 're
   await req.db.run('UPDATE users SET referral_code = ? WHERE id = ?', ['CP' + r.id.toString(36).toUpperCase(), r.id]);
   const u = await req.db.get('SELECT * FROM users WHERE id = ?', [r.id]);
   await audit.log(req.db, { actorId: u.id, actorRole: 'player', action: 'user.register', entity: 'user', entityId: u.id, detail: { email: emailLc }, ip: req.ip });
+  // Device/IP duplicate detection (v14): flags only, never blocks.
+  try {
+    const { checkSharedDevice } = require('../lib/flags');
+    await checkSharedDevice(req.db, u.id, req.ip, req.headers['user-agent'] || '');
+  } catch {}
   notify.send(req.db, req.settings, 'email', 'welcome', emailLc, { name: u.name }).catch(() => {});
   await recordLogin(req, u.id, emailLc, true);
   return finishLogin(req, res, u, 'Welcome, ' + u.name.split(' ')[0] + '! Your account is ready — good luck!');
@@ -294,20 +327,41 @@ router.post('/forgot', rateLimit({ windowMs: 3600000, max: 10, keyFn: r => 'forg
 });
 router.get('/reset/:token', async (req, res) => {
   const pr = await req.db.get('SELECT * FROM password_resets WHERE token_hash = ? AND used = 0 AND expires_at > ?', [sha256('reset:' + req.params.token), now()]);
-  if (!pr) return res.render('error', { status: 400, message: 'This reset link is invalid or expired.' });
+  if (!pr) return res.status(400).render('error', { status: 400, message: 'This reset link is invalid or expired.' });
   res.render('reset', { metaTitle: 'Set New Password', metaDesc: '', token: req.params.token });
 });
 router.post('/reset/:token', async (req, res) => {
   const pr = await req.db.get('SELECT * FROM password_resets WHERE token_hash = ? AND used = 0 AND expires_at > ?', [sha256('reset:' + req.params.token), now()]);
-  if (!pr) return res.render('error', { status: 400, message: 'This reset link is invalid or expired.' });
-  const pwErr = strongPassword(req.body.password, getBool(req.settings, 'secure_password', true));
+  if (!pr) return res.status(400).render('error', { status: 400, message: 'This reset link is invalid or expired.' });
+  const target = await req.db.get('SELECT role FROM users WHERE id = ?', [pr.user_id]);
+  const { passwordError } = require('../lib/validate');
+  const pwErr = passwordError(req.body.password, target ? target.role : 'player', getBool(req.settings, 'secure_password', true));
   if (pwErr || req.body.password !== req.body.password2)
     return res.render('reset', { metaTitle: 'Set New Password', metaDesc: '', token: req.params.token, formError: pwErr || 'Passwords do not match.' });
+  if (getBool(req.settings, 'breached_password_check', true)) {
+    const { isBreached } = require('../lib/breached');
+    if (await isBreached(req.body.password))
+      return res.render('reset', { metaTitle: 'Set New Password', metaDesc: '', token: req.params.token, formError: 'This password has appeared in a data breach. Please choose a different one.' });
+  }
   await req.db.run('UPDATE users SET password_hash = ? WHERE id = ?', [hashPassword(req.body.password), pr.user_id]);
   await req.db.run('UPDATE password_resets SET used = 1 WHERE id = ?', [pr.id]);
   const { destroyUserSessions } = require('../lib/auth');
   await destroyUserSessions(req.db, pr.user_id);
   await audit.log(req.db, { actorId: pr.user_id, actorRole: '', action: 'user.password_reset', entity: 'user', entityId: pr.user_id, detail: {}, ip: req.ip });
+  res.redirect('/login');
+});
+
+/* ---------- email verification link (v14, public) ---------- */
+// Used both for self-verification (new_email == current email) and for
+// admin-initiated email changes (new_email == the new address): the swap
+// happens ONLY when the new address owner clicks the link.
+router.get('/verify-email/:token', async (req, res) => {
+  const row = await req.db.get('SELECT * FROM email_verifications WHERE token_hash = ? AND used = 0 AND expires_at > ?', [sha256('verify:' + req.params.token), now()]);
+  if (!row) return res.status(400).render('error', { status: 400, message: 'This verification link is invalid or expired.' });
+  await req.db.run('UPDATE email_verifications SET used = 1 WHERE id = ?', [row.id]);
+  await req.db.run('UPDATE users SET email = ?, email_verified = 1 WHERE id = ?', [row.new_email, row.user_id]);
+  await audit.log(req.db, { actorId: row.user_id, actorRole: 'player', action: 'user.email_verified', entity: 'user', entityId: row.user_id, detail: { via: 'link' }, ip: req.ip });
+  try { await req.setFlash('success', 'Email verified. You can now deposit and withdraw.'); } catch {}
   res.redirect('/login');
 });
 
@@ -415,7 +469,7 @@ router.post('/login/complete-profile', async (req, res) => {
 router.get('/auth/facebook', (req, res) => {
   const id = process.env.FACEBOOK_APP_ID;
   if (!getBool(req.settings, 'facebook_oauth_enabled', false) || !id)
-    return res.render('error', { status: 503, message: 'Facebook sign-in is not configured yet.' });
+    return res.status(503).render('error', { status: 503, message: 'Facebook sign-in is not configured yet.' });
   const redirect = encodeURIComponent((process.env.BASE_URL || '') + '/auth/facebook/callback');
   const state = randHex(12);
   if (req.sess) require('../lib/auth').touchSession(req.db, req.sess.id, { oauth_state: state });
@@ -448,7 +502,7 @@ router.get('/auth/facebook/callback', async (req, res) => {
     await recordLogin(req, u.id, u.email || profile.id, true);
     return finishLogin(req, res, u, 'Welcome back!');
   } catch (e) {
-    return res.render('error', { status: 400, message: 'Facebook sign-in failed: ' + e.message });
+    return res.status(400).render('error', { status: 400, message: 'Facebook sign-in failed: ' + e.message });
   }
 });
 
@@ -456,7 +510,7 @@ router.get('/auth/facebook/callback', async (req, res) => {
 router.get('/auth/google', (req, res) => {
   const id = process.env.GOOGLE_CLIENT_ID;
   if (!getBool(req.settings, 'google_oauth_enabled', false) || !id)
-    return res.render('error', { status: 503, message: 'Google sign-in is not configured yet. The operator needs to add the Google OAuth credentials.' });
+    return res.status(503).render('error', { status: 503, message: 'Google sign-in is not configured yet. The operator needs to add the Google OAuth credentials.' });
   const redirect = encodeURIComponent((process.env.BASE_URL || '') + '/auth/google/callback');
   const state = randHex(12);
   if (req.sess) require('../lib/auth').touchSession(req.db, req.sess.id, { oauth_state: state });
@@ -491,7 +545,7 @@ router.get('/auth/google/callback', async (req, res) => {
     await recordLogin(req, u.id, emailLc, true);
     return finishLogin(req, res, u);
   } catch (e) {
-    return res.render('error', { status: 400, message: 'Google sign-in failed: ' + e.message });
+    return res.status(400).render('error', { status: 400, message: 'Google sign-in failed: ' + e.message });
   }
 });
 

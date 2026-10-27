@@ -124,6 +124,17 @@ adminRouter.use(async (req, res, next) => {
   next();
 });
 adminRouter.use(requireRole('admin'));
+// RBAC (v14): scratch series actions move money (prize pools, RTP), so only
+// super + finance may POST; views (GET) stay readable by all staff.
+adminRouter.use((req, res, next) => {
+  if (req.method !== 'GET') {
+    const role = req.user.admin_role || 'super';
+    if (!['super', 'finance'].includes(role)) {
+      return res.status(403).render('error', { status: 403, message: 'Your staff role does not permit this action.' });
+    }
+  }
+  next();
+});
 adminRouter.get('/', async (req, res) => {
   const series = await req.db.query(
     `SELECT s.*, (SELECT COUNT(*) FROM scratch_tickets t WHERE t.series_id=s.id) AS sold,

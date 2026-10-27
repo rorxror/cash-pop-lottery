@@ -4,7 +4,7 @@
 const express = require('express');
 const router = express.Router();
 const { now, randHex, validEmail, hashPassword, normalizeEmail, normalizePhone } = require('../lib/util');
-const { getS } = require('../lib/settings');
+const { getS, getBool } = require('../lib/settings');
 const { requireLogin, requireRole } = require('../lib/auth');
 const { getBalances, postLedger } = require('../lib/money');
 const audit = require('../lib/audit');
@@ -62,8 +62,17 @@ router.get('/players/new', async (req, res) => {
 router.post('/players/new', async (req, res) => {
   const aid = agentId(req);
   const { name, email, phone, password } = req.body;
-  if (!name || !validEmail(email) || !password || password.length < 6) {
-    return res.render('agent/create_user', { metaTitle: 'Create Player', metaDesc: '', formError: 'Name, valid email and a 6+ character password are required.' });
+  // v14: player minimum is 8 (standing rule — the old 6 here was a hole).
+  const { passwordError } = require('../lib/validate');
+  const pwErr = passwordError(password, 'player', getBool(req.settings, 'secure_password', true));
+  if (!name || !validEmail(email) || pwErr) {
+    return res.render('agent/create_user', { metaTitle: 'Create Player', metaDesc: '', formError: pwErr || 'Name and valid email are required.' });
+  }
+  if (getBool(req.settings, 'breached_password_check', true)) {
+    const { isBreached } = require('../lib/breached');
+    if (await isBreached(password)) {
+      return res.render('agent/create_user', { metaTitle: 'Create Player', metaDesc: '', formError: 'This password has appeared in a data breach. Please choose a different one.' });
+    }
   }
   const emailLc = normalizeEmail(email);
   const phoneNorm = normalizePhone(phone);

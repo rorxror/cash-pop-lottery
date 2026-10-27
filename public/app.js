@@ -351,3 +351,184 @@
     });
   });
 })();
+
+/* ---------- (g) Moved inline scripts (v14 CSP: no inline <script> in views) ---------- */
+(function () {
+  'use strict';
+
+  /* Register: combine dial code + local number into the hidden phone field */
+  var registerForm = document.getElementById('registerForm');
+  if (registerForm) registerForm.addEventListener('submit', function () {
+    var ccEl = document.getElementById('phoneCc');
+    var localEl = document.getElementById('phoneLocal');
+    var fullEl = document.getElementById('phoneFull');
+    if (!ccEl || !localEl || !fullEl) return;
+    var cc = ccEl.value.replace(/\D/g, '');
+    var local = localEl.value.replace(/\D/g, '');
+    fullEl.value = (cc && local) ? ('+' + cc + local) : '';
+  });
+
+  /* Login: method tabs (Password / OTP) */
+  var methodSegs = document.querySelectorAll('.auth-methods .seg');
+  var pwPane = document.getElementById('loginPw');
+  var otpPane = document.getElementById('loginOtp');
+  methodSegs.forEach(function (b) {
+    b.addEventListener('click', function () {
+      methodSegs.forEach(function (x) { x.classList.toggle('active', x === b); });
+      var m = b.dataset.method;
+      if (pwPane) pwPane.hidden = (m !== 'password');
+      if (otpPane) otpPane.hidden = (m !== 'otp');
+    });
+  });
+
+  /* Login: password form routes identifier to email or phone field */
+  var pwForm = document.getElementById('pwForm');
+  if (pwForm) pwForm.addEventListener('submit', function () {
+    var inp = document.getElementById('pwIdentifier');
+    if (!inp) return;
+    var v = inp.value.trim();
+    inp.name = (v.indexOf('@') === -1) ? 'phone' : 'email';
+  });
+
+  /* Login: OTP flow (only rendered when admin enabled OTP) */
+  var otpPaneEl = document.getElementById('loginOtp');
+  if (otpPaneEl) (function () {
+    var type = 'phone';
+    var phoneOtpOn = otpPaneEl.getAttribute('data-phone-otp') !== 'false';
+    var emailOtpOn = otpPaneEl.getAttribute('data-email-otp') !== 'false';
+    var segs = document.querySelectorAll('.auth-otp-types .seg');
+    var label = document.getElementById('otpLabel');
+    var input = document.getElementById('otpIdentifier');
+    var hint = document.getElementById('otpHint');
+    var step1 = document.getElementById('otpStep1');
+    var step2 = document.getElementById('otpStep2');
+    var stepProfile = document.getElementById('authStepProfile');
+    var err = document.getElementById('otpError');
+    var sentTo = document.getElementById('otpSentTo');
+    var identifier = '';
+    var csrfToken = '';
+    function showErr(m) { err.textContent = m; err.hidden = false; }
+    function hideErr() { err.hidden = true; }
+    var phoneRow = document.getElementById('otpPhoneRow');
+    var phoneLocal = document.getElementById('otpPhoneLocal');
+    var ccSel = document.getElementById('otpCc');
+    function setType(t) {
+      type = t;
+      segs.forEach(function (b) { b.classList.toggle('active', b.dataset.type === t); });
+      if (t === 'phone') {
+        label.textContent = 'Phone number';
+        phoneRow.hidden = false; input.hidden = true;
+        hint.textContent = "We'll text you a 6-digit code.";
+      } else {
+        label.textContent = 'Email address';
+        phoneRow.hidden = true; input.hidden = false; input.type = 'email';
+        hint.textContent = "We'll email you a 6-digit code.";
+      }
+    }
+    segs.forEach(function (b) { b.addEventListener('click', function () { setType(b.dataset.type); }); });
+    if (document.querySelector('.auth-otp-types .seg[data-type="email"].active')) setType('email');
+    var reqBtn = document.getElementById('otpRequestBtn');
+    if (reqBtn) reqBtn.addEventListener('click', async function () {
+      hideErr();
+      if (type === 'phone') {
+        var cc = ccSel.value.replace(/\D/g, '');
+        var local = phoneLocal.value.replace(/\D/g, '');
+        identifier = (cc && local) ? ('+' + cc + local) : '';
+      } else {
+        identifier = input.value.trim();
+      }
+      if (!identifier) return showErr(type === 'phone' ? 'Please enter your phone number.' : 'Please enter your email address.');
+      var r = await fetch('/login/otp/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: type, identifier: identifier }) });
+      var d = await r.json().catch(function () { return {}; });
+      if (!r.ok) return showErr(d.error || 'Could not send code. Please try again.');
+      sentTo.textContent = identifier;
+      step1.hidden = true; step2.hidden = false;
+      document.getElementById('otpCode').focus();
+    });
+    var verifyBtn = document.getElementById('otpVerifyBtn');
+    if (verifyBtn) verifyBtn.addEventListener('click', async function () {
+      hideErr();
+      var code = document.getElementById('otpCode').value.trim();
+      if (code.length !== 6) return showErr('Please enter the 6-digit code.');
+      var r = await fetch('/login/otp/verify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: type, identifier: identifier, code: code }) });
+      var d = await r.json().catch(function () { return {}; });
+      if (!r.ok) return showErr(d.error || 'Invalid code. Please try again.');
+      if (d.needsProfile) { if (d.csrf) csrfToken = d.csrf; step2.hidden = true; stepProfile.hidden = false; document.getElementById('authFullName').focus(); return; }
+      window.location.href = d.redirect || '/';
+    });
+    var resend = document.getElementById('otpResend');
+    if (resend) resend.addEventListener('click', async function (e) {
+      e.preventDefault(); hideErr();
+      var r = await fetch('/login/otp/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: type, identifier: identifier }) });
+      if (!r.ok) showErr('Could not resend code. Please wait and try again.');
+    });
+    var back = document.getElementById('otpBack');
+    if (back) back.addEventListener('click', function (e) { e.preventDefault(); hideErr(); step2.hidden = true; step1.hidden = false; input.focus(); });
+    var profileBtn = document.getElementById('authProfileBtn');
+    if (profileBtn) profileBtn.addEventListener('click', async function () {
+      hideErr();
+      var nm = document.getElementById('authFullName').value.trim();
+      if (nm.length < 2) return showErr('Please enter your full name.');
+      if (!document.getElementById('authAgree').checked) return showErr('Please accept the Terms & Privacy Policy.');
+      var r = await fetch('/login/complete-profile', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-csrf-token': csrfToken }, body: JSON.stringify({ name: nm, agree: true }) });
+      var d = await r.json().catch(function () { return {}; });
+      if (!r.ok) return showErr(d.error || 'Could not save your profile. Please try again.');
+      window.location.href = d.redirect || '/';
+    });
+  })();
+
+  /* Scratch ticket: foil canvas */
+  (function () {
+    var canvas = document.getElementById('foil'), area = document.getElementById('scratchArea'), form = document.getElementById('revealForm');
+    if (!canvas || !area || !form) return;
+    var ctx = canvas.getContext('2d', { willReadFrequently: true });
+    var down = false, submitted = false;
+    function size() {
+      var r = area.getBoundingClientRect();
+      canvas.width = Math.max(280, Math.floor(r.width));
+      canvas.height = Math.max(220, Math.floor(r.height));
+      ctx.globalCompositeOperation = 'source-over';
+      var g = ctx.createLinearGradient(0, 0, canvas.width, canvas.height);
+      g.addColorStop(0, '#9aa3ad'); g.addColorStop(.5, '#e4e7eb'); g.addColorStop(1, '#7d8792');
+      ctx.fillStyle = g; ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = '#25304c'; ctx.font = '700 22px system-ui'; ctx.textAlign = 'center';
+      ctx.fillText('SCRATCH HERE', canvas.width / 2, canvas.height / 2);
+      ctx.globalCompositeOperation = 'destination-out';
+    }
+    function point(e) {
+      var r = canvas.getBoundingClientRect(), p = e.touches ? e.touches[0] : e;
+      return { x: (p.clientX - r.left) * canvas.width / r.width, y: (p.clientY - r.top) * canvas.height / r.height };
+    }
+    function scratch(e) {
+      if (!down) return;
+      e.preventDefault();
+      var p = point(e);
+      ctx.beginPath(); ctx.arc(p.x, p.y, 26, 0, Math.PI * 2); ctx.fill();
+      measure();
+    }
+    var check = 0;
+    function measure(force) {
+      if (!force && ++check % 3) return;
+      var d = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+      var clear = 0;
+      for (var i = 3; i < d.length; i += 16) if (d[i] < 32) clear++;
+      var pct = Math.min(100, Math.round(clear / (d.length / 16) * 100));
+      document.getElementById('scratchPct').textContent = pct + '%';
+      document.getElementById('scratchBar').style.width = pct + '%';
+      if (pct >= 60 && !submitted) {
+        submitted = true;
+        document.getElementById('scratchHint').textContent = 'Revealing your locked result…';
+        form.submit();
+      }
+    }
+    canvas.addEventListener('pointerdown', function (e) { down = true; canvas.setPointerCapture(e.pointerId); scratch(e); });
+    canvas.addEventListener('pointermove', scratch);
+    canvas.addEventListener('pointerup', function () { down = false; measure(true); });
+    canvas.addEventListener('pointercancel', function () { down = false; measure(true); });
+    size();
+  })();
+
+  /* Ticket print button */
+  var printBtn = document.getElementById('printBtn');
+  if (printBtn) printBtn.addEventListener('click', function () { window.print(); });
+})();

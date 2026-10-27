@@ -25,6 +25,21 @@
       </div>
       <button type="submit" class="btn btn-p btn-lg btn-block">Save Changes</button>
     </form>
+    <div class="card mt">
+      <div class="card-h"><h2>Contact verification</h2></div>
+      <p class="muted">A verified email or phone is required before depositing or withdrawing (operator setting). If you cannot receive a code, contact support — staff can attest your contact manually.</p>
+      <p>Email: <%= user.email_verified ? '<span class="badge b-ok">&#10003; verified</span>' : '<span class="badge b-warn">not verified</span>' %>
+        <% if (!user.email_verified) { %><form method="POST" action="/profile/verify-email" style="display:inline"><input type="hidden" name="_csrf" value="<%= csrf %>"><button class="btn btn-sm btn-p" type="submit">Send verification link</button></form><% } %></p>
+      <p>Phone: <%= user.mobile_verified ? '<span class="badge b-ok">&#10003; verified</span>' : '<span class="badge b-warn">not verified</span>' %>
+        <% if (!user.mobile_verified && user.phone) { %><form method="POST" action="/profile/verify-phone" style="display:inline"><input type="hidden" name="_csrf" value="<%= csrf %>"><button class="btn btn-sm btn-p" type="submit">Send code</button></form><% } else if (!user.mobile_verified) { %><span class="muted">Add a phone number above first.</span><% } %></p>
+      <% if (typeof verifyPhone !== 'undefined' && verifyPhone) { %>
+      <form method="POST" action="/profile/verify-phone/confirm">
+        <input type="hidden" name="_csrf" value="<%= csrf %>">
+        <div class="field"><label for="phoneCode">Phone code</label><input type="text" id="phoneCode" name="code" required autocomplete="off"></div>
+        <button class="btn btn-p" type="submit">Confirm phone</button>
+      </form>
+      <% } %>
+    </div>
     <% if (user.referral_code) { %>
     <div class="login-branding">
       <div class="login-jackpot">🔗 Your referral link</div>

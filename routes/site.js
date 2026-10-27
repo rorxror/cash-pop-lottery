@@ -4,7 +4,7 @@
 const express = require('express');
 const router = express.Router();
 const { sha256 } = require('../lib/util');
-const { deriveWinningNumber, publicDrawInfo } = require('../lib/draws');
+const { deriveWinningNumberLegacy, deriveWinningNumberFair, combineSeed, publicDrawInfo } = require('../lib/draws');
 
 function resolveContent(body, blocks) {
   return String(body || '').replace(/\{\{\s*content:([a-z0-9_]+)\s*\}\}/gi, (_, k) => blocks[k] || '');
@@ -81,7 +81,14 @@ router.get('/fairness', async (req, res) => {
     const d = await req.db.get('SELECT * FROM draws WHERE id = ?', [drawId]);
     if (d) {
       const recomputedHash = d.seed ? sha256(d.seed) : null;
-      const recomputedNumber = d.seed ? deriveWinningNumber(d.seed, d.id) : null;
+      // v14: pre-v14 draws (no beacon fields) use the legacy %15 derivation;
+      // newer draws combine the revealed seed with the recorded beacon
+      // randomness and use rejection sampling — exactly as settle did.
+      let recomputedNumber = null;
+      if (d.seed) {
+        if (!d.beacon_status) recomputedNumber = deriveWinningNumberLegacy(d.seed, d.id);
+        else recomputedNumber = deriveWinningNumberFair(combineSeed(d.seed, d.beacon_randomness || ''), d.id);
+      }
       result = {
         draw: publicDrawInfo(d),
         recomputed_hash: recomputedHash,

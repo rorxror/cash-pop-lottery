@@ -35,6 +35,9 @@
         <% }) %>
         <button type="submit" class="btn btn-p btn-lg btn-block">Submit Withdrawal</button>
       </form>
+      <% } else if (typeof noMethods !== 'undefined' && noMethods) { %>
+      <p class="muted"><%= (typeof noMethodsReason !== 'undefined' && noMethodsReason) ? noMethodsReason : 'No withdrawal methods are available right now. The operator has not enabled any withdrawal method yet — please check back later or contact support.' %></p>
+      <p><a class="btn btn-g" href="/wallet">Back to wallet</a></p>
       <% } else { %>
       <p class="muted">Select a payment method to continue.</p>
       <% } %>

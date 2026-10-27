@@ -10,7 +10,7 @@
 <% if (S('custom_css')) { %><style><%- S('custom_css') %></style><% } %>
 <% if (extOn('google_analytics') && extCfg('google_analytics') && extCfg('google_analytics').tracking_id) { %>
 <script async src="https://www.googletagmanager.com/gtag/js?id=<%= extCfg('google_analytics').tracking_id %>"></script>
-<script>
+<script nonce="<%= cspNonce %>">
 window.dataLayer = window.dataLayer || [];
 function gtag(){ dataLayer.push(arguments); }
 gtag('js', new Date());
@@ -133,7 +133,7 @@ gtag('config', '<%= extCfg('google_analytics').tracking_id %>');
 <% } %>
 
 <% if (extOn('tawkto') && extCfg('tawkto') && extCfg('tawkto').embed_code) { %>
-<%- extCfg('tawkto').embed_code %>
+<%- extCfg('tawkto').embed_code.replace(/<script(?![^>]*nonce=)/g, '<script nonce="' + cspNonce + '"') %>
 <% } %>
 </body>
 </html>

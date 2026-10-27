@@ -130,7 +130,8 @@ async function boot() {
     app.locals.assetV = h.digest('hex').slice(0, 8);
   } catch { app.locals.assetV = String(Date.now()); }
 
-  // security headers (CSP intentionally omitted: views use inline handlers)
+  // security headers (CSP added in v14 — see the nonce middleware below;
+  // inline handlers were moved into public/app.js so the policy holds)
   app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
@@ -138,6 +139,12 @@ async function boot() {
     next();
   });
   app.use((req, res, next) => { req.cookies = parseCookies(req); next(); });
+  // CSP nonce: one random value per request; templates add it to the few
+  // remaining inline scripts (GA, tawk.to embed) and captcha widget scripts.
+  app.use((req, res, next) => {
+    req.cspNonce = require('node:crypto').randomBytes(16).toString('base64');
+    next();
+  });
   // Webhook routes verify HMAC signatures over the RAW body, so the global
   // body parsers must skip /webhooks/* — otherwise express.json() consumes
   // the stream first and the route-level express.raw() sees a parsed object
@@ -199,6 +206,7 @@ async function boot() {
       const blocks = await db.query('SELECT `key`, body FROM content_blocks').catch(() => []);
       const blockMap = Object.fromEntries(blocks.map(b => [b.key, b.body]));
       const exts = await getExtensions(db).catch(() => ({}));
+      req.exts = exts;
       const footerPages = await db.query("SELECT slug, title FROM pages WHERE status='published' ORDER BY sort, name").catch(() => []);
       let wallets = [];
       if (req.user) wallets = await db.query('SELECT currency, balance FROM wallets WHERE user_id = ?', [req.user.id]).catch(() => []);
@@ -221,6 +229,7 @@ async function boot() {
         metaTitle: 'Home', metaDesc: '',
         currentPath: req.path,
         adminPath: ADMIN_PATH,
+        cspNonce: req.cspNonce || '',
         captchaHtml: '', recaptchaHtml: '',
         googleOn: getBool(req.settings, 'google_oauth_enabled', false) && !!process.env.GOOGLE_CLIENT_ID,
       };
@@ -254,18 +263,89 @@ async function boot() {
     next();
   });
 
-  // Maintenance mode (admin toggle): player site shows a maintenance page.
-  // Admin panel, admin login, and static assets always stay reachable.
+  // Content-Security-Policy (v14, nonce-based). Inline event handlers were
+  // moved into public/app.js; the remaining inline scripts (GA snippet,
+  // tawk.to embed) carry the per-request nonce, and captcha widgets get it
+  // on their <script> tags. style-src keeps 'unsafe-inline' for admin inline
+  // styles and operator custom_css (operator-controlled, never user input).
+  // Runs after the context middleware so extension state is known.
   app.use((req, res, next) => {
-    if (req.method !== 'GET') return next();
+    try {
+      if (getBool(req.settings, 'csp_enabled', true)) {
+        const nonce = req.cspNonce || '';
+        const exts = req.exts || {};
+        const on = (k) => !!(exts[k] && exts[k].enabled);
+        const scriptSrc = ["'self'", `'nonce-${nonce}'`];
+        const connectSrc = ["'self'"];
+        let frameSrc = "'none'";
+        if (on('google_analytics')) { scriptSrc.push('https://www.googletagmanager.com', 'https://www.google-analytics.com'); connectSrc.push('https://www.google-analytics.com'); }
+        if (on('tawkto')) { scriptSrc.push('https://embed.tawk.to'); connectSrc.push('https://embed.tawk.to', 'https://va.tawk.to'); }
+        if (on('fb_comments')) { scriptSrc.push('https://connect.facebook.net'); frameSrc = 'https://www.facebook.com'; }
+        if (on('recaptcha') || on('hcaptcha') || on('turnstile')) {
+          scriptSrc.push('https://www.google.com', 'https://www.gstatic.com', 'https://js.hcaptcha.com', 'https://challenges.cloudflare.com');
+          frameSrc = 'https://www.google.com https://js.hcaptcha.com https://newassets.hcaptcha.com https://challenges.cloudflare.com';
+        }
+        res.setHeader('Content-Security-Policy', [
+          "default-src 'self'",
+          'script-src ' + scriptSrc.join(' '),
+          "style-src 'self' 'unsafe-inline'",
+          "img-src 'self' data: https:",
+          'connect-src ' + connectSrc.join(' '),
+          'frame-src ' + frameSrc,
+          "frame-ancestors 'none'",
+          "object-src 'none'",
+          "base-uri 'self'",
+          "form-action 'self'",
+        ].join('; '));
+      }
+    } catch {}
+    next();
+  });
+
+  // Maintenance mode (admin toggle, v14): gates ALL methods, not just GET —
+  // the old version let a logged-in player POST /play/buy during maintenance.
+  // Admin users bypass; everyone else gets the maintenance page (GET) or a
+  // 503 JSON (POST/API). Allowlist: admin path, login/logout, impersonation
+  // exit, webhooks, healthz, email verification, password reset/forgot,
+  // static assets.
+  app.use((req, res, next) => {
     let mm = false;
     try { mm = req.settings && (req.settings.maintenance_mode === '1' || req.settings.maintenance_mode === 'true'); } catch {}
     if (!mm) return next();
     const isAdmin = req.user && req.user.role === 'admin';
-    const adminPath = req.adminPath || '/ops-7f3a9c-console';
     if (isAdmin) return next();
-    if (req.path.startsWith(adminPath) || req.path === '/login' || req.path.startsWith('/style.css') || req.path.startsWith('/app.js') || req.path === '/favicon.ico') return next();
-    return res.status(503).render('maintenance', { metaTitle: 'Under Maintenance', metaDesc: '' });
+    const adminPath = req.adminPath || '/ops-7f3a9c-console';
+    if (req.path.startsWith(adminPath)) return next();
+    if (req.path === '/login' || req.path === '/logout' || req.path === '/impersonate/exit') return next();
+    if (req.path.startsWith('/webhooks/')) return next();
+    if (req.path === '/healthz') return next();
+    if (req.path.startsWith('/verify-email/') || req.path.startsWith('/reset/') || req.path === '/forgot' || req.path === '/force-reset') return next();
+    if (req.path.startsWith('/style.css') || req.path.startsWith('/app.js') || req.path === '/favicon.ico') return next();
+    if (req.method === 'GET') return res.status(503).render('maintenance', { metaTitle: 'Under Maintenance', metaDesc: '' });
+    return res.status(503).json({ ok: false, error: 'Site under maintenance' });
+  });
+
+  // Forced-action gate (v14): users flagged for a forced password reset
+  // (agents created by an admin) or forced TOTP enrollment (admins when
+  // enforcement is on) can ONLY reach the page that clears the flag (+
+  // logout + impersonation exit). Everything else redirects there. Checked
+  // fresh every request so clearing the flag takes effect immediately.
+  app.use(async (req, res, next) => {
+    if (!req.user) return next();
+    try {
+      const u = await db.get('SELECT force_password_reset, force_totp_enroll FROM users WHERE id = ?', [req.user.id]);
+      if (!u) return next();
+      if (u.force_password_reset) {
+        if (req.path === '/force-reset' || req.path === '/logout' || req.path === '/impersonate/exit') return next();
+        return res.redirect('/force-reset');
+      }
+      if (u.force_totp_enroll && req.user.role === 'admin') {
+        const adminPath = req.adminPath || '/ops-7f3a9c-console';
+        if (req.path === adminPath + '/security' || req.path.startsWith(adminPath + '/security/') || req.path === '/logout' || req.path === '/impersonate/exit') return next();
+        return res.redirect(adminPath + '/security');
+      }
+    } catch {}
+    next();
   });
 
   // exit impersonation

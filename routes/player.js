@@ -4,12 +4,12 @@
 const express = require('express');
 const router = express.Router();
 const QRCode = require('qrcode');
-const { now, randHex, hmac, toMinor, esc } = require('../lib/util');
+const { now, randHex, hmac, sha256, hashPassword, verifyPassword, toMinor, esc } = require('../lib/util');
 const { getS, getBool, getCurrencies, getSettings } = require('../lib/settings');
 const { requireLogin } = require('../lib/auth');
-const { getBalances, postLedger, depositPolicy, withdrawalPolicy, chargeFor, createDeposit, createWithdrawal } = require('../lib/money');
+const { getBalances, postLedger, depositPolicy, withdrawalPolicy, chargeFor, createDeposit, createWithdrawal, checkWithdrawalRules, notePayoutDetails, releaseReferralCredits } = require('../lib/money');
 const { getRail } = require('../lib/rails');
-const { newTotpSecret, totpUri, verifyTotp, newBackupCodes, hashBackupCodes, verifyPassword, destroyUserSessions } = require('../lib/auth');
+const { newTotpSecret, totpUri, verifyTotp, newBackupCodes, hashBackupCodes, destroyUserSessions } = require('../lib/auth');
 const notify = require('../lib/notify');
 const audit = require('../lib/audit');
 
@@ -91,13 +91,16 @@ router.post('/play/buy', requireLogin, async (req, res) => {
       for (const did of drawIds) {
         await tx.run("INSERT INTO ticket_entries (ticket_id, draw_id, status) VALUES (?, ?, 'pending')", [r.id, did]);
       }
-      // Referral commission: referrer earns % of the purchase (admin toggle + rate)
+      // Referral commission (v14): recorded as PENDING, not paid instantly.
+      // It releases only after the referee's first approved deposit + any
+      // wagering, up to the per-referee cap (see lib/money.js release).
       if (getBool(req.settings, 'referral_enabled', false)) {
         const rate = parseFloat(getS(req.settings, 'referral_rate', '5')) || 0;
         const buyer = await tx.get('SELECT referred_by FROM users WHERE id = ?', [req.user.id]);
         if (buyer && buyer.referred_by && rate > 0) {
           const comm = Math.round(total * rate / 100);
-          if (comm > 0) await postLedger(tx, { userId: buyer.referred_by, currency, type: 'referral_commission', amount: comm, refType: 'ticket', refId: publicId, meta: { referred_user: req.user.id, rate } });
+          if (comm > 0) await tx.run('INSERT INTO referral_credits (referrer_id, referee_id, ticket_id, currency, amount, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            [buyer.referred_by, req.user.id, r.id, currency, comm, 'pending', now()]);
         }
       }
       // agent commission on purchase
@@ -112,6 +115,10 @@ router.post('/play/buy', requireLogin, async (req, res) => {
       return r.id;
     });
     await audit.log(req.db, { actorId: req.user.id, actorRole: 'player', action: 'ticket.buy', entity: 'ticket', entityId: publicId, detail: { pops, wager, drawType, numDraws, total }, ip: req.ip });
+    // This purchase counts as wagering: release any pending referral credits
+    // whose referee conditions are now met. Best-effort — a failure leaves
+    // rows pending for the next trigger (deposit approval or next buy).
+    try { await releaseReferralCredits(req.db, req.user.id, req.settings); } catch (e) { console.error('referral release failed:', e.message); }
     res.redirect('/ticket/' + publicId);
   } catch (e) {
     res.status(400).render('error', { status: 400, message: 'Purchase failed: ' + e.message });
@@ -171,9 +178,9 @@ function methodCustomFields(method) {
 
 router.get('/deposit/new', requireLogin, async (req, res) => {
   const policy = depositPolicy(req.settings, req.user);
-  if (!policy.allowed) return res.render('error', { status: 403, message: policy.reason });
+  if (!policy.allowed) return res.status(403).render('error', { status: 403, message: policy.reason });
   const methods = await req.db.query("SELECT * FROM payment_methods WHERE enabled = 1 AND kind IN ('deposit','both') ORDER BY sort");
-  if (!methods.length) return res.render('error', { status: 503, message: 'No deposit methods are enabled right now. Please check back later.' });
+  if (!methods.length) return res.render('deposit_new', { metaTitle: 'Deposit', metaDesc: '', methods: [], method: null, noMethods: true });
   const method = methods.find(m => m.id === parseInt(req.query.m, 10)) || methods[0];
   res.render('deposit_new', {
     metaTitle: 'Deposit', metaDesc: '', methods,
@@ -212,9 +219,20 @@ router.post('/deposit/new', requireLogin, async (req, res) => {
 
 router.get('/withdraw/new', requireLogin, async (req, res) => {
   const policy = withdrawalPolicy(req.settings, req.user);
-  if (!policy.allowed) return res.render('error', { status: 403, message: policy.reason });
-  const methods = await req.db.query("SELECT * FROM payment_methods WHERE enabled = 1 AND kind IN ('withdrawal','both') ORDER BY sort");
-  if (!methods.length) return res.render('error', { status: 503, message: 'No withdrawal methods are enabled right now. Please check back later.' });
+  if (!policy.allowed) return res.status(403).render('error', { status: 403, message: policy.reason });
+  let methods = await req.db.query("SELECT * FROM payment_methods WHERE enabled = 1 AND kind IN ('withdrawal','both') ORDER BY sort");
+  if (!methods.length) return res.render('withdraw_new', { metaTitle: 'Withdraw', metaDesc: '', methods: [], method: null, balance: 0, noMethods: true });
+  // Same-method preference (v14): when withdrawal_same_method is ON, only
+  // methods the player has deposited with are offered; otherwise
+  // deposit-used methods are simply listed first (preference, not a rule).
+  const used = await req.db.query("SELECT DISTINCT method_id FROM deposits WHERE user_id = ? AND status = 'approved'", [req.user.id]);
+  const usedIds = new Set(used.map(u => u.method_id));
+  if (getBool(req.settings, 'withdrawal_same_method', false)) {
+    methods = methods.filter(m => usedIds.has(m.id));
+    if (!methods.length) return res.render('withdraw_new', { metaTitle: 'Withdraw', metaDesc: '', methods: [], method: null, balance: 0, noMethods: true, noMethodsReason: 'Withdrawals are restricted to payment methods you have deposited with. Deposit first, then withdraw to the same method.' });
+  } else {
+    methods.sort((a, b) => (usedIds.has(b.id) ? 1 : 0) - (usedIds.has(a.id) ? 1 : 0) || (a.sort - b.sort));
+  }
   const method = methods.find(m => m.id === parseInt(req.query.m, 10)) || methods[0];
   const wallets = await getBalances(req.db, req.user.id);
   const balance = (wallets.find(w => w.currency === method.currency) || { balance: 0 }).balance;
@@ -238,6 +256,13 @@ router.post('/withdraw/new', requireLogin, async (req, res) => {
     const v = String(req.body['custom_' + f.key] || '').trim();
     if (f.required && !v) return res.status(400).render('error', { status: 400, message: `Field "${f.label}" is required.` });
     userData[f.key] = v;
+  }
+  // v14 withdrawal rules (turnover, caps, payout lock, same-method) — checked
+  // BEFORE the OTP step so a blocked withdrawal never sends a code.
+  const ruleCheck = await checkWithdrawalRules(req.db, req.settings, req.user, method, amount, userData);
+  if (!ruleCheck.ok) {
+    if (ruleCheck.changeDetected) await notePayoutDetails(req.db, req.user.id, ruleCheck.fingerprint, true);
+    return res.status(400).render('error', { status: 400, message: ruleCheck.reason });
   }
   // Withdrawal OTP (admin toggle `withdrawal_otp_enabled`, ON by default):
   // OTP is used ONLY here — never on login/register. When ON, the withdrawal is
@@ -266,6 +291,7 @@ router.post('/withdraw/new', requireLogin, async (req, res) => {
   }
   try {
     const { publicId } = await createWithdrawal(req.db, { userId: req.user.id, method, amountMinor: amount, userData });
+    await notePayoutDetails(req.db, req.user.id, ruleCheck.fingerprint, false);
     await audit.log(req.db, { actorId: req.user.id, actorRole: 'player', action: 'withdrawal.create', entity: 'withdrawal', entityId: publicId, detail: { amount, method: method.name }, ip: req.ip });
     await req.setFlash('success', 'Withdrawal request submitted and amount held. It will be processed after review.');
     res.redirect('/wallet');
@@ -285,10 +311,20 @@ router.post('/withdraw/verify', requireLogin, async (req, res) => {
   if (!v.ok) return res.status(400).render('error', { status: 400, message: 'Withdrawal verification failed: ' + v.error });
   const method = await req.db.get("SELECT * FROM payment_methods WHERE id = ? AND enabled = 1 AND kind IN ('withdrawal','both')", [pending.method_id]);
   if (!method) return res.status(400).render('error', { status: 400, message: 'Withdrawal method no longer available.' });
+  // Re-check v14 rules: state may have changed since the OTP was requested
+  // (e.g. a payout-detail change started a lock in the meantime).
+  const ruleCheck2 = await checkWithdrawalRules(req.db, req.settings, req.user, method, pending.amount, pending.userData);
+  if (!ruleCheck2.ok) {
+    if (ruleCheck2.changeDetected) await notePayoutDetails(req.db, req.user.id, ruleCheck2.fingerprint, true);
+    const { touchSession: ts2 } = require('../lib/auth');
+    await ts2(req.db, req.sess.id, { pending_withdrawal: null });
+    return res.status(400).render('error', { status: 400, message: ruleCheck2.reason });
+  }
   const { touchSession } = require('../lib/auth');
   await touchSession(req.db, req.sess.id, { pending_withdrawal: null });
   try {
     const { publicId } = await createWithdrawal(req.db, { userId: req.user.id, method, amountMinor: pending.amount, userData: pending.userData });
+    await notePayoutDetails(req.db, req.user.id, ruleCheck2.fingerprint, false);
     await audit.log(req.db, { actorId: req.user.id, actorRole: 'player', action: 'withdrawal.create', entity: 'withdrawal', entityId: publicId, detail: { amount: pending.amount, method: method.name, otp_verified: true }, ip: req.ip });
     await req.setFlash('success', 'Withdrawal verified and submitted. Amount held — it will be processed after review.');
     res.redirect('/wallet');
@@ -311,7 +347,7 @@ router.get('/transactions', requireLogin, async (req, res) => {
 
 /* ---------------- profile ---------------- */
 router.get('/profile', requireLogin, async (req, res) => {
-  res.render('profile', { metaTitle: 'Profile', metaDesc: '' });
+  res.render('profile', { metaTitle: 'Profile', metaDesc: '', verifyPhone: req.query.verify_phone === '1' });
 });
 router.post('/profile', requireLogin, async (req, res) => {
   const { name, phone, country } = req.body;
@@ -321,6 +357,73 @@ router.post('/profile', requireLogin, async (req, res) => {
   await audit.log(req.db, { actorId: req.user.id, actorRole: req.user.role, action: 'user.profile_update', entity: 'user', entityId: req.user.id, detail: {}, ip: req.ip });
   await req.setFlash('success', 'Profile updated.');
   res.redirect('/profile');
+});
+
+/* ---------------- contact verification (v14) ---------------- */
+// Email link + phone OTP verification mark email_verified / mobile_verified,
+// which the deposit/withdrawal gate reads. Admins can also mark a contact
+// verified from the user page (audited) when no provider is configured.
+router.post('/profile/verify-email', requireLogin, async (req, res) => {
+  const email = req.user.email;
+  if (!email || email.endsWith('@phone.local')) { await req.setFlash('error', 'Add a real email to your profile first.'); return res.redirect('/profile'); }
+  const token = randHex(24);
+  await req.db.run('INSERT INTO email_verifications (user_id, new_email, token_hash, expires_at, used, created_at) VALUES (?, ?, ?, ?, 0, ?)',
+    [req.user.id, email, sha256('verify:' + token), now() + 24 * 3600 * 1000, now()]);
+  const link = (process.env.BASE_URL || (req.protocol + '://' + req.get('host'))) + '/verify-email/' + token;
+  const sent = await notify.send(req.db, req.settings, 'email', 'email_verification', email, { name: req.user.name, link });
+  if (sent.status === 'sent') await req.setFlash('success', 'Verification link sent to ' + email + '.');
+  else await req.setFlash('error', 'Could not send the verification email (no email provider configured). Ask support to mark your contact verified.');
+  res.redirect('/profile');
+});
+router.post('/profile/verify-phone', requireLogin, async (req, res) => {
+  const phone = req.user.phone;
+  if (!phone) { await req.setFlash('error', 'Add a phone number to your profile first.'); return res.redirect('/profile'); }
+  const otpLib = require('../lib/otp');
+  let code;
+  try { code = await otpLib.createOtp(req.db, phone, 'phone'); } catch (e) { await req.setFlash('error', e.message); return res.redirect('/profile'); }
+  const sent = await otpLib.sendOtp(req.db, req.settings, phone, 'phone', code);
+  if (!sent.sent) { await req.setFlash('error', 'Could not send the verification code. Try again later.'); return res.redirect('/profile'); }
+  await req.setFlash('success', 'Verification code sent to ' + phone + '. Enter it below.');
+  res.redirect('/profile?verify_phone=1');
+});
+router.post('/profile/verify-phone/confirm', requireLogin, async (req, res) => {
+  const otpLib = require('../lib/otp');
+  const v = await otpLib.verifyOtp(req.db, req.user.phone, 'phone', String(req.body.code || '').trim());
+  if (!v.ok) { await req.setFlash('error', 'Phone verification failed: ' + v.error); return res.redirect('/profile?verify_phone=1'); }
+  await req.db.run('UPDATE users SET mobile_verified = 1 WHERE id = ?', [req.user.id]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'player', action: 'user.phone_verified', entity: 'user', entityId: req.user.id, detail: {}, ip: req.ip });
+  await req.setFlash('success', 'Phone verified.');
+  res.redirect('/profile');
+});
+
+/* ---------------- forced password reset (v14) ---------------- */
+// Agents created by an admin (or flagged by one) must set their own password
+// before doing anything else. The server flag-gate redirects every other
+// route here until the flag is cleared.
+router.get('/force-reset', requireLogin, async (req, res) => {
+  const u = await req.db.get('SELECT force_password_reset FROM users WHERE id = ?', [req.user.id]);
+  if (!u || !u.force_password_reset) return res.redirect('/');
+  res.render('force_reset', { metaTitle: 'Set Your Password', metaDesc: '' });
+});
+router.post('/force-reset', requireLogin, async (req, res) => {
+  const u = await req.db.get('SELECT * FROM users WHERE id = ?', [req.user.id]);
+  if (!u || !u.force_password_reset) return res.redirect('/');
+  const { passwordError } = require('../lib/validate');
+  const { isBreached } = require('../lib/breached');
+  const pwErr = passwordError(req.body.password, u.role, getBool(req.settings, 'secure_password', true));
+  if (pwErr || req.body.password !== req.body.password2) {
+    return res.render('force_reset', { metaTitle: 'Set Your Password', metaDesc: '', formError: pwErr || 'Passwords do not match.' });
+  }
+  if (getBool(req.settings, 'breached_password_check', true) && await isBreached(req.body.password)) {
+    return res.render('force_reset', { metaTitle: 'Set Your Password', metaDesc: '', formError: 'This password has appeared in a data breach. Please choose a different one.' });
+  }
+  await req.db.run('UPDATE users SET password_hash = ?, force_password_reset = 0 WHERE id = ?', [hashPassword(req.body.password), req.user.id]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: u.role, action: 'user.forced_reset_done', entity: 'user', entityId: req.user.id, detail: {}, ip: req.ip });
+  // Kill every OTHER session (in case the temporary password leaked) but keep
+  // this one: the user just proved control of it by setting the password.
+  await destroyUserSessions(req.db, req.user.id, req.sess ? req.sess.id : null);
+  await req.setFlash('success', 'Password set. You can continue now.');
+  res.redirect(u.role === 'agent' ? '/agent' : '/');
 });
 
 /* ---------------- security / TOTP 2FA ---------------- */

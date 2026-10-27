@@ -18,6 +18,12 @@ dependencies only (no native modules), SQLite built in, MySQL optional.
 4. Add environment variables (see `.env.example`):
    - `TICKET_HMAC_SECRET` — long random string (required; in production the
      app refuses to start without it — never leave the dev default)
+   - `CREDENTIAL_ENCRYPTION_KEY` (v14) — 64 hex characters (32 random bytes:
+     generate with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`).
+     Gateway credentials are AES-256-GCM encrypted at rest with this key.
+     Without it, credentials store in plaintext with a warning — set it
+     BEFORE saving any provider credential. If you rotate it, re-save every
+     method's credentials afterwards (old envelopes become unreadable).
    - Note: sessions use random opaque IDs and need no signing secret, so
      `SESSION_SECRET` is NOT required by the code (older docs listed it).
    - `ADMIN_PATH` — e.g. `/ops-9f2c1a-console` (your hidden admin URL;
@@ -127,3 +133,13 @@ these. Live automation needs:
 - Back up `data/cashpop.sqlite` (or your MySQL database) regularly.
 - Production draws are always server-random; number override exists
   only on TEST draws and is audit-logged (Admin → Audit Trail).
+- v14 draws combine the committed seed with the public drand beacon at
+  settle (rejection sampling, no modulo bias); verify any draw at
+  /fairness?draw_id=N (hash + number must both MATCH). If the beacon is
+  unreachable, draws settle with beacon_status=fallback unless
+  `beacon_required` is ON (then settle refuses — fail closed).
+- v14 launch gates: verified contact before deposit/withdraw, 1× turnover,
+  payout-detail change lock, maker-checker above the threshold, admin TOTP
+  enrollment (Admin → Security) before enabling `admin_totp_required`.
+- Ops docs: docs/THREAT-MODEL.md, docs/INCIDENT-RESPONSE.md,
+  docs/LOAD-TEST.md (includes the npm-audit sandbox limitation).

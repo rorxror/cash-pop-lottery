@@ -24,6 +24,12 @@
       <div class="slip-line"><span>Published winning number</span><span><%= result.draw.winning_number %></span></div>
       <div class="slip-line"><span>Recomputed winning number</span><span><%= result.recomputed_number %></span></div>
       <div class="slip-line"><span>Number match</span><span><%= result.number_match ? '<span class="badge b-ok">&#10003; MATCH</span>' : '<span class="badge b-err">&#10007; MISMATCH</span>' %></span></div>
+      <% if (result.draw.beacon_status) { %>
+      <div class="slip-line"><span>Beacon</span><span>drand round <%= result.draw.beacon_round %> — <%= result.draw.beacon_status %></span></div>
+      <div class="slip-line"><span>Beacon randomness</span><span class="code"><%= result.draw.beacon_randomness || '—' %></span></div>
+      <% } else { %>
+      <div class="slip-line"><span>Beacon</span><span class="muted">Pre-v14 draw — legacy derivation (no beacon).</span></div>
+      <% } %>
     </div>
   </div>
   <% } %>
@@ -32,7 +38,7 @@
     <div class="card-h"><h2>How provably-fair works</h2></div>
     <ol class="fair-steps">
       <li><strong>Commit.</strong> Before the draw closes, the operator generates a secret random seed and publishes its SHA-256 hash (<span class="code">seed_hash</span>). The hash is a one-way fingerprint: it cannot be reversed to reveal the seed.</li>
-      <li><strong>Draw.</strong> Once betting closes, the seed is used to derive the winning number deterministically: <span class="code">winning_number = (HMAC(seed) mod 15) + 1</span>. Because the hash was published first, the operator cannot change the outcome afterwards.</li>
+      <li><strong>Draw.</strong> Once betting closes, the winning number is derived from the seed combined with the public drand beacon randomness for that round, using rejection sampling (no modulo bias): <span class="code">winning_number = reject_sample(SHA256(seed + '|' + beacon_randomness), draw_id)</span>. Because the hash was published first and the beacon is public and unpredictable, the operator cannot change the outcome afterwards. Pre-v14 draws (no beacon recorded) used the legacy <span class="code">(HMAC(seed) mod 15) + 1</span> derivation.</li>
       <li><strong>Reveal &amp; verify.</strong> The seed is revealed. Anyone can compute <span class="code">SHA256(seed)</span> and compare it with the published hash, then recompute the winning number from the seed. If both match, the draw was fair.</li>
     </ol>
   </div>

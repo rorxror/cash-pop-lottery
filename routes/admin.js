@@ -9,7 +9,7 @@ const QRCode = require('qrcode');
 const { now, randHex, sha256, hashPassword, validEmail, toMinor, esc, fromMinor } = require('../lib/util');
 const { getS, getBool, setSetting, getCurrencies, getSettings } = require('../lib/settings');
 const { requireLogin, requireRole, createSession, destroySession, destroyUserSessions, verifyTotp } = require('../lib/auth');
-const { decideDeposit, decideWithdrawal, getBalances, postLedger } = require('../lib/money');
+const { decideDeposit, decideWithdrawal, getBalances, postLedger, markWithdrawalPaid, settleAgentCommissions, releaseReferralCredits } = require('../lib/money');
 const { RAILS, getRail, isBlockedRail } = require('../lib/rails');
 const { getExtensions, setExtension, EXTENSION_FIELDS } = require('../lib/extensions');
 const { ensureUpcomingDraws, createTestDraw, settleDraw, publicDrawInfo } = require('../lib/draws');
@@ -17,6 +17,11 @@ const { runNow } = require('../lib/cron');
 const notify = require('../lib/notify');
 const audit = require('../lib/audit');
 const ui = require('../lib/admin-ui');
+const { rbacMiddleware } = require('../lib/rbac');
+const { runReconciliation } = require('../lib/reconcile');
+const { encryptField, decryptField, keyConfigured } = require('../lib/credentials');
+const { isBreached } = require('../lib/breached');
+const { passwordError } = require('../lib/validate');
 
 /* STEALTH: the admin panel must not exist for anyone but a logged-in admin.
    Logged-out visitors used to be redirected to /login and logged-in players
@@ -35,6 +40,11 @@ router.use(async (req, res, next) => {
   next();
 });
 router.use(requireLogin, requireRole('admin'));
+/* v14 RBAC: views (GET) are readable by all staff roles; ACTIONS enforce the
+   role map in lib/rbac.js (finance = money, support = tickets, risk = user
+   safety + draws + flags, super = everything). Stealth above still runs
+   first, so outsiders never see a 403 — only the plain 404. */
+router.use(rbacMiddleware);
 
 /* ---------- helpers ---------- */
 function adminPath(req) { return req.adminPath; }
@@ -67,6 +77,9 @@ router.get('/', async (req, res) => {
   const pendDep = await req.db.get("SELECT COUNT(*) AS c FROM deposits WHERE status = 'pending'");
   const pendWd = await req.db.get("SELECT COUNT(*) AS c FROM withdrawals WHERE status = 'pending'");
   const openSup = await req.db.get("SELECT COUNT(*) AS c FROM support_tickets WHERE status = 'open'");
+  const pendAppr = await req.db.get("SELECT COUNT(*) AS c FROM pending_approvals WHERE status = 'open'");
+  const openFlags = await req.db.get('SELECT COUNT(*) AS c FROM account_flags WHERE reviewed_at IS NULL');
+  const lastRecon = await req.db.get('SELECT * FROM reconciliation_reports ORDER BY checked_at DESC LIMIT 1');
 
   // Exposure: money staked per number on upcoming (unscheduled-settled) draws
   const upcoming = await req.db.query("SELECT * FROM draws WHERE status = 'scheduled' ORDER BY close_at LIMIT 14");
@@ -133,7 +146,11 @@ router.get('/', async (req, res) => {
     : ui.card(title, '<p class="muted">No logins in the last 30 days.</p>');
   const loginCards = `<div class="grid2">${shareBars('Logins by browser (last 30 days)', share('browser'))}${shareBars('Logins by OS (last 30 days)', share('os'))}</div>
     <p class="muted">Country breakdown is not shown: logins do not record a country (no geo-IP service configured) — nothing is guessed.</p>`;
+  const reconBanner = lastRecon && lastRecon.mismatch_count > 0
+    ? `<div class="alert a-err">Ledger reconciliation found ${lastRecon.mismatch_count} mismatch(es) on ${d(lastRecon.checked_at)} — see <a href="${R(req, '/reconciliation')}">Reconciliation</a>.</div>`
+    : '';
   const body = `
+    ${reconBanner}
     ${ui.kpis([
       { n: money(req, soldAll.s, getS(req.settings, 'base_currency', 'USD')), l: 'Sold amount (all time)', href: R(req, '/reports?type=business') },
       { n: money(req, prizeAll.s, getS(req.settings, 'base_currency', 'USD')), l: 'Given prize (all time)', href: R(req, '/reports?type=business') },
@@ -145,6 +162,8 @@ router.get('/', async (req, res) => {
       { n: money(req, winsToday.s, getS(req.settings, 'base_currency', 'USD')), l: 'Paid out (24h)', href: R(req, '/reports?type=business') },
       { n: pendDep.c, l: 'Pending deposits', href: R(req, '/deposits?status=pending') },
       { n: pendWd.c, l: 'Pending withdrawals', href: R(req, '/withdrawals?status=pending') },
+      { n: pendAppr.c, l: 'Pending second approvals', href: R(req, '/approvals') },
+      { n: openFlags.c, l: 'Open fraud flags', href: R(req, '/flags') },
       { n: openSup.c, l: 'Open support tickets', href: R(req, '/support?status=open') },
       { n: rtpValue, l: 'RTP (settled draws only)', href: R(req, '/reports?type=business') },
     ])}
@@ -318,6 +337,8 @@ router.get('/users/:id', async (req, res) => {
   const acts = await req.db.query('SELECT * FROM audit_log WHERE actor_id = ? ORDER BY created_at DESC LIMIT 15', [u.id]);
   const tickets = await req.db.query('SELECT * FROM tickets WHERE user_id = ? ORDER BY created_at DESC LIMIT 10', [u.id]);
   const agents = await req.db.query("SELECT id, name FROM users WHERE role = 'agent' ORDER BY name");
+  const flags = await req.db.query('SELECT * FROM account_flags WHERE user_id = ? ORDER BY created_at DESC LIMIT 20', [u.id]);
+  const refCredits = await req.db.query('SELECT * FROM referral_credits WHERE referrer_id = ? ORDER BY created_at DESC LIMIT 20', [u.id]);
   const body = `
   <div class="grid2">
     <div>${ui.card('Biodata', ui.formHtml(R(req, '/users/' + u.id), [
@@ -343,6 +364,8 @@ router.get('/users/:id', async (req, res) => {
             <button class="btn" data-confirm="Sign this user out everywhere?">Revoke sessions</button></form>
           <form method="POST" action="${R(req, '/users/' + u.id + '/login-as')}" style="display:inline" target="_blank"><input type="hidden" name="_csrf" value="${req.csrfToken}">
             <button class="btn btn-g" data-confirm="Log in as this user? This is audit-logged.">Login as user</button></form>
+          <form method="POST" action="${R(req, '/users/' + u.id + '/verify-contact')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}">
+            <button class="btn" data-confirm="Mark this user's contact (email/phone) as verified? Use only when you have attested the contact yourself.">Mark contact verified</button></form>
         </div>
         <h4 class="mt">Balance adjustment (manual correction, audit-logged)</h4>
         <form method="POST" action="${R(req, '/users/' + u.id + '/adjust')}" class="adm-form" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;">
@@ -362,6 +385,8 @@ router.get('/users/:id', async (req, res) => {
     </div>
     <div>
       ${ui.card('Wallets', ui.table(['Currency', 'Balance'], wallets.map(w => [w.currency, money(req, w.balance, w.currency)])))}
+      ${ui.card('Fraud flags', flags.length ? ui.table(['When', 'Flag', 'Detail', 'Reviewed'], flags.map(f => [d(f.created_at), esc(f.flag_type), `<span class="code">${esc(String(f.detail).slice(0, 120))}</span>`, f.reviewed_at ? '✓ ' + d(f.reviewed_at) : `<a class="btn btn-sm" href="${R(req, '/flags')}">Review</a>`])) : '<p class="muted">No flags.</p>')}
+      ${ui.card('Referral credits (pending = awaiting referee deposit + wagering)', ui.table(['When', 'Referee', 'Amount', 'Status'], refCredits.map(c => [d(c.created_at), '#' + c.referee_id, money(req, c.amount, c.currency), ui.statusBadge(c.status)])))}
       ${ui.card('Recent tickets', ui.table(['Ticket', 'Total', 'Status', 'When'], tickets.map(t =>
         [`<span class="code">${esc(t.public_id)}</span>`, money(req, t.total, t.currency), ui.statusBadge(t.status), d(t.created_at)])))}
       ${ui.card('Recent transactions', ui.table(['When', 'Type', 'Amount', 'Balance after'], txs.map(t =>
@@ -384,11 +409,22 @@ router.post('/users/:id', async (req, res) => {
      String(req.body.state || '').slice(0, 128), String(req.body.zip || '').slice(0, 32),
      String(req.body.country || '').slice(0, 64),
      req.body.kyc_status, String(req.body.notes || '').slice(0, 2000), req.body.agent_id ? parseInt(req.body.agent_id, 10) : null, u.id]);
+  // v14: admin email changes NEVER swap immediately — a verification link
+  // goes to the NEW address; the swap happens only when it is clicked.
+  let emailChangeMsg = '';
   if (req.body.email && validEmail(req.body.email) && req.body.email.toLowerCase() !== u.email) {
-    await req.db.run('UPDATE users SET email = ? WHERE id = ?', [req.body.email.trim().toLowerCase(), u.id]);
+    const newEmail = req.body.email.trim().toLowerCase();
+    const token = randHex(24);
+    await req.db.run('INSERT INTO email_verifications (user_id, new_email, token_hash, expires_at, used, created_at) VALUES (?, ?, ?, ?, 0, ?)',
+      [u.id, newEmail, sha256('verify:' + token), now() + 24 * 3600 * 1000, now()]);
+    const link = (process.env.BASE_URL || '') + '/verify-email/' + token;
+    const sent = await notify.send(req.db, req.settings, 'email', 'email_verification', newEmail, { name: u.name, link }).catch(() => ({ status: 'failed' }));
+    emailChangeMsg = sent.status === 'sent'
+      ? ' Email change requested — verification link sent to the new address (old email stays until verified).'
+      : ' Email change requested — no email provider configured. Forward this one-time link to the user (do not click it yourself unless attesting the address): ' + link;
   }
-  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'user.update', entity: 'user', entityId: u.id, detail: { by: req.user.id }, ip: req.ip });
-  await req.setFlash('success', 'User updated.');
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'user.update', entity: 'user', entityId: u.id, detail: { by: req.user.id, old: { name: u.name, email: u.email, phone: u.phone, kyc_status: u.kyc_status, agent_id: u.agent_id }, new: { name: req.body.name, email: req.body.email, phone: req.body.phone, kyc_status: req.body.kyc_status, agent_id: req.body.agent_id } }, ip: req.ip });
+  await req.setFlash('success', 'User updated.' + emailChangeMsg);
   res.redirect(R(req, '/users/' + u.id));
 });
 
@@ -398,7 +434,7 @@ router.post('/users/:id/block', async (req, res) => {
   const next = u.status === 'banned' ? 'active' : 'banned';
   await req.db.run('UPDATE users SET status = ? WHERE id = ?', [next, u.id]);
   if (next === 'banned') await destroyUserSessions(req.db, u.id);
-  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: next === 'banned' ? 'user.block' : 'user.unblock', entity: 'user', entityId: u.id, detail: {}, ip: req.ip });
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: next === 'banned' ? 'user.block' : 'user.unblock', entity: 'user', entityId: u.id, detail: { old_status: u.status, new_status: next }, ip: req.ip });
   await req.setFlash('success', `User ${next}.`);
   res.redirect(R(req, '/users/' + u.id));
 });
@@ -406,11 +442,23 @@ router.post('/users/:id/block', async (req, res) => {
 router.post('/users/:id/reset-password', async (req, res) => {
   const u = await req.db.get('SELECT * FROM users WHERE id = ?', [req.params.id]);
   if (!u) return notFound(req, res, 'User not found.');
-  const pw = randHex(6);
-  await req.db.run('UPDATE users SET password_hash = ? WHERE id = ?', [hashPassword(pw), u.id]);
+  // v14: no temp-password flash — the user sets their own password via a
+  // one-time reset link (same token flow as /forgot). If email is not
+  // configured, the one-time link is shown to the admin to forward.
+  const token = randHex(24);
+  await req.db.run('INSERT INTO password_resets (user_id, token_hash, expires_at, used, created_at) VALUES (?, ?, ?, 0, ?)',
+    [u.id, sha256('reset:' + token), now() + 3600000, now()]);
   await destroyUserSessions(req.db, u.id);
-  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'user.password_reset_admin', entity: 'user', entityId: u.id, detail: {}, ip: req.ip });
-  await req.setFlash('success', 'New temporary password: ' + pw + ' — share it with the user securely. It will not be shown again.');
+  const link = (process.env.BASE_URL || '') + '/reset/' + token;
+  let msg;
+  if (u.email && !u.email.endsWith('@phone.local')) {
+    const sent = await notify.send(req.db, req.settings, 'email', 'password_reset', u.email, { name: u.name, link }).catch(() => ({ status: 'failed' }));
+    msg = sent.status === 'sent' ? 'Password reset link emailed to the user (valid 1 hour).' : 'Password reset link created (valid 1 hour) — email is not configured, forward this one-time link: ' + link;
+  } else {
+    msg = 'Password reset link created (valid 1 hour) — user has no email on file, forward this one-time link: ' + link;
+  }
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'user.password_reset_admin', entity: 'user', entityId: u.id, detail: { via: 'reset_link' }, ip: req.ip });
+  await req.setFlash('success', msg);
   res.redirect(R(req, '/users/' + u.id));
 });
 
@@ -431,21 +479,41 @@ router.post('/users/:id/adjust', async (req, res) => {
   if (amount === null || amount <= 0 || !remark) { await req.setFlash('error', 'Enter a valid amount and a remark.'); return res.redirect(R(req, '/users/' + u.id)); }
   const signed = req.body.direction === 'subtract' ? -amount : amount;
   const currency = getS(req.settings, 'base_currency', 'USD');
+  const before = (await getBalances(req.db, u.id)).find(w => w.currency === currency);
   await req.db.transaction(async (tx) => {
     await postLedger(tx, { userId: u.id, currency, type: 'adjustment', amount: signed, refType: 'admin_adjustment', refId: 'ADJ' + now(), meta: { remark, admin_id: req.user.id, direction: req.body.direction } });
   });
-  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'user.balance_adjust', entity: 'user', entityId: u.id, detail: { amount: signed, currency, remark }, ip: req.ip });
+  const after = (await getBalances(req.db, u.id)).find(w => w.currency === currency);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'user.balance_adjust', entity: 'user', entityId: u.id, detail: { amount: signed, currency, remark, old_balance: before ? before.balance : 0, new_balance: after ? after.balance : 0 }, ip: req.ip });
   await req.setFlash('success', 'Balance adjusted by ' + money(req, signed, currency) + '.');
   res.redirect(R(req, '/users/' + u.id));
 });
 router.post('/users/:id/matrix', async (req, res) => {
+  const old = await req.db.get('SELECT deposit_blocked, withdrawal_blocked, deposit_mode, withdrawal_mode FROM users WHERE id = ?', [req.params.id]);
+  const nv = {
+    deposit_blocked: req.body.deposit_blocked ? 1 : 0, withdrawal_blocked: req.body.withdrawal_blocked ? 1 : 0,
+    deposit_mode: ['', 'auto', 'manual'].includes(req.body.deposit_mode) ? req.body.deposit_mode : '',
+    withdrawal_mode: ['', 'auto', 'manual'].includes(req.body.withdrawal_mode) ? req.body.withdrawal_mode : '',
+  };
   await req.db.run('UPDATE users SET deposit_blocked = ?, withdrawal_blocked = ?, deposit_mode = ?, withdrawal_mode = ? WHERE id = ?',
-    [req.body.deposit_blocked ? 1 : 0, req.body.withdrawal_blocked ? 1 : 0,
-     ['', 'auto', 'manual'].includes(req.body.deposit_mode) ? req.body.deposit_mode : '',
-     ['', 'auto', 'manual'].includes(req.body.withdrawal_mode) ? req.body.withdrawal_mode : '', req.params.id]);
-  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'user.matrix_update', entity: 'user', entityId: req.params.id, detail: req.body, ip: req.ip });
+    [nv.deposit_blocked, nv.withdrawal_blocked, nv.deposit_mode, nv.withdrawal_mode, req.params.id]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'user.matrix_update', entity: 'user', entityId: req.params.id, detail: { old: old || {}, new: nv }, ip: req.ip });
   await req.setFlash('success', 'Control matrix saved.');
   res.redirect(R(req, '/users/' + req.params.id));
+});
+
+router.post('/users/:id/verify-contact', async (req, res) => {
+  const u = await req.db.get('SELECT * FROM users WHERE id = ?', [req.params.id]);
+  if (!u) return notFound(req, res, 'User not found.');
+  // Admin attestation: used when no email/SMS provider is configured and the
+  // player cannot self-verify. Sets only the flags that have a real value on
+  // file (a phone.local placeholder email never counts as verified).
+  const setEmail = (u.email && !u.email.endsWith('@phone.local')) ? 1 : (u.email_verified || 0);
+  const setMobile = u.phone ? 1 : (u.mobile_verified || 0);
+  await req.db.run('UPDATE users SET email_verified = ?, mobile_verified = ? WHERE id = ?', [setEmail, setMobile, u.id]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'user.contact_verified', entity: 'user', entityId: u.id, detail: { by: req.user.id, email_verified: setEmail, mobile_verified: setMobile }, ip: req.ip });
+  await req.setFlash('success', 'Contact marked verified (admin attestation).');
+  res.redirect(R(req, '/users/' + u.id));
 });
 
 router.post('/users/:id/login-as', async (req, res) => {
@@ -513,13 +581,17 @@ router.get('/agents', async (req, res) => {
 
 router.post('/agents', async (req, res) => {
   const { name, email, password } = req.body;
-  if (!name || !validEmail(email) || !password || password.length < 6) { await req.setFlash('error', 'Name, valid email and 6+ char password required.'); return res.redirect(R(req, '/agents')); }
+  // v14: agents get a 10-char minimum + forced reset on first login (they
+  // must set their own password before doing anything).
+  const pwErr = passwordError(password, 'agent', getBool(req.settings, 'secure_password', true));
+  if (!name || !validEmail(email) || pwErr) { await req.setFlash('error', pwErr || 'Name and valid email required.'); return res.redirect(R(req, '/agents')); }
+  if (getBool(req.settings, 'breached_password_check', true) && await isBreached(password)) { await req.setFlash('error', 'This password has appeared in a data breach. Choose a different one.'); return res.redirect(R(req, '/agents')); }
   const dup = await req.db.get('SELECT id FROM users WHERE email = ?', [email.trim().toLowerCase()]);
   if (dup) { await req.setFlash('error', 'An account with that email already exists.'); return res.redirect(R(req, '/agents')); }
-  const r = await req.db.run("INSERT INTO users (email, name, password_hash, role, status, created_at) VALUES (?, ?, ?, 'agent', 'active', ?)",
+  const r = await req.db.run("INSERT INTO users (email, name, password_hash, role, status, force_password_reset, created_at) VALUES (?, ?, ?, 'agent', 'active', 1, ?)",
     [email.trim().toLowerCase(), name.trim(), hashPassword(password), now()]);
-  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'agent.create', entity: 'user', entityId: r.id, detail: {}, ip: req.ip });
-  await req.setFlash('success', 'Agent created.');
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'agent.create', entity: 'user', entityId: r.id, detail: { force_password_reset: 1 }, ip: req.ip });
+  await req.setFlash('success', 'Agent created. They must set their own password on first sign-in.');
   res.redirect(R(req, '/agents'));
 });
 
@@ -530,6 +602,7 @@ router.get('/agents/:id', async (req, res) => {
   const players = await req.db.query("SELECT id, name, email, created_at FROM users WHERE agent_id = ? AND role = 'player'", [a.id]);
   const comms = await req.db.query('SELECT * FROM commissions WHERE agent_id = ? ORDER BY created_at DESC LIMIT 25', [a.id]);
   const transfers = await req.db.query('SELECT * FROM agent_transfers WHERE from_agent = ? ORDER BY created_at DESC LIMIT 25', [a.id]);
+  const unsettled = await req.db.query('SELECT currency, COUNT(*) AS n, COALESCE(SUM(amount),0) AS s FROM commissions WHERE agent_id = ? AND settled = 0 GROUP BY currency', [a.id]);
   const body = `
   <div class="grid2"><div>
     ${ui.card('Fund float', `<p class="muted">Add house funds to this agent's float. Agents fund players from their float.</p>` +
@@ -541,10 +614,23 @@ router.get('/agents/:id', async (req, res) => {
     ${ui.card('Float balances', ui.table(['Currency', 'Balance'], floats.map(f => [f.currency, money(req, f.balance, f.currency)])))}
   </div><div>
     ${ui.card('Players (' + players.length + ')', ui.table(['ID', 'Name', 'Email', 'Joined'], players.map(p => [p.id, esc(p.name), esc(p.email), d(p.created_at)])))}
-    ${ui.card('Commissions', ui.table(['When', 'Amount', 'Rate'], comms.map(c => [d(c.created_at), money(req, c.amount, c.currency), c.rate + '%'])))}
+    ${ui.card('Commissions', ui.table(['When', 'Amount', 'Rate', 'Settled'], comms.map(c => [d(c.created_at), money(req, c.amount, c.currency), c.rate + '%', c.settled ? '✓ ' + d(c.settled_at) : '—'])))}
+    ${ui.card('Settle commissions', `<p class="muted">Unsettled commissions are paid to the agent's wallet through the ledger (one entry per currency) and marked settled so they can never be paid twice. ${unsettled.length ? 'Unsettled now: ' + unsettled.map(x => `${x.n} × ${money(req, x.s, x.currency)}`).join(', ') : 'Nothing unsettled.'}</p>` +
+      ui.formHtml(R(req, '/agents/' + a.id + '/settle-commissions'), [], { csrf: req.csrfToken, submit: 'Settle unpaid commissions' }))}
     ${ui.card('Transfers', ui.table(['When', 'To user', 'Amount', 'Note'], transfers.map(t => [d(t.created_at), '#' + t.to_user, money(req, t.amount, t.currency), esc(t.note)])))}
   </div></div>`;
   res.send(shell(req, '/agents', 'Agent — ' + a.name, body));
+});
+
+router.post('/agents/:id/settle-commissions', async (req, res) => {
+  const a = await req.db.get("SELECT * FROM users WHERE id = ? AND role = 'agent'", [req.params.id]);
+  if (!a) return notFound(req, res, 'Agent not found.');
+  try {
+    const r = await settleAgentCommissions(req.db, a.id, req.user.id);
+    await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'agent.commissions_settled', entity: 'user', entityId: a.id, detail: { settled: r.settled, total: r.total }, ip: req.ip });
+    await req.setFlash('success', r.settled ? `Settled ${r.settled} commission(s) to the agent wallet.` : 'No unsettled commissions.');
+  } catch (e) { await req.setFlash('error', e.message); }
+  res.redirect(R(req, '/agents/' + req.params.id));
 });
 
 router.post('/agents/:id/fund', async (req, res) => {
@@ -560,8 +646,8 @@ router.post('/agents/:id/fund', async (req, res) => {
 });
 
 /* ============================================================ DEPOSITS */
-function moneyTabs(req, base, counts, active) {
-  const tabs = [['pending', 'Pending'], ['approved', 'Approved'], ['rejected', 'Rejected'], ['revoked', 'Revoked'], ['expired', 'Expired']];
+function moneyTabs(req, base, counts, active, extra = []) {
+  const tabs = [['pending', 'Pending'], ['approved', 'Approved'], ['rejected', 'Rejected'], ['revoked', 'Revoked'], ['expired', 'Expired'], ...extra];
   return `<div class="tabs"><a class="tab${!active ? ' active' : ''}" href="${base}">All <span class="count">${counts.all}</span></a>` +
     tabs.map(([k, l]) => `<a class="tab${active === k ? ' active' : ''}" href="${base}?status=${k}">${l} <span class="count">${counts[k] || 0}</span></a>`).join('') + '</div>';
 }
@@ -591,7 +677,11 @@ router.get('/deposits/:id', async (req, res) => {
   if (!x) return notFound(req, res, 'Deposit not found.');
   let userData = {};
   try { userData = JSON.parse(x.user_data || '{}'); } catch {}
-  const actions = x.status === 'pending'
+  const events = await req.db.query('SELECT * FROM webhook_events WHERE deposit_id = ? ORDER BY created_at DESC LIMIT 20', [x.id]);
+  const pendAppr = await req.db.get("SELECT id FROM pending_approvals WHERE entity = 'deposit' AND entity_id = ? AND status = 'open'", [x.id]);
+  const actions = pendAppr
+    ? `<span class="badge b-warn">Awaiting second approval — decide in Approvals</span>`
+    : x.status === 'pending'
     ? `<form method="POST" action="${R(req, '/deposits/' + x.id + '/approve')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-p" data-confirm="Approve and credit this deposit?">Approve & credit</button></form>
        <form method="POST" action="${R(req, '/deposits/' + x.id + '/reject')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-d" data-confirm="Reject this deposit?">Reject</button></form>`
     : x.status === 'approved'
@@ -603,6 +693,7 @@ router.get('/deposits/:id', async (req, res) => {
         ['Player', `${esc(x.user_name)} (${esc(x.email)})`], ['Method', esc(x.method_name || '—')],
         ['Amount', money(req, x.amount, x.currency)], ['Charge', money(req, x.charge, x.currency)],
         ['Net credited', money(req, x.net, x.currency)], ['Status', ui.statusBadge(x.status)],
+        ['Provider txn ID', esc(x.provider_txn_id || '—')],
         ['Created', d(x.created_at)], ['Decided', x.decided_at ? d(x.decided_at) : '—'],
       ])}
     </div><div>
@@ -611,17 +702,41 @@ router.get('/deposits/:id', async (req, res) => {
       <h4 class="mt">Admin note</h4>
       ${ui.formHtml(R(req, '/deposits/' + x.id + '/note'), [{ key: 'admin_note', label: 'Note', type: 'textarea', value: x.admin_note }], { csrf: req.csrfToken, submit: 'Save note', grid: false })}
     </div></div>
+    <h4 class="mt">Webhook events for this deposit</h4>
+    ${events.length ? ui.table(['When', 'Provider', 'Event', 'Action'], events.map(e => [d(e.created_at), esc(e.provider), `<span class="code">${esc(e.event_id)}</span>`, esc(e.action)])) : '<p class="muted">No webhook events recorded.</p>'}
     <div class="btn-row mt">${actions}</div>`);
   res.send(shell(req, '/deposits', 'Deposit ' + x.public_id, body));
 });
 
+/* v14 maker-checker: money actions at or above the threshold do NOT execute
+   — they queue in pending_approvals for a DIFFERENT admin. Returns true when
+   the action was queued (caller must not execute). Revokes stay single-admin
+   only below the threshold; above it they queue like everything else. */
+async function maybeMakerChecker(req, action, entity, entityId, amount, currency) {
+  const threshold = parseInt(getS(req.settings, 'maker_checker_threshold', '0'), 10) || 0;
+  if (!(threshold > 0 && amount >= threshold)) return false;
+  const existing = await req.db.get("SELECT id FROM pending_approvals WHERE entity = ? AND entity_id = ? AND status = 'open'", [entity, entityId]);
+  if (existing) return true; // already queued — do not execute, do not duplicate
+  await req.db.run('INSERT INTO pending_approvals (action, entity, entity_id, amount, currency, requested_by, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    [action, entity, entityId, amount, currency, req.user.id, 'open', now()]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'approval.requested', entity, entityId, detail: { action, amount, currency }, ip: req.ip });
+  return true;
+}
 async function decideDep(req, res, decision) {
   try {
+    const row = await req.db.get('SELECT * FROM deposits WHERE id = ?', [req.params.id]);
+    if (!row) throw new Error('Deposit not found');
+    if (await maybeMakerChecker(req, 'deposit.' + decision, 'deposit', row.id, row.net, row.currency)) {
+      await req.setFlash('success', 'This action exceeds the maker-checker threshold and is queued for a second approver (see Approvals).');
+      return res.redirect(R(req, '/deposits/' + req.params.id));
+    }
     const dep = await decideDeposit(req.db, parseInt(req.params.id, 10), decision, req.user.id);
-    await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'deposit.' + decision, entity: 'deposit', entityId: dep.public_id, detail: { amount: dep.net }, ip: req.ip });
+    await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'deposit.' + decision, entity: 'deposit', entityId: dep.public_id, detail: { amount: dep.net, old_status: dep.status, new_status: decision }, ip: req.ip });
     if (decision === 'approve') {
       const u = await req.db.get('SELECT email, name FROM users WHERE id = ?', [dep.user_id]);
       notify.send(req.db, req.settings, 'email', 'deposit_approved', u.email, { name: u.name, amount: money(req, dep.net, dep.currency) }).catch(() => {});
+      // Referral release trigger (v14): the referee's deposit is now approved.
+      try { await releaseReferralCredits(req.db, dep.user_id, req.settings); } catch (e) { console.error('referral release failed:', e.message); }
     }
     await req.setFlash('success', 'Deposit ' + decision + 'd.');
   } catch (e) { await req.setFlash('error', e.message); }
@@ -640,17 +755,17 @@ router.post('/deposits/:id/note', async (req, res) => {
 router.get('/withdrawals', async (req, res) => {
   const page = pageOf(req), status = req.query.status || '';
   const counts = { all: (await req.db.get('SELECT COUNT(*) AS c FROM withdrawals')).c };
-  for (const s of ['pending', 'approved', 'rejected', 'revoked']) counts[s] = (await req.db.get('SELECT COUNT(*) AS c FROM withdrawals WHERE status = ?', [s])).c;
+  for (const s of ['pending', 'approved', 'rejected', 'revoked', 'paid']) counts[s] = (await req.db.get('SELECT COUNT(*) AS c FROM withdrawals WHERE status = ?', [s])).c;
   const wdBaseCur = getS(req.settings, 'base_currency', 'USD');
   const wdSums = {};
-  for (const s of ['pending', 'approved', 'rejected', 'revoked']) wdSums[s] = (await req.db.get('SELECT COALESCE(SUM(net),0) AS s FROM withdrawals WHERE status = ?', [s])).s;
-  const wdStrip = `<div class="sumstrip"><span>Approved: <strong>${money(req, wdSums.approved, wdBaseCur)}</strong></span><span>Pending: <strong>${money(req, wdSums.pending, wdBaseCur)}</strong></span><span>Rejected: <strong>${money(req, wdSums.rejected, wdBaseCur)}</strong></span><span>Revoked: <strong>${money(req, wdSums.revoked, wdBaseCur)}</strong></span></div>`;
+  for (const s of ['pending', 'approved', 'rejected', 'revoked', 'paid']) wdSums[s] = (await req.db.get('SELECT COALESCE(SUM(net),0) AS s FROM withdrawals WHERE status = ?', [s])).s;
+  const wdStrip = `<div class="sumstrip"><span>Approved: <strong>${money(req, wdSums.approved, wdBaseCur)}</strong></span><span>Pending: <strong>${money(req, wdSums.pending, wdBaseCur)}</strong></span><span>Rejected: <strong>${money(req, wdSums.rejected, wdBaseCur)}</strong></span><span>Revoked: <strong>${money(req, wdSums.revoked, wdBaseCur)}</strong></span><span>Paid: <strong>${money(req, wdSums.paid, wdBaseCur)}</strong></span></div>`;
   const where = status ? 'WHERE w.status = ?' : '', params = status ? [status] : [];
   const total = (await req.db.get(`SELECT COUNT(*) AS c FROM withdrawals w ${where}`, params)).c;
   const rows = await req.db.query(
     `SELECT w.*, u.email, m.name AS method_name FROM withdrawals w JOIN users u ON u.id = w.user_id LEFT JOIN payment_methods m ON m.id = w.method_id
      ${where} ORDER BY w.created_at DESC LIMIT ? OFFSET ?`, [...params, PER, (page - 1) * PER]);
-  const body = wdStrip + moneyTabs(req, R(req, '/withdrawals'), counts, status) + ui.table(['ID', 'Player', 'Method', 'Amount', 'Charge', 'Net payout', 'Status', 'When', ''],
+  const body = wdStrip + moneyTabs(req, R(req, '/withdrawals'), counts, status, [['paid', 'Paid']]) + ui.table(['ID', 'Player', 'Method', 'Amount', 'Charge', 'Net payout', 'Status', 'When', ''],
     rows.map(x => [`<span class="code">${esc(x.public_id)}</span>`, esc(x.email), esc(x.method_name || '—'),
       money(req, x.amount, x.currency), money(req, x.charge, x.currency), money(req, x.net, x.currency),
       ui.statusBadge(x.status), d(x.created_at), `<a class="btn btn-sm" href="${R(req, '/withdrawals/' + x.id)}">Review</a>`])) +
@@ -663,11 +778,15 @@ router.get('/withdrawals/:id', async (req, res) => {
   if (!x) return notFound(req, res, 'Withdrawal not found.');
   let userData = {};
   try { userData = JSON.parse(x.user_data || '{}'); } catch {}
-  const actions = x.status === 'pending'
+  const pendAppr = await req.db.get("SELECT id FROM pending_approvals WHERE entity = 'withdrawal' AND entity_id = ? AND status = 'open'", [x.id]);
+  const actions = pendAppr
+    ? `<span class="badge b-warn">Awaiting second approval — decide in Approvals</span>`
+    : x.status === 'pending'
     ? `<form method="POST" action="${R(req, '/withdrawals/' + x.id + '/approve')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-p" data-confirm="Approve? Pay ${esc(money(req, x.net, x.currency))} to the player.">Approve & pay</button></form>
        <form method="POST" action="${R(req, '/withdrawals/' + x.id + '/reject')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-d" data-confirm="Reject and release the held amount?">Reject & release</button></form>`
     : x.status === 'approved'
-    ? `<form method="POST" action="${R(req, '/withdrawals/' + x.id + '/revoke')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-d" data-confirm="Revoke? The payout will be credited back.">Revoke</button></form>`
+    ? `<form method="POST" action="${R(req, '/withdrawals/' + x.id + '/mark-paid')}" class="adm-form" style="display:inline-flex;gap:8px;align-items:end;"><input type="hidden" name="_csrf" value="${req.csrfToken}"><div class="field"><label>Provider payout ID (required)</label><input type="text" name="provider_payout_id" required maxlength="255" placeholder="e.g. PSP payout reference"></div><button class="btn btn-p" data-confirm="Mark this withdrawal as PAID? This is final — no revoke after payment.">Mark as paid</button></form>
+       <form method="POST" action="${R(req, '/withdrawals/' + x.id + '/revoke')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-d" data-confirm="Revoke? The payout will be credited back.">Revoke</button></form>`
     : `<span class="muted">No actions available.</span>`;
   const body = ui.card('Withdrawal ' + x.public_id, `
     <div class="grid2"><div>
@@ -675,6 +794,7 @@ router.get('/withdrawals/:id', async (req, res) => {
         ['Player', `${esc(x.user_name)} (${esc(x.email)})`], ['Method', esc(x.method_name || '—')],
         ['Amount (held)', money(req, x.amount, x.currency)], ['Charge', money(req, x.charge, x.currency)],
         ['Net payout', money(req, x.net, x.currency)], ['Status', ui.statusBadge(x.status)],
+        ['Provider payout ID', esc(x.provider_payout_id || '—')], ['Paid at', x.payout_at ? d(x.payout_at) : '—'],
         ['Created', d(x.created_at)], ['Decided', x.decided_at ? d(x.decided_at) : '—'],
       ])}
     </div><div>
@@ -689,8 +809,14 @@ router.get('/withdrawals/:id', async (req, res) => {
 
 async function decideWd(req, res, decision) {
   try {
+    const row = await req.db.get('SELECT * FROM withdrawals WHERE id = ?', [req.params.id]);
+    if (!row) throw new Error('Withdrawal not found');
+    if (await maybeMakerChecker(req, 'withdrawal.' + decision, 'withdrawal', row.id, row.net, row.currency)) {
+      await req.setFlash('success', 'This action exceeds the maker-checker threshold and is queued for a second approver (see Approvals).');
+      return res.redirect(R(req, '/withdrawals/' + req.params.id));
+    }
     const w = await decideWithdrawal(req.db, parseInt(req.params.id, 10), decision, req.user.id);
-    await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'withdrawal.' + decision, entity: 'withdrawal', entityId: w.public_id, detail: { amount: w.net }, ip: req.ip });
+    await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'withdrawal.' + decision, entity: 'withdrawal', entityId: w.public_id, detail: { amount: w.net, old_status: w.status, new_status: decision }, ip: req.ip });
     if (decision !== 'revoke' || true) {
       const u = await req.db.get('SELECT email, name FROM users WHERE id = ?', [w.user_id]);
       notify.send(req.db, req.settings, 'email', 'withdrawal_decided', u.email, { name: u.name, amount: money(req, w.net, w.currency), status: decision + 'd' }).catch(() => {});
@@ -702,6 +828,14 @@ async function decideWd(req, res, decision) {
 router.post('/withdrawals/:id/approve', (req, res) => decideWd(req, res, 'approve'));
 router.post('/withdrawals/:id/reject', (req, res) => decideWd(req, res, 'reject'));
 router.post('/withdrawals/:id/revoke', (req, res) => decideWd(req, res, 'revoke'));
+router.post('/withdrawals/:id/mark-paid', async (req, res) => {
+  try {
+    const w = await markWithdrawalPaid(req.db, parseInt(req.params.id, 10), req.body.provider_payout_id, req.user.id);
+    await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'withdrawal.mark_paid', entity: 'withdrawal', entityId: w.public_id, detail: { provider_payout_id: String(req.body.provider_payout_id || '').trim(), old_status: 'approved', new_status: 'paid' }, ip: req.ip });
+    await req.setFlash('success', 'Withdrawal marked as paid.');
+  } catch (e) { await req.setFlash('error', e.message); }
+  res.redirect(R(req, '/withdrawals/' + req.params.id));
+});
 router.post('/withdrawals/:id/note', async (req, res) => {
   await req.db.run('UPDATE withdrawals SET admin_note = ? WHERE id = ?', [String(req.body.admin_note || '').slice(0, 2000), req.params.id]);
   await req.setFlash('success', 'Note saved.');
@@ -803,10 +937,16 @@ router.get('/methods/:id/credentials', async (req, res) => {
   const m = await req.db.get('SELECT * FROM payment_methods WHERE id = ?', [req.params.id]);
   if (!m) return notFound(req, res, 'Method not found.');
   const rail = getRail(m.rail);
-  const saved = Object.fromEntries((await req.db.query('SELECT field_key, field_value FROM gateway_credentials WHERE method_id = ?', [m.id])).map(r => [r.field_key, r.field_value]));
+  // v14: decrypt stored credentials for display (legacy plaintext rows read
+  // as-is; envelope rows need CREDENTIAL_ENCRYPTION_KEY or show a warning).
+  const saved = {};
+  for (const r of await req.db.query('SELECT field_key, field_value, field_enc FROM gateway_credentials WHERE method_id = ?', [m.id])) {
+    try { saved[r.field_key] = decryptField(r.field_value, r.field_enc); }
+    catch (e) { saved[r.field_key] = '[unreadable — encryption key not configured]'; }
+  }
   const fields = (rail ? rail.credentialFields : []).map(f => ({ ...f, value: saved[f.key] || '' }));
   const body = ui.card(`Gateway credentials — ${m.name} (${rail ? rail.name : m.rail})`,
-    `<p class="muted">Credentials are stored server-side and never shown to players. ${rail && rail.webhook ? 'This rail supports provider webhooks with signature verification.' : 'This rail runs in manual mode: players submit proof, staff approves.'}</p>` +
+    `<p class="muted">Credentials are stored server-side and never shown to players. ${rail && rail.webhook ? 'This rail supports provider webhooks with signature verification.' : 'This rail runs in manual mode: players submit proof, staff approves.'} ${keyConfigured() ? 'Credentials are encrypted at rest (AES-256-GCM).' : 'No encryption key is configured — credentials are stored in plaintext. Set CREDENTIAL_ENCRYPTION_KEY and re-save to encrypt.'}</p>` +
     (fields.length ? ui.formHtml(R(req, '/methods/' + m.id + '/credentials'), fields.map(f =>
       f.type === 'select' ? { key: f.key, label: f.label, type: 'select', options: f.options, value: saved[f.key] || '' }
       : f.type === 'textarea' ? { key: f.key, label: f.label, type: 'textarea', value: saved[f.key] || '' }
@@ -823,12 +963,14 @@ router.post('/methods/:id/credentials', async (req, res) => {
     let v = String(req.body[f.key] || '');
     if (f.type === 'password' && !v) continue; // keep saved
     if (f.required && !v) { await req.setFlash('error', `"${f.label}" is required.`); return res.redirect(R(req, '/methods/' + m.id + '/credentials')); }
+    const enc = keyConfigured();
+    const stored = enc ? encryptField(v) : v;
     const ex = await req.db.get('SELECT id FROM gateway_credentials WHERE method_id = ? AND field_key = ?', [m.id, f.key]);
-    if (ex) await req.db.run('UPDATE gateway_credentials SET field_value = ?, updated_at = ? WHERE id = ?', [v, now(), ex.id]);
-    else await req.db.run('INSERT INTO gateway_credentials (method_id, field_key, field_value, updated_at) VALUES (?, ?, ?, ?)', [m.id, f.key, v, now()]);
+    if (ex) await req.db.run('UPDATE gateway_credentials SET field_value = ?, field_enc = ?, updated_at = ? WHERE id = ?', [stored, enc ? 1 : 0, now(), ex.id]);
+    else await req.db.run('INSERT INTO gateway_credentials (method_id, field_key, field_value, field_enc, updated_at) VALUES (?, ?, ?, ?, ?)', [m.id, f.key, stored, enc ? 1 : 0, now()]);
   }
-  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'method.credentials', entity: 'method', entityId: m.id, detail: {}, ip: req.ip });
-  await req.setFlash('success', 'Credentials saved.');
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'method.credentials', entity: 'method', entityId: m.id, detail: { encrypted: keyConfigured() }, ip: req.ip });
+  await req.setFlash('success', 'Credentials saved.' + (keyConfigured() ? ' Encrypted at rest.' : ' WARNING: stored unencrypted — set CREDENTIAL_ENCRYPTION_KEY and re-save to encrypt.'));
   res.redirect(R(req, '/methods/' + m.id + '/credentials'));
 });
 
@@ -1336,6 +1478,13 @@ const TOGGLES = [
   ['facebook_oauth_enabled', 'Facebook login', 'Needs FACEBOOK_APP_ID/SECRET env vars'],
   ['google_oauth_enabled', 'Google login', 'Needs GOOGLE_CLIENT_ID/SECRET env vars'],
   ['password_login_enabled', 'Password login (legacy)', 'Keep old email+password as fallback'],
+  ['verified_contact_required', 'Verified contact gate', 'Require email OR phone verification before deposit/withdraw.'],
+  ['admin_totp_required', 'Admin TOTP required', 'Admins must have authenticator 2FA (enable ONLY after enrolling — see Security).'],
+  ['beacon_enabled', 'Draw beacon', 'Combine the committed seed with the public drand beacon at settle.'],
+  ['beacon_required', 'Beacon required (strict)', 'If ON, a draw does NOT settle when the beacon is unreachable (fail closed).'],
+  ['withdrawal_same_method', 'Same-method withdrawals', 'Withdraw only via a method previously deposited with.'],
+  ['breached_password_check', 'Breached-password check', 'Reject passwords found in public data breaches (HIBP, fails open offline).'],
+  ['csp_enabled', 'Content-Security-Policy', 'Send the CSP header (nonce-based; disable only if a custom embed breaks).'],
 ];
 router.get('/settings', async (req, res) => {
   const s = req.settings;
@@ -1362,6 +1511,14 @@ router.get('/settings', async (req, res) => {
      <form method="POST" action="${R(req, '/settings/prizes')}" class="adm-form"><input type="hidden" name="_csrf" value="${req.csrfToken}">
      <div class="prize-grid">${prizes.map(p => `<div class="field"><label>${p.pops_count} pop${p.pops_count > 1 ? 's' : ''} → ×</label><input type="number" name="mult_${p.pops_count}" value="${p.multiplier}" min="1"></div>`).join('')}</div>
      <div class="mt"><button class="btn btn-p" type="submit">Save prize table</button></div></form>`)}
+  ${ui.card('Withdrawal & risk controls', ui.formHtml(R(req, '/settings/risk'), [
+      { key: 'withdrawal_turnover_required', label: 'Require 1× wagering before withdrawal', type: 'checkbox', value: getS(s, 'withdrawal_turnover_required', '1') === '1', help: 'Players must wager at least their approved deposits before withdrawing.' },
+      { key: 'withdrawal_daily_cap', label: 'Daily withdrawal cap (e.g. 500.00; 0 = unlimited)', type: 'text', value: (parseFloat(getS(s, 'withdrawal_daily_cap', '0')) / 100).toFixed(2) },
+      { key: 'withdrawal_monthly_cap', label: 'Monthly withdrawal cap (e.g. 5000.00; 0 = unlimited)', type: 'text', value: (parseFloat(getS(s, 'withdrawal_monthly_cap', '0')) / 100).toFixed(2) },
+      { key: 'payout_lock_hours', label: 'Payout-detail change lock (hours, 24–72)', type: 'number', value: getS(s, 'payout_lock_hours', '48') },
+      { key: 'maker_checker_threshold', label: 'Maker-checker threshold (e.g. 1000.00; 0 = disabled)', type: 'text', value: (parseFloat(getS(s, 'maker_checker_threshold', '0')) / 100).toFixed(2), help: 'Money actions at or above this amount need a second approver (see Approvals).' },
+      { key: 'referral_cap_per_referee', label: 'Referral cap per referee (e.g. 50.00; 0 = unlimited)', type: 'text', value: (parseFloat(getS(s, 'referral_cap_per_referee', '0')) / 100).toFixed(2) },
+    ], { csrf: req.csrfToken, submit: 'Save risk controls' }))}
   ${ui.card('Phone countries — dial codes & blocks', ui.formHtml(R(req, '/settings/phone-countries'), [
       { key: 'blocked_phone_countries', label: 'Blocked countries (ISO codes, comma-separated)', type: 'text', value: getS(s, 'blocked_phone_countries', ''), help: 'Example: PK,BD — players from these countries will NOT see their dial code in the phone dropdown and cannot register with that country number. Leave empty to allow all countries.' },
     ], { csrf: req.csrfToken, submit: 'Save phone countries' })) + `<p class="muted">The register and OTP phone fields show a country dial-code dropdown with all ${require('../lib/phone-countries').COUNTRIES.length} countries. Blocked countries are hidden from the dropdown and rejected server-side.</p>`}
@@ -1384,16 +1541,60 @@ router.get('/settings', async (req, res) => {
   res.send(shell(req, '/settings', 'Settings', body));
 });
 router.post('/settings/toggles', async (req, res) => {
-  for (const [k] of TOGGLES) await setSetting(req.db, req.driver, k, req.body[k] ? '1' : '0');
-  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'settings.toggles', entity: 'settings', entityId: '', detail: {}, ip: req.ip });
+  // Guard: enabling admin TOTP enforcement before the current admin has
+  // enrolled would lock every admin out. Refuse until enrolled.
+  if (req.body.admin_totp_required) {
+    const me = await req.db.get('SELECT totp_secret FROM users WHERE id = ?', [req.user.id]);
+    if (!me || !me.totp_secret) {
+      await req.setFlash('error', 'Cannot enable "Admin TOTP required": enroll your own authenticator first (Admin → Security), then enable it.');
+      return res.redirect(R(req, '/settings'));
+    }
+  }
+  const old = {};
+  for (const [k] of TOGGLES) old[k] = getS(req.settings, k, '0');
+  const changes = {};
+  for (const [k] of TOGGLES) {
+    const nv = req.body[k] ? '1' : '0';
+    if (old[k] !== nv) changes[k] = { from: old[k], to: nv };
+    await setSetting(req.db, req.driver, k, nv);
+  }
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'settings.toggles', entity: 'settings', entityId: '', detail: { changes }, ip: req.ip });
   await req.setFlash('success', 'Toggles saved.');
   res.redirect(R(req, '/settings'));
 });
 router.post('/settings/economy', async (req, res) => {
-  for (const k of ['wager_options', 'max_pops', 'max_draws', 'day_draw_time', 'eve_draw_time', 'commission_rate', 'deposit_mode', 'withdrawal_mode', 'auto_approve_deposit_limit', 'referral_rate', 'multi_draw_discounts'])
-    await setSetting(req.db, req.driver, k, String(req.body[k] || ''));
-  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'settings.economy', entity: 'settings', entityId: '', detail: {}, ip: req.ip });
+  const keys = ['wager_options', 'max_pops', 'max_draws', 'day_draw_time', 'eve_draw_time', 'commission_rate', 'deposit_mode', 'withdrawal_mode', 'auto_approve_deposit_limit', 'referral_rate', 'multi_draw_discounts'];
+  const changes = {};
+  for (const k of keys) {
+    const old = getS(req.settings, k, '');
+    const nv = String(req.body[k] || '');
+    if (old !== nv) changes[k] = { from: old, to: nv };
+    await setSetting(req.db, req.driver, k, nv);
+  }
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'settings.economy', entity: 'settings', entityId: '', detail: { changes }, ip: req.ip });
   await req.setFlash('success', 'Economy settings saved.');
+  res.redirect(R(req, '/settings'));
+});
+router.post('/settings/risk', async (req, res) => {
+  const { toMinor } = require('../lib/util');
+  const daily = toMinor(req.body.withdrawal_daily_cap);
+  const monthly = toMinor(req.body.withdrawal_monthly_cap);
+  const threshold = toMinor(req.body.maker_checker_threshold);
+  const refCap = toMinor(req.body.referral_cap_per_referee);
+  const lock = Math.max(0, Math.min(168, parseInt(req.body.payout_lock_hours, 10) || 0));
+  if (daily === null || monthly === null || threshold === null || refCap === null) {
+    await req.setFlash('error', 'Caps/threshold must be valid amounts (e.g. 500.00). Nothing was saved.');
+    return res.redirect(R(req, '/settings'));
+  }
+  const keys = { withdrawal_turnover_required: req.body.withdrawal_turnover_required ? '1' : '0', withdrawal_daily_cap: String(daily), withdrawal_monthly_cap: String(monthly), payout_lock_hours: String(lock), maker_checker_threshold: String(threshold), referral_cap_per_referee: String(refCap) };
+  const changes = {};
+  for (const [k, v] of Object.entries(keys)) {
+    const old = getS(req.settings, k, '');
+    if (old !== v) changes[k] = { from: old, to: v };
+    await setSetting(req.db, req.driver, k, v);
+  }
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'settings.risk', entity: 'settings', entityId: '', detail: { changes }, ip: req.ip });
+  await req.setFlash('success', 'Risk controls saved.');
   res.redirect(R(req, '/settings'));
 });
 router.post('/settings/phone-countries', async (req, res) => {
@@ -1442,6 +1643,194 @@ router.post('/settings/appearance', async (req, res) => {
   res.redirect(R(req, '/settings'));
 });
 
+/* ============================================================ APPROVALS (maker-checker, v14) */
+router.get('/approvals', async (req, res) => {
+  const open = await req.db.query(`SELECT pa.*, u.email AS requester_email FROM pending_approvals pa LEFT JOIN users u ON u.id = pa.requested_by WHERE pa.status = 'open' ORDER BY pa.created_at DESC`);
+  const decided = await req.db.query(`SELECT pa.*, u.email AS requester_email FROM pending_approvals pa LEFT JOIN users u ON u.id = pa.requested_by WHERE pa.status != 'open' ORDER BY pa.created_at DESC LIMIT 50`);
+  const row = (a, canDecide) => [a.id, esc(a.action), esc(a.entity) + ' #' + a.entity_id, money(req, a.amount, a.currency), esc(a.requester_email || ('#' + a.requested_by)), d(a.created_at), ui.statusBadge(a.status),
+    canDecide ? `<form method="POST" action="${R(req, '/approvals/' + a.id + '/approve')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm btn-p" data-confirm="Approve and execute this action?">Approve</button></form>
+    <form method="POST" action="${R(req, '/approvals/' + a.id + '/reject')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm btn-d">Reject</button></form>` : ''];
+  const body = ui.card('Awaiting second approval', `<p class="muted">Money actions at or above the maker-checker threshold wait here. A DIFFERENT admin must approve — the requester cannot approve their own action. Rejecting leaves the original deposit/withdrawal untouched (still pending).</p>` +
+    ui.table(['ID', 'Action', 'Target', 'Amount', 'Requested by', 'Requested', 'Status', ''], open.map(a => row(a, true)))) +
+    ui.card('Decided', ui.table(['ID', 'Action', 'Target', 'Amount', 'Requested by', 'Requested', 'Status', ''], decided.map(a => row(a, false))));
+  res.send(shell(req, '/approvals', 'Approvals', body));
+});
+router.post('/approvals/:id/approve', async (req, res) => {
+  const a = await req.db.get('SELECT * FROM pending_approvals WHERE id = ?', [req.params.id]);
+  if (!a || a.status !== 'open') { await req.setFlash('error', 'Approval not found or already decided.'); return res.redirect(R(req, '/approvals')); }
+  if (a.requested_by === req.user.id) { await req.setFlash('error', 'You cannot approve your own request — a different admin must approve.'); return res.redirect(R(req, '/approvals')); }
+  try {
+    const [entity, decision] = a.action.split('.');
+    if (entity === 'deposit') await decideDeposit(req.db, a.entity_id, decision, req.user.id);
+    else if (entity === 'withdrawal') await decideWithdrawal(req.db, a.entity_id, decision, req.user.id);
+    else throw new Error('Unknown approval action');
+    await req.db.run("UPDATE pending_approvals SET status = 'approved', decided_by = ?, decided_at = ? WHERE id = ?", [req.user.id, now(), a.id]);
+    await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'approval.approved', entity: a.entity, entityId: a.entity_id, detail: { approval_id: a.id, action: a.action, amount: a.amount }, ip: req.ip });
+    if (entity === 'deposit' && decision === 'approve') {
+      const dep = await req.db.get('SELECT * FROM deposits WHERE id = ?', [a.entity_id]);
+      const u = await req.db.get('SELECT email, name FROM users WHERE id = ?', [dep.user_id]);
+      notify.send(req.db, req.settings, 'email', 'deposit_approved', u.email, { name: u.name, amount: money(req, dep.net, dep.currency) }).catch(() => {});
+      try { await releaseReferralCredits(req.db, dep.user_id, req.settings); } catch (e) { console.error('referral release failed:', e.message); }
+    }
+    if (entity === 'withdrawal') {
+      const w = await req.db.get('SELECT * FROM withdrawals WHERE id = ?', [a.entity_id]);
+      const u = await req.db.get('SELECT email, name FROM users WHERE id = ?', [w.user_id]);
+      notify.send(req.db, req.settings, 'email', 'withdrawal_decided', u.email, { name: u.name, amount: money(req, w.net, w.currency), status: decision + 'd' }).catch(() => {});
+    }
+    await req.setFlash('success', 'Approved and executed.');
+  } catch (e) { await req.setFlash('error', 'Execution failed: ' + e.message); }
+  res.redirect(R(req, '/approvals'));
+});
+router.post('/approvals/:id/reject', async (req, res) => {
+  const a = await req.db.get('SELECT * FROM pending_approvals WHERE id = ?', [req.params.id]);
+  if (!a || a.status !== 'open') { await req.setFlash('error', 'Approval not found or already decided.'); return res.redirect(R(req, '/approvals')); }
+  if (a.requested_by === req.user.id) { await req.setFlash('error', 'You cannot decide your own request.'); return res.redirect(R(req, '/approvals')); }
+  await req.db.run("UPDATE pending_approvals SET status = 'rejected', decided_by = ?, decided_at = ? WHERE id = ?", [req.user.id, now(), a.id]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'approval.rejected', entity: a.entity, entityId: a.entity_id, detail: { approval_id: a.id, action: a.action }, ip: req.ip });
+  await req.setFlash('success', 'Approval rejected. The original item is untouched.');
+  res.redirect(R(req, '/approvals'));
+});
+
+/* ============================================================ RECONCILIATION (v14) */
+router.get('/reconciliation', async (req, res) => {
+  const reports = await req.db.query('SELECT * FROM reconciliation_reports ORDER BY checked_at DESC LIMIT 30');
+  const latest = reports[0];
+  let detailHtml = '';
+  if (latest) {
+    let det = {};
+    try { det = JSON.parse(latest.details || '{}'); } catch {}
+    detailHtml = ui.card('Latest report — ' + d(latest.checked_at), `<p>Wallets checked: ${latest.wallets_checked} · Mismatches: <strong>${latest.mismatch_count}</strong> · Provider txns without webhook events: ${(det.unconfirmed_provider_txns || []).length} · Stale proof deposits: ${(det.stale_proof_deposits || []).length}</p>` +
+      (det.mismatches && det.mismatches.length ? ui.table(['User', 'Currency', 'Wallet', 'Ledger', 'Diff'], det.mismatches.map(m => ['#' + m.user_id, esc(m.currency), money(req, m.wallet || 0, m.currency), money(req, m.ledger, m.currency), money(req, m.diff, m.currency)])) : '<p class="muted">No wallet/ledger mismatches.</p>') +
+      ((det.unconfirmed_provider_txns || []).length ? ui.table(['Deposit', 'Provider txn ID'], det.unconfirmed_provider_txns.map(x => [`<span class="code">${esc(x.public_id)}</span>`, `<span class="code">${esc(x.provider_txn_id)}</span>`])) : ''));
+  }
+  const body = ui.card('Run reconciliation', `<p class="muted">Proves wallets == ledger per user/currency, lists deposits claiming a provider transaction with no matching webhook event, and stale proof-carrying pending deposits. Runs nightly via cron; run on demand here.</p>` +
+    ui.formHtml(R(req, '/reconciliation/run'), [], { csrf: req.csrfToken, submit: 'Run now' })) +
+    detailHtml +
+    ui.card('History', ui.table(['When', 'Wallets', 'Mismatches'], reports.map(r => [d(r.checked_at), r.wallets_checked, r.mismatch_count])));
+  res.send(shell(req, '/reconciliation', 'Reconciliation', body));
+});
+router.post('/reconciliation/run', async (req, res) => {
+  try {
+    const r = await runReconciliation(req.db);
+    await req.setFlash('success', `Reconciliation done: ${r.wallets_checked} wallets, ${r.mismatch_count} mismatch(es), ${r.unconfirmed} unconfirmed provider txn(s).`);
+  } catch (e) { await req.setFlash('error', 'Reconciliation failed: ' + e.message); }
+  res.redirect(R(req, '/reconciliation'));
+});
+
+/* ============================================================ FRAUD FLAGS (v14) */
+router.get('/flags', async (req, res) => {
+  const open = await req.db.query(`SELECT f.*, u.email FROM account_flags f JOIN users u ON u.id = f.user_id WHERE f.reviewed_at IS NULL ORDER BY f.created_at DESC`);
+  const done = await req.db.query(`SELECT f.*, u.email FROM account_flags f JOIN users u ON u.id = f.user_id WHERE f.reviewed_at IS NOT NULL ORDER BY f.created_at DESC LIMIT 50`);
+  const table = (rows, showReview) => ui.table(['When', 'User', 'Flag', 'Detail', 'Reviewed', ''], rows.map(f => [d(f.created_at), esc(f.email) + ` (<a href="${R(req, '/users/' + f.user_id)}">#${f.user_id}</a>)`, esc(f.flag_type), `<span class="code">${esc(String(f.detail).slice(0, 200))}</span>`, f.reviewed_at ? '✓ ' + d(f.reviewed_at) : '—',
+    showReview ? `<form method="POST" action="${R(req, '/flags/' + f.id + '/review')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm">Mark reviewed</button></form>` : '']));
+  const body = ui.card('Open flags — review only, never auto-ban', `<p class="muted">Shared device/IP across accounts is a signal, not proof: households, agents and VPNs share IPs legitimately. Review and decide; the system never bans on a flag alone.</p>` + table(open, true)) +
+    ui.card('Reviewed', table(done, false));
+  res.send(shell(req, '/flags', 'Fraud Flags', body));
+});
+router.post('/flags/:id/review', async (req, res) => {
+  await req.db.run('UPDATE account_flags SET reviewed_by = ?, reviewed_at = ? WHERE id = ?', [req.user.id, now(), req.params.id]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'fraud.flag_reviewed', entity: 'flag', entityId: req.params.id, detail: {}, ip: req.ip });
+  await req.setFlash('success', 'Flag marked reviewed.');
+  res.redirect(R(req, '/flags'));
+});
+
+/* ============================================================ STAFF & ROLES (v14) */
+router.get('/staff', async (req, res) => {
+  const staff = await req.db.query("SELECT * FROM users WHERE role = 'admin' ORDER BY created_at");
+  const isSuper = (req.user.admin_role || 'super') === 'super';
+  const createCard = isSuper ? ui.card('Create staff account', `<p class="muted">Staff roles: super (everything), finance (money actions), support (support tickets), risk (user safety + draws + flags). Views are readable by all staff; actions enforce the role. New staff must set a 12+ character password${getBool(req.settings, 'admin_totp_required', false) ? ' and enroll an authenticator before doing anything' : ''}.</p>` +
+    ui.formHtml(R(req, '/staff'), [
+      { key: 'name', label: 'Name', type: 'text', required: true },
+      { key: 'email', label: 'Email', type: 'text', required: true },
+      { key: 'password', label: 'Password (12+ chars)', type: 'text', required: true },
+      { key: 'admin_role', label: 'Role', type: 'select', options: ['super', 'finance', 'support', 'risk'], value: 'support' },
+    ], { csrf: req.csrfToken, submit: 'Create staff' })) : ui.card('Create staff account', '<p class="muted">Only super admins can create staff accounts.</p>');
+  const body = createCard +
+    ui.card('Staff', ui.table(['ID', 'Name', 'Email', 'Role', 'TOTP', 'Joined', ''], staff.map(s => [s.id, esc(s.name), esc(s.email), esc(s.admin_role || 'super'), s.totp_secret ? ui.badge('on', 'ok') : ui.badge('off', 'muted'), d(s.created_at),
+      s.id === req.user.id ? '<span class="muted">you</span>'
+      : isSuper ? `<form method="POST" action="${R(req, '/staff/' + s.id + '/role')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><select name="admin_role"><option value="super">super</option><option value="finance">finance</option><option value="support">support</option><option value="risk">risk</option></select><button class="btn btn-sm">Change role</button></form>`
+      : '<span class="muted">—</span>'])));
+  res.send(shell(req, '/staff', 'Staff', body));
+});
+router.post('/staff', async (req, res) => {
+  const { name, email, password, admin_role } = req.body;
+  const role = ['super', 'finance', 'support', 'risk'].includes(admin_role) ? admin_role : 'support';
+  const pwErr = passwordError(password, 'admin', getBool(req.settings, 'secure_password', true));
+  if (!name || !validEmail(email) || pwErr) { await req.setFlash('error', pwErr || 'Name and valid email required.'); return res.redirect(R(req, '/staff')); }
+  if (getBool(req.settings, 'breached_password_check', true) && await isBreached(password)) { await req.setFlash('error', 'This password has appeared in a data breach. Choose a different one.'); return res.redirect(R(req, '/staff')); }
+  const dup = await req.db.get('SELECT id FROM users WHERE email = ?', [email.trim().toLowerCase()]);
+  if (dup) { await req.setFlash('error', 'An account with that email already exists.'); return res.redirect(R(req, '/staff')); }
+  const forceTotp = getBool(req.settings, 'admin_totp_required', false) ? 1 : 0;
+  const r = await req.db.run("INSERT INTO users (email, name, password_hash, role, admin_role, status, email_verified, force_totp_enroll, created_at) VALUES (?, ?, ?, 'admin', ?, 'active', 1, ?, ?)",
+    [email.trim().toLowerCase(), name.trim(), hashPassword(password), role, forceTotp, now()]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'staff.create', entity: 'user', entityId: r.id, detail: { admin_role: role }, ip: req.ip });
+  await req.setFlash('success', 'Staff account created' + (forceTotp ? ' — they must enroll an authenticator on first sign-in.' : '.'));
+  res.redirect(R(req, '/staff'));
+});
+router.post('/staff/:id/role', async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (id === req.user.id) { await req.setFlash('error', 'You cannot change your own role.'); return res.redirect(R(req, '/staff')); }
+  const role = ['super', 'finance', 'support', 'risk'].includes(req.body.admin_role) ? req.body.admin_role : null;
+  if (!role) { await req.setFlash('error', 'Invalid role.'); return res.redirect(R(req, '/staff')); }
+  const old = await req.db.get("SELECT admin_role FROM users WHERE id = ? AND role = 'admin'", [id]);
+  if (!old) return notFound(req, res, 'Staff not found.');
+  await req.db.run("UPDATE users SET admin_role = ? WHERE id = ?", [role, id]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'staff.role_change', entity: 'user', entityId: id, detail: { old_role: old.admin_role || 'super', new_role: role }, ip: req.ip });
+  await req.setFlash('success', 'Role updated.');
+  res.redirect(R(req, '/staff'));
+});
+
+/* ============================================================ ADMIN SECURITY — TOTP enrollment (v14) */
+router.get('/security', async (req, res) => {
+  const u = await req.db.get('SELECT totp_secret FROM users WHERE id = ?', [req.user.id]);
+  const enforced = getBool(req.settings, 'admin_totp_required', false);
+  res.send(shell(req, '/security', 'Security', ui.card('Authenticator (TOTP)', `
+    <p class="muted">Your authenticator protects the admin panel. ${enforced ? 'TOTP is REQUIRED for admins on this site (admin_totp_required is ON).' : 'TOTP enforcement is OFF (admin_totp_required). Enroll first, then an admin can enable enforcement in Settings → Toggles.'}</p>
+    <p>Status: ${u.totp_secret ? ui.badge('enabled', 'ok') : ui.badge('not enrolled', 'warn')}</p>
+    ${u.totp_secret
+      ? `<form method="POST" action="${R(req, '/security/totp/disable')}"><input type="hidden" name="_csrf" value="${req.csrfToken}"><div class="field"><label>Password (to confirm)</label><input type="password" name="password" required></div><button class="btn btn-d" type="submit" data-confirm="Disable your authenticator?">Disable authenticator</button></form>`
+      : `<form method="POST" action="${R(req, '/security/totp/start')}"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-p" type="submit">Enroll authenticator</button></form>`}
+  `)));
+});
+router.post('/security/totp/start', async (req, res) => {
+  const authLib = require('../lib/auth');
+  const secret = authLib.newTotpSecret();
+  await authLib.touchSession(req.db, req.sess.id, { admin_totp_pending: secret });
+  const uri = authLib.totpUri(secret, req.user.email, getS(req.settings, 'site_name', 'Cash Pop'));
+  const qrDataUrl = await QRCode.toDataURL(uri);
+  res.send(shell(req, '/security', 'Enroll Authenticator', ui.card('Scan with your authenticator app', `
+    <p><img src="${qrDataUrl}" alt="TOTP QR code" style="width:200px;height:200px"></p>
+    <p class="muted">Or enter this secret manually: <span class="code">${esc(secret)}</span></p>
+    <form method="POST" action="${R(req, '/security/totp/confirm')}"><input type="hidden" name="_csrf" value="${req.csrfToken}">
+    <div class="field"><label>6-digit code from your app</label><input type="text" name="totp_code" required autocomplete="off"></div>
+    <button class="btn btn-p" type="submit">Verify & enable</button></form>`)));
+});
+router.post('/security/totp/confirm', async (req, res) => {
+  const secret = req.sessionData.admin_totp_pending;
+  if (!secret) { await req.setFlash('error', 'Setup session expired. Start again.'); return res.redirect(R(req, '/security')); }
+  if (!verifyTotp(secret, req.body.totp_code)) { await req.setFlash('error', 'Invalid code. Try again.'); return res.redirect(R(req, '/security')); }
+  const authLib = require('../lib/auth');
+  const codes = authLib.newBackupCodes(8);
+  await req.db.run('UPDATE users SET totp_secret = ?, backup_codes = ?, force_totp_enroll = 0 WHERE id = ?', [secret, authLib.hashBackupCodes(codes), req.user.id]);
+  await authLib.touchSession(req.db, req.sess.id, { admin_totp_pending: null });
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'admin.totp_enable', entity: 'user', entityId: req.user.id, detail: {}, ip: req.ip });
+  res.send(shell(req, '/security', 'Authenticator Enabled', ui.card('Backup codes', `<p class="muted">Save these somewhere safe — each works once if you lose your authenticator.</p><p class="code">${codes.join('<br>')}</p><p><a class="btn btn-p" href="${R(req, '/security')}">Done</a></p>`)));
+});
+router.post('/security/totp/disable', async (req, res) => {
+  // Refuse while enforcement is ON: disabling would violate the enforced policy.
+  if (getBool(req.settings, 'admin_totp_required', false)) {
+    await req.setFlash('error', 'Cannot disable: admin TOTP is required on this site. Turn off admin_totp_required in Settings first.');
+    return res.redirect(R(req, '/security'));
+  }
+  const u = await req.db.get('SELECT * FROM users WHERE id = ?', [req.user.id]);
+  const { verifyPassword } = require('../lib/util');
+  if (!verifyPassword(req.body.password || '', u.password_hash || '')) { await req.setFlash('error', 'Wrong password.'); return res.redirect(R(req, '/security')); }
+  await req.db.run("UPDATE users SET totp_secret = '', backup_codes = '[]' WHERE id = ?", [req.user.id]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'admin.totp_disable', entity: 'user', entityId: req.user.id, detail: {}, ip: req.ip });
+  await req.setFlash('success', 'Authenticator disabled.');
+  res.redirect(R(req, '/security'));
+});
+
 /* ============================================================ AUDIT TRAIL */
 router.get('/audit', async (req, res) => {
   const page = pageOf(req), q = req.query.q || '';
@@ -1449,7 +1838,11 @@ router.get('/audit', async (req, res) => {
   const params = q ? [`%${q}%`, `%${q}%`, `%${q}%`] : [];
   const total = (await req.db.get(`SELECT COUNT(*) AS c FROM audit_log ${where}`, params)).c;
   const rows = await req.db.query(`SELECT * FROM audit_log ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`, [...params, PER, (page - 1) * PER]);
-  const body = ui.filtersHtml(R(req, '/audit'), [{ key: 'q', label: 'Search action/entity' }], req.query) +
+  const chain = await audit.verifyChain(req.db).catch(() => ({ ok: false, checked: 0, firstBadId: null, reason: 'verify failed' }));
+  const chainBanner = chain.ok
+    ? `<div class="alert a-ok">Audit chain verified: ${chain.checked} chained row(s), no tampering detected.</div>`
+    : `<div class="alert a-err">Audit chain BROKEN at row #${chain.firstBadId} (${esc(chain.reason)}). Investigate immediately.</div>`;
+  const body = chainBanner + ui.filtersHtml(R(req, '/audit'), [{ key: 'q', label: 'Search action/entity' }], req.query) +
     ui.table(['When', 'Actor', 'Action', 'Entity', 'IP', 'Detail'], rows.map(a =>
       [d(a.created_at), `${esc(a.actor_role || '?')} #${a.actor_id || '—'}`, esc(a.action), esc(a.entity) + ' ' + esc(a.entity_id), esc(a.ip), `<span class="code">${esc(String(a.detail).slice(0, 120))}</span>`])) +
     ui.paginate(`${R(req, '/audit')}?q=${encodeURIComponent(q)}`, page, PER, total);
