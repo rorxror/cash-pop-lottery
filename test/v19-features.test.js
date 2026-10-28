@@ -148,7 +148,10 @@ test('BP-16: /healthz returns ok:true with no config leakage', async () => {
   assert.equal(r.status, 200);
   const j = await r.json();
   assert.equal(j.ok, true);
-  assert.deepEqual(Object.keys(j).sort(), ['ok', 'time'], 'healthz must expose nothing but ok+time');
+  // v20 U-28 contract (owner's information-separation rule, newer than
+  // the v19 shape): healthz is EXACTLY { ok: true } — no time, no
+  // versions, no paths. Assertion updated at v20 integration.
+  assert.deepEqual(Object.keys(j).sort(), ['ok'], 'healthz must expose nothing but ok');
 });
 
 test('BP-15 E2E: admin canned reply -> picker on ticket -> send -> player sees it', { timeout: 60000 }, async () => {
@@ -262,7 +265,11 @@ test('BP-14 E2E: /security lists own sessions; revoke signs out the other sessio
   assert.equal(g.status, 200);
   assert.match(g.body, /Active sessions/, 'sessions section renders');
   assert.match(g.body, /This session/, 'current session is marked');
-  assert.match(g.body, /V19PlayerBrowser/, 'the recorded user-agent is shown verbatim');
+  // v20 U-04 contract (owner directive supersedes the v19 verbatim-UA
+  // expectation): the page shows the HUMAN device label and the raw
+  // user-agent string never reaches the page.
+  assert.match(g.body, /Unknown device · Unknown browser/, 'the session shows its human device label');
+  assert.doesNotMatch(g.body, /V19PlayerBrowser/, 'the raw user-agent is never rendered');
 
   // second login for the same player
   const jar2 = new Jar('V19SecondBrowser/2.0');
@@ -274,7 +281,8 @@ test('BP-14 E2E: /security lists own sessions; revoke signs out the other sessio
 
   // revoke from the first session
   g = await playerJar.text('/security');
-  assert.match(g.body, /V19SecondBrowser/, 'both sessions are listed');
+  assert.equal((g.body.match(/class="v20-session-card/g) || []).length >= 2, true, 'both sessions are listed as cards');
+  assert.doesNotMatch(g.body, /V19SecondBrowser/, 'the second raw user-agent is never rendered either');
   post = await playerJar.text('/security/sessions/revoke', { method: 'POST', body: { _csrf: csrfOf(g.body) } });
   assert.equal(post.status, 302);
   g = await jar2.text('/wallet');

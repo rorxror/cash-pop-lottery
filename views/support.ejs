@@ -10,6 +10,12 @@
           <a href="/support/<%= t.public_id %>"><%= t.subject %></a>
           <span class="badge <%= t.status === 'open' ? 'b-info' : 'b-muted' %>"><%= t.status %></span>
           <small class="muted"><%= new Date(t.created_at).toLocaleString() %></small>
+          <% /* U-25: delete own ticket — plain POST, same pattern as the
+                close/reopen forms on the ticket page (no confirm). */ %>
+          <form method="POST" action="/support/<%= t.public_id %>/delete" style="display:inline">
+            <input type="hidden" name="_csrf" value="<%= csrf %>">
+            <button type="submit" class="btn btn-d btn-sm">Delete</button>
+          </form>
         </li>
         <% }) %>
       </ul>

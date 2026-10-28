@@ -27,10 +27,15 @@
         <a href="/play" class="btn btn-p btn-lg">Play Now</a>
         <a href="/fairness" class="btn btn-g btn-lg">How Fairness Works</a>
       </div>
-      <div class="hero-stats">
-        <div class="hstat"><span class="n live-count" data-count="<%= stats.players %>" data-mode="<%= stats.mode %>"><%= stats.players %></span><span class="l"><%= stats.players === 1 ? "Player" : "Players" %></span></div>
-        <div class="hstat"><span class="n live-count" data-count="<%= stats.tickets_today %>" data-mode="<%= stats.mode %>"><%= stats.tickets_today %></span><span class="l">Tickets in the last 24 hours</span></div>
-        <div class="hstat"><span class="n live-count" data-count="<%= stats.paid_out %>" data-mode="<%= stats.mode %>" data-money="1" data-symbol="<%= paidBase.symbol %>" data-decimals="<%= paidBase.dec %>"><%= stats.paid_out_fmt %></span><span class="l">Paid out</span></div>
+      <% /* U-10 (v20): equal 3-up stats row on the v20 primitives. The
+            .live-count spans keep their exact order and data attributes —
+            app.js count-up / 30s refresh reads them in DOM order
+            (players, tickets, paid out) and the figures are the unchanged
+            real DB aggregates from routes/site.js. */ %>
+      <div class="v20-stats-row">
+        <div class="v20-stat-card"><span class="v20-stat-deco" aria-hidden="true"></span><span class="v20-stat-value live-count" data-count="<%= stats.players %>" data-mode="<%= stats.mode %>"><%= stats.players %></span><span class="v20-stat-label"><%= stats.players === 1 ? "Player" : "Players" %></span></div>
+        <div class="v20-stat-card"><span class="v20-stat-deco" aria-hidden="true"></span><span class="v20-stat-value live-count" data-count="<%= stats.tickets_today %>" data-mode="<%= stats.mode %>"><%= stats.tickets_today %></span><span class="v20-stat-label">Tickets in the last 24 hours</span></div>
+        <div class="v20-stat-card"><span class="v20-stat-deco" aria-hidden="true"></span><span class="v20-stat-value live-count" data-count="<%= stats.paid_out %>" data-mode="<%= stats.mode %>" data-money="1" data-symbol="<%= paidBase.symbol %>" data-decimals="<%= paidBase.dec %>"><%= stats.paid_out_fmt %></span><span class="v20-stat-label">Paid out</span></div>
       </div>
     </div>
     <div class="hero-teaser">
@@ -59,18 +64,25 @@
       <span class="draw-banner-sub">Entries close when the timer hits zero</span>
     </div>
     <div class="draw-banner-timer">
-      <div class="countdown countdown-lg" data-close-at="<%= nextDraw.close_at %>">--:--:--</div>
+      <div class="countdown countdown-lg" data-close-at="<%= nextDraw.close_at %>">-d --:--:--</div>
       <a href="/play" class="btn btn-p btn-lg">Enter Now</a>
     </div>
   </div>
 </section>
 <% } %>
 
-<section class="trust-row wrap">
-  <div class="trust-badge"><span class="trust-ico">&#10003;</span><div><strong>Provably Fair</strong><span>Every draw verifiable</span></div></div>
-  <div class="trust-badge"><span class="trust-ico">&#9889;</span><div><strong>Fast Win Credits</strong><span>Winnings land in your wallet as soon as the draw settles</span></div></div>
-  <div class="trust-badge"><span class="trust-ico">&#128274;</span><div><strong>Secure Platform</strong><span>Provably fair, transparent draws</span></div></div>
-  <div class="trust-badge"><span class="trust-ico">&#127942;</span><div><strong>Daily Draws</strong><span>Two chances every day</span></div></div>
+<% /* U-09 (v20): feature cards on the v20 primitives — icon on top at the
+      CSS size, title, body at full card width, equal heights via the grid.
+      Copy is held to what the product backs (see adj-home.md): win credits
+      are promised at settlement, exactly as settleDraw posts them; the
+      Secure Platform body no longer duplicates the fairness claim. */ %>
+<section class="wrap section">
+  <div class="v20-feature-grid">
+    <div class="v20-feature-card"><span class="v20-feature-icon" aria-hidden="true">&#10003;</span><h3 class="v20-feature-title">Provably Fair</h3><p class="v20-feature-body">Every draw verifiable — the seed hash is published before entries close and the seed is revealed after the draw settles.</p></div>
+    <div class="v20-feature-card"><span class="v20-feature-icon" aria-hidden="true">&#9889;</span><h3 class="v20-feature-title">Fast Win Credits</h3><p class="v20-feature-body">Winnings land in your wallet as soon as the draw settles.</p></div>
+    <div class="v20-feature-card"><span class="v20-feature-icon" aria-hidden="true">&#128274;</span><h3 class="v20-feature-title">Secure Platform</h3><p class="v20-feature-body">Your password is protected, your sign-in stays secure, and your balance and results are held on our secure servers — never in your browser, so they can't be changed there.</p></div>
+    <div class="v20-feature-card"><span class="v20-feature-icon" aria-hidden="true">&#127942;</span><h3 class="v20-feature-title">Daily Draws</h3><p class="v20-feature-body">A Day draw and an Evening draw — two chances every day.</p></div>
+  </div>
 </section>
 
 <% if (typeof recentWins !== 'undefined' && recentWins && recentWins.length) { %>
@@ -92,12 +104,48 @@
   </div>
   <div class="draw-cards collapsible" id="upcomingDraws">
     <% draws.forEach(function(d){ %>
-    <div class="draw-card">
+    <% /* U-11 (v20): v20 draw-card hooks. The countdown keeps the exact
+          ticker contract app.js already uses — class "countdown" plus
+          data-close-at (epoch ms) — and adds .v20-draw-countdown. The
+          ball is decorative (sun/moon by draw type, no invented number). */ %>
+    <article class="v20-draw-card">
+      <span class="v20-draw-ball" aria-hidden="true"><%= d.draw_type === 'DAY' ? '☀' : '☾' %></span>
       <div class="draw-type"><%= d.label %></div>
-      <div class="countdown" data-close-at="<%= d.close_at %>">--:--:--</div>
+      <div class="muted"><%= d.draw_date %></div>
+      <div class="countdown v20-draw-countdown" data-close-at="<%= d.close_at %>">-d --:--:--</div>
       <div class="draw-hash muted">Seed hash: <span class="code"><%= d.seed_hash ? d.seed_hash.slice(0,16) + '...' : 'pending' %></span></div>
-      <a href="/play" class="btn btn-p btn-sm btn-block">Enter</a>
-    </div>
+      <a href="/play" class="btn btn-p btn-sm btn-block v20-draw-enter">Enter</a>
+    </article>
+    <% }) %>
+  </div>
+</section>
+<% } %>
+
+<% /* U-12 (v20): homepage scratch showcase from REAL live series
+      (routes/site.js mirrors the scratch lobby query). When no live
+      series exists this whole section renders NOTHING — no placeholder,
+      no invented content. Price / top prize / remaining are public
+      series data; no visitor balance appears here in either state. */ %>
+<% if (typeof scratchSeries !== 'undefined' && scratchSeries && scratchSeries.length) { %>
+<section class="wrap section v20-scratch-section">
+  <div class="sec-head">
+    <h2 class="sec-title">Scratch Cards</h2>
+    <% if (typeof user !== 'undefined' && user) { %><a href="/scratch" class="btn btn-g">All Scratch Cards</a><% } %>
+  </div>
+  <p class="muted">Instant games — every outcome is locked before you scratch. Scratching only reveals it — it never changes it.</p>
+  <div class="v20-scratch-grid">
+    <% scratchSeries.forEach(function(s){ %>
+    <article class="v20-scratch-card scratch-card type-<%= s.game_type %>">
+      <div class="scratch-card-top"><span class="eyebrow"><%= s.game_type %></span><span class="status-dot">Live</span></div>
+      <h3><%= s.title %></h3>
+      <div class="scratch-metrics"><div><small>Price</small><strong><%= fmt(s.price, s.currency) %></strong></div><div><small>Top prize</small><strong><%= fmt(s.top_prize || 0, s.currency) %></strong></div><div><small>Remaining</small><strong><%= s.remaining %></strong></div></div>
+      <% if (typeof user !== 'undefined' && user) { %>
+      <a class="btn btn-p btn-block" href="/scratch">Play Scratch Cards</a>
+      <% } else { %>
+      <a class="btn btn-p btn-block" href="/register">Create an account to play</a>
+      <a class="btn btn-g btn-block" href="/login">Sign in</a>
+      <% } %>
+    </article>
     <% }) %>
   </div>
 </section>
@@ -110,10 +158,28 @@
 </section>
 <% } %>
 
+<% /* U-13 (v20): structured step cards — the numeral chip (.v20-step-num)
+      lives INSIDE each .v20-step-card. The lottery copy is carried over
+      from the seeded how_it_works content block (which still drives
+      /page/how-it-works); a raw CMS <ol> string cannot carry per-step
+      card/num hooks, so the homepage renders explicit cards. Scratch
+      steps get equal prominence in the same style; the prize wording is
+      what lib/scratch.js revealTicket does — the prize credits in the
+      same transaction that reveals the ticket. */ %>
 <section class="wrap section">
   <h2 class="sec-title">How It Works</h2>
-  <div class="steps">
-    <%- content('how_it_works') %>
+  <h3>How Cash Pop works</h3>
+  <div class="v20-steps">
+    <div class="v20-step-card"><span class="v20-step-num" aria-hidden="true">1</span><strong>Pick 1–15 pops</strong><p class="muted">Your lucky numbers from 1 to 15.</p></div>
+    <div class="v20-step-card"><span class="v20-step-num" aria-hidden="true">2</span><strong>Set your wager</strong><p class="muted">Set your wager per pop and choose Day, Evening or Both draws.</p></div>
+    <div class="v20-step-card"><span class="v20-step-num" aria-hidden="true">3</span><strong>Buy your ticket</strong><p class="muted">Securely signed and locked to the next draws.</p></div>
+    <div class="v20-step-card"><span class="v20-step-num" aria-hidden="true">4</span><strong>Win</strong><p class="muted">If the drawn number matches one of your pops, you win that pop's prize, credited to your wallet as soon as the draw settles.</p></div>
+  </div>
+  <h3>How Scratch Cards work</h3>
+  <div class="v20-steps">
+    <div class="v20-step-card"><span class="v20-step-num" aria-hidden="true">1</span><strong>Buy a card</strong><p class="muted">Pick a live scratch series and buy a card — its outcome is locked before you scratch.</p></div>
+    <div class="v20-step-card"><span class="v20-step-num" aria-hidden="true">2</span><strong>Scratch to reveal</strong><p class="muted">Scratch the card to reveal its locked result.</p></div>
+    <div class="v20-step-card"><span class="v20-step-num" aria-hidden="true">3</span><strong>Prize credited at reveal</strong><p class="muted">If your card wins, its prize is credited to your wallet when you reveal it.</p></div>
   </div>
 </section>
 
@@ -126,7 +192,7 @@
     <tbody>
       <% recentResults.forEach(function(r){ %>
       <tr>
-        <td><%= r.draw_type %><%= r.is_test ? ' <span class="badge b-warn">TEST</span>' : '' %></td>
+        <td><%= r.draw_type %><% if (r.is_test) { %> <span class="badge b-warn">TEST</span><% } %></td>
         <td><%= r.draw_date %></td>
         <td><span class="ball ball-win"><%= r.winning_number %></span></td>
       </tr>

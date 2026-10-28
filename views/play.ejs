@@ -7,10 +7,10 @@
     <input type="hidden" name="_csrf" value="<%= csrf %>">
     <script type="application/json" id="prizeData"><%- JSON.stringify(prizeTable || []) %></script>
 
-    <!-- R-071: wallet currency picker. The buy handler debits the wallet
+    <% /* R-071: wallet currency picker. The buy handler debits the wallet
          matching this currency (base only, before); without a picker a
          EUR-funded player could never spend their balance. Changing it
-         reloads the slip so the shown balance matches the wallet used. -->
+         reloads the slip so the shown balance matches the wallet used. */ %>
     <div class="pstep">
       <div class="field"><label for="playCurrency">Wallet currency</label>
       <select name="currency" id="playCurrency">
@@ -22,7 +22,7 @@
     </div>
 
     <div class="pslip">
-      <!-- STEP 1 -->
+      <% /* STEP 1 */ %>
       <div class="pstep">
         <div class="pstep-banner"><span class="pstep-num">1</span><span>Pick your pops</span></div>
         <p class="pstep-sub">Play just 1 or up to 15 numbers (pops). The more numbers you play, the better your odds of winning!</p>
@@ -32,14 +32,14 @@
           <% } %>
         </div>
         <div class="ball-actions">
-          <button type="button" class="btn btn-g btn-sm" id="coverAll">&#10003; Cover All</button>
+          <button type="button" class="btn btn-g btn-sm" id="coverAll" aria-pressed="false">Cover All</button>
           <button type="button" class="btn btn-g btn-sm" id="quickPick">Quick Pick</button>
           <button type="button" class="btn btn-g btn-sm" id="clearBalls">Clear</button>
         </div>
         <p class="muted"><span id="popCount">0</span> pops selected</p>
       </div>
 
-      <!-- STEP 2 -->
+      <% /* STEP 2 */ %>
       <div class="pstep">
         <div class="pstep-banner"><span class="pstep-num">2</span><span>Select your wager per pop</span></div>
         <p class="pstep-sub">The more you wager, the higher the cash prize you could win!</p>
@@ -50,7 +50,7 @@
         </div>
       </div>
 
-      <!-- STEP 3 -->
+      <% /* STEP 3 */ %>
       <div class="pstep">
         <div class="pstep-banner"><span class="pstep-num">3</span><span>Select draw &amp; number of draws</span></div>
         <p class="pstep-sub">Choose your draw time(s), then how many consecutive draws to play.</p>
@@ -69,7 +69,7 @@
         <p class="muted note">Both = your pops enter the Day draw <em>and</em> the Evening draw each day.</p>
       </div>
 
-      <!-- PRIZES -->
+      <% /* PRIZES */ %>
       <% if (prizeTable && prizeTable.length) { %>
       <div class="pstep">
         <div class="pstep-banner prize-banner"><span class="pstep-num">$</span><span>Prize multipliers</span></div>
@@ -88,7 +88,7 @@
       <% } %>
     </div>
 
-    <!-- SLIP SUMMARY -->
+    <% /* SLIP SUMMARY */ %>
     <div class="card slip-card" id="totalBox">
       <div class="card-h"><h2>Your slip</h2><button type="button" id="slipToggle" class="btn btn-g btn-sm">Hide</button></div>
       <div id="slipBreakdown" class="slip-lines">

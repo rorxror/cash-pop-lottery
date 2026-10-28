@@ -3,9 +3,9 @@
    delegated user creation, float-funded wallet transfers, commissions. */
 const express = require('express');
 const router = express.Router();
-const { now, randHex, validEmail, hashPassword, normalizeEmail, normalizePhone } = require('../lib/util');
-const { getS, getBool } = require('../lib/settings');
-const { requireLogin, requireRole } = require('../lib/auth');
+const { now, randHex, validEmail, hashPassword, normalizeEmail, normalizePhone, toMinor, decimalsFor } = require('../lib/util');
+const { getS, getBool, getCurrencies } = require('../lib/settings');
+const { requireLogin, requireRole, touchSession } = require('../lib/auth');
 const { getBalances, postLedger } = require('../lib/money');
 const audit = require('../lib/audit');
 
@@ -70,6 +70,13 @@ router.get('/players', async (req, res) => {
 });
 
 router.post('/players/claim', async (req, res) => {
+  /* U-20.5: the unassigned pool is operators-only BY DESIGN (the list
+     handler hides it from agents for privacy), but this endpoint still
+     let any agent claim ANY unassigned player by guessing their
+     sequential user id — the list privacy was theatre while the action
+     stayed open. Claim is an operator action; agents receive players by
+     operator assignment or by creating them. */
+  if (req.user.role !== 'admin') { await req.setFlash('error', 'Only operators can claim unassigned players. Ask an operator to assign this player to you.'); return res.redirect('/agent/players'); }
   const aid = agentId(req);
   const uid = parseInt(req.body.user_id, 10);
   const target = await req.db.get("SELECT * FROM users WHERE id = ? AND role = 'player'", [uid]);
@@ -105,6 +112,10 @@ router.post('/players/new', async (req, res) => {
   }
   const emailLc = normalizeEmail(email);
   const phoneNorm = normalizePhone(phone);
+  if (phoneNorm) {
+    const { isBlockedPhone } = require('../lib/phone-countries');
+    if (isBlockedPhone(req.settings, phoneNorm)) return res.render('agent/create_user', { metaTitle: 'Create Player', metaDesc: '', formError: 'Phone numbers from this country are not accepted on this platform.' });
+  }
   const ex = await req.db.get('SELECT id FROM users WHERE email = ?', [emailLc]);
   if (ex) return res.render('agent/create_user', { metaTitle: 'Create Player', metaDesc: '', formError: 'Email already registered.' });
   if (phoneNorm) {
@@ -127,35 +138,62 @@ router.get('/transfer', async (req, res) => {
   const aid = agentId(req);
   const floats = await req.db.query('SELECT currency, balance FROM agent_floats WHERE agent_id = ?', [aid]);
   const players = await req.db.query("SELECT id, name FROM users WHERE agent_id = ? AND role = 'player' AND status = 'active' ORDER BY name", [aid]);
-  res.render('agent/transfer', { metaTitle: 'Fund Player', metaDesc: '', floats, players });
+  /* D1-C7 (v20): every rendered transfer form carries a fresh one-time
+     submission token, stored server-side in the session; the POST
+     claims it in the DB (agent_transfers.idempotency_key UNIQUE,
+     migration v21) inside the transfer transaction. */
+  const transferToken = randHex(16);
+  if (req.sess) await touchSession(req.db, req.sess.id, { transfer_token: transferToken });
+  res.render('agent/transfer', { metaTitle: 'Fund Player', metaDesc: '', floats, players, transferToken });
 });
 
 router.post('/transfer', async (req, res) => {
   const aid = agentId(req);
   const toUser = parseInt(req.body.to_user_id, 10);
   const currency = String(req.body.currency || '').toUpperCase().slice(0, 8);
-  const { toMinor } = require('../lib/util');
-  const amount = toMinor(req.body.amount);
+  /* D1-C6 (v20): parse with the CURRENCY's decimals — the old bare
+     toMinor() defaulted to 2, so a 0-decimal currency (JPY) moved
+     100x the typed amount. */
+  const amount = toMinor(req.body.amount, decimalsFor(currency, getCurrencies(req.settings)));
   const note = String(req.body.note || '').slice(0, 255);
+  /* D1-C7 (v20): one-time submission. The token must match the one the
+     GET issued for this session; the transfer row is INSERTed FIRST
+     inside the transaction with the token as its UNIQUE
+     idempotency_key, so two parallel identical POSTs cannot both
+     apply: the second insert fails on the unique key and its whole
+     transaction (float debit included) rolls back. A failed transfer
+     (e.g. insufficient float) rolls the claim back too, so the same
+     form can be corrected and resubmitted. */
+  const token = String(req.body.transfer_token || '');
+  const storedToken = req.sessionData && req.sessionData.transfer_token;
+  if (!token || !storedToken || token !== storedToken) {
+    let used = null;
+    if (token) { try { used = await req.db.get('SELECT id FROM agent_transfers WHERE idempotency_key = ?', [token]); } catch {} }
+    await req.setFlash('error', used ? 'This transfer was already submitted — check the transfer history.' : 'This transfer form has expired — reload the transfer page and try again.');
+    return res.redirect('/agent/transfer');
+  }
   // R-068: the transfer form only lists active players, but the POST
   // never enforced it — a crafted POST could fund a banned player.
   const target = await req.db.get("SELECT * FROM users WHERE id = ? AND agent_id = ? AND role = 'player' AND status = 'active'", [toUser, aid]);
   if (!target || !amount || amount <= 0) { await req.setFlash('error', 'Invalid player or amount.'); return res.redirect('/agent/transfer'); }
   try {
     await req.db.transaction(async (tx) => {
+      // Claim the one-time token FIRST (UNIQUE idempotency_key, v21).
+      const claim = await tx.run('INSERT INTO agent_transfers (from_agent, to_user, currency, amount, note, created_at, created_by, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        [aid, toUser, currency, amount, note, now(), req.user.id, token]);
       // Atomic float debit: the guarded UPDATE + affected-row check closes
       // the same double-spend race as the wallet ledger (two concurrent
       // transfers cannot both pass the balance check).
       const f = await tx.run('UPDATE agent_floats SET balance = balance - ? WHERE agent_id = ? AND currency = ? AND balance >= ?', [amount, aid, currency, amount]);
       if (f.changes === 0) throw new Error('Insufficient float balance.');
-      await postLedger(tx, { userId: toUser, currency, type: 'agent_funding', amount, refType: 'agent_transfer', refId: String(aid), meta: { note, agent_id: aid } });
-      await tx.run('INSERT INTO agent_transfers (from_agent, to_user, currency, amount, note, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        [aid, toUser, currency, amount, note, now(), req.user.id]);
+      await postLedger(tx, { userId: toUser, currency, type: 'agent_funding', amount, refType: 'agent_transfer', refId: String(aid), meta: { note, agent_id: aid, transfer_id: claim.id } });
     });
+    if (req.sess) await touchSession(req.db, req.sess.id, { transfer_token: null });
     await audit.log(req.db, { actorId: req.user.id, actorRole: req.user.role, action: 'agent.transfer', entity: 'user', entityId: toUser, detail: { amount, currency, note }, ip: req.ip });
     await req.setFlash('success', 'Transfer completed.');
   } catch (e) {
-    await req.setFlash('error', 'Transfer failed: ' + e.message);
+    if (/UNIQUE|duplicate/i.test(e.message)) await req.setFlash('error', 'This transfer was already submitted — check the transfer history.');
+    else await req.setFlash('error', 'Transfer failed: ' + e.message);
   }
   res.redirect('/agent/transfer');
 });
@@ -177,15 +215,18 @@ router.get('/support', async (req, res) => {
   const aid = agentId(req);
   const tickets = await req.db.query(
     `SELECT t.*, u.name AS player_name, u.email AS player_email FROM support_tickets t
-     JOIN users u ON u.id = t.user_id WHERE u.agent_id = ? ORDER BY t.updated_at DESC LIMIT 200`, [aid]);
+     JOIN users u ON u.id = t.user_id WHERE u.agent_id = ? AND t.deleted_at IS NULL ORDER BY t.updated_at DESC LIMIT 200`, [aid]);
   res.render('agent/support', { metaTitle: 'Support', metaDesc: '', tickets });
 });
 
+/* U-25: agents only ever see LIVE tickets of their own players —
+   soft-deleted rows are excluded here, so the detail view and the
+   reply path treat them exactly like the admin side does. */
 async function agentTicket(req) {
   const aid = agentId(req);
   return req.db.get(
     `SELECT t.*, u.name AS player_name, u.email AS player_email FROM support_tickets t
-     JOIN users u ON u.id = t.user_id WHERE t.public_id = ? AND u.agent_id = ?`, [req.params.publicId, aid]);
+     JOIN users u ON u.id = t.user_id WHERE t.public_id = ? AND u.agent_id = ? AND t.deleted_at IS NULL`, [req.params.publicId, aid]);
 }
 
 router.get('/support/:publicId', async (req, res) => {
@@ -201,9 +242,35 @@ router.get('/support/:publicId', async (req, res) => {
   res.render('agent/support_view', { metaTitle: 'Ticket ' + ticket.public_id, metaDesc: '', ticket, messages, canned });
 });
 
-router.post('/support/:publicId/reply', async (req, res) => {
+/* U-25: agent soft delete — ONLY their own players' tickets (the same
+   scope agentTicket enforces). Executes on click; sets
+   deleted_at/deleted_by + audit row; sends NO notification. A ticket
+   of another agent's player (or a missing/already-deleted one) gets
+   the same 404 as the detail view, so existence is never leaked. */
+router.post('/support/:publicId/delete', async (req, res) => {
   const ticket = await agentTicket(req);
   if (!ticket) return res.status(404).render('error', { status: 404, message: 'Ticket not found.' });
+  const nowMs = Date.now();
+  const r = await req.db.run('UPDATE support_tickets SET deleted_at = ?, deleted_by = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL', [nowMs, req.user.id, nowMs, ticket.id]);
+  if (r.changes !== 1) { await req.setFlash('error', 'Ticket not found or already deleted.'); return res.redirect('/agent/support'); }
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'agent', action: 'support.delete', entity: 'support', entityId: ticket.public_id, detail: { ticket_id: ticket.id, status_at_delete: ticket.status, via: 'agent' }, ip: req.ip });
+  await req.setFlash('success', 'Ticket deleted. It is hidden from queues and kept for the operators as dispute evidence.');
+  res.redirect('/agent/support');
+});
+
+router.post('/support/:publicId/reply', async (req, res) => {
+  const ticket = await agentTicket(req);
+  if (!ticket) {
+    /* U-25: distinguish "deleted" from "not yours / missing" for own
+       players so the agent gets the true reason — and the deleted
+       ticket is never resurrected by a reply. */
+    const aid = agentId(req);
+    const deleted = await req.db.get(
+      `SELECT t.public_id FROM support_tickets t JOIN users u ON u.id = t.user_id
+       WHERE t.public_id = ? AND u.agent_id = ? AND t.deleted_at IS NOT NULL`, [req.params.publicId, aid]);
+    if (deleted) { await req.setFlash('error', 'This ticket has been deleted and can no longer be replied to.'); return res.redirect('/agent/support'); }
+    return res.status(404).render('error', { status: 404, message: 'Ticket not found.' });
+  }
   if (ticket.status === 'closed') { await req.setFlash('error', 'This ticket is closed.'); return res.redirect('/agent/support/' + ticket.public_id); }
   const body = String(req.body.message || '').trim().slice(0, 5000);
   if (!body) return res.redirect('/agent/support/' + ticket.public_id);

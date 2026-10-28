@@ -160,7 +160,10 @@ test('email OTP template seed: otp_login + support_reply resolve (failed, never 
   const row = await db.get("SELECT * FROM notifications_log WHERE to_addr = 'v17@example.com' ORDER BY id DESC LIMIT 1");
   assert.match(row.subject, /login code/i);
   assert.notStrictEqual(row.subject, 'otp_login');
-  assert.match(row.body, /123456/);
+  // v20: the outbox LOG copy must be masked — the delivered mail carried
+  // the real code, the stored row must never do so (see v20-log-masking).
+  assert.doesNotMatch(row.body, /123456/);
+  assert.match(row.body, /login code is \*\*\*\*\*\*/i);
 });
 
 test('OAuth refusals: banned/pending refused, TOTP users routed to the TOTP step', () => {

@@ -1,11 +1,11 @@
 <section class="section wrap narrow-wide">
   <a class="back-link" href="/scratch">← All scratch cards</a>
   <div class="card scratch-detail type-<%= series.game_type %>">
-    <div class="scratch-card-top"><span class="eyebrow"><%= series.game_type %></span><span class="status-dot">Live</span></div>
+    <% var scratchStatusLabels = { live: 'Live', draft: 'Draft', stopped: 'Stopped', ended: 'Ended' }; %><div class="scratch-card-top"><span class="eyebrow"><%= series.game_type %></span><% if (series.status === 'live') { %><span class="status-dot">Live</span><% } else { %><span class="status-label"><%= scratchStatusLabels[series.status] || series.status %></span><% } %></div>
     <h1><%= series.title %></h1><p><%= series.rules %></p>
     <div class="scratch-metrics"><div><small>Ticket</small><strong><%= fmt(series.price,series.currency) %></strong></div><div><small>Top prize</small><strong><%= fmt(series.top_prize || 0,series.currency) %></strong></div><div><small>Remaining</small><strong><%= series.remaining %></strong></div></div>
     <% if (user) { %><form action="/scratch/<%= series.id %>/buy" method="POST"><input type="hidden" name="_csrf" value="<%= csrf %>"><button class="btn btn-p btn-block" type="submit" <%= Number(series.remaining)<1?'disabled':'' %>>Buy &amp; scratch · <%= fmt(series.price,series.currency) %></button></form><% } else { %><a class="btn btn-p btn-block" href="/login">Sign in to buy</a><% } %>
   </div>
   <div class="card mt"><h2>Prize tiers</h2><div class="table-wrap"><table><thead><tr><th>Prize</th><th>Tickets</th><th>Label</th></tr></thead><tbody><% tiers.forEach(function(t){ %><tr><td><strong><%= fmt(t.amount,series.currency) %></strong></td><td><%= t.quantity %></td><td><%= t.label || 'Prize' %></td></tr><% }) %></tbody></table></div></div>
-  <div class="card mt"><h2>How fairness works</h2><ol><li>Your ticket receives an unused pre-shuffled outcome at purchase.</li><li>The outcome commitment is saved on the ticket before reveal.</li><li>Scratching never changes the prize; it only reveals it.</li><li>After reveal, use Verify to recompute the commitment.</li></ol></div>
+  <div class="card mt"><h2>How fairness works</h2><ol><li>Your card's prize is decided when you buy it, before you scratch.</li><li>That result is locked to your ticket before you scratch.</li><li>Scratching never changes the prize; it only reveals it.</li><li>After you reveal it, you can check the result yourself on the Verify page.</li></ol></div>
 </section>

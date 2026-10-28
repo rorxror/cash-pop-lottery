@@ -23,7 +23,10 @@
     <div class="cur-row">
       <span class="cr-name"><%= w.currency %> <span class="cr-sym"><%= cinfo.symbol || '' %></span></span>
       <span class="cr-bal"><%= fmt(w.balance, w.currency) %></span>
-      <span class="cr-meta"><%= (cinfo.rate && w.currency !== 'USD') ? ('1 ' + w.currency + ' = ' + Number(cinfo.rate).toFixed(4) + ' USD') : '&nbsp;' %></span>
+      <% /* U-01: the old fallback was the STRING '&nbsp;' sent through the
+            escaped-output tag, which printed the literal text "&nbsp;".
+            Empty means empty. */ %>
+      <span class="cr-meta"><%= (cinfo.rate && w.currency !== 'USD') ? ('1 ' + w.currency + ' = ' + Number(cinfo.rate).toFixed(4) + ' USD') : '' %></span>
     </div>
     <% }) %>
   </div>
@@ -79,5 +82,29 @@
     </table>
     </div>
     <% } else { %><p class="muted">No pending requests.</p><% } %>
+  </div>
+
+  <div class="card mt">
+    <div class="card-h"><h2>Request history</h2></div>
+    <% var reqStatusLabels = { pending: 'Pending', approved: 'Approved', rejected: 'Rejected', revoked: 'Revoked', expired: 'Expired', paid: 'Paid' }; %>
+    <% if (typeof requests !== 'undefined' && requests && requests.length) { %>
+    <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr><th>ID</th><th>Type</th><th>Amount</th><th>Status</th><th>Reason</th><th>Created</th></tr></thead>
+      <tbody>
+        <% requests.forEach(function(p){ %>
+        <tr>
+          <td><span class="code"><%= p.public_id %></span></td>
+          <td><%= p.kind === 'deposit' ? 'Deposit' : 'Withdrawal' %></td>
+          <td><%= fmt(p.amount, p.currency) %></td>
+          <td><span class="badge <%= p.status === 'rejected' ? 'b-err' : (p.status === 'approved' || p.status === 'paid' ? 'b-ok' : 'b-warn') %>"><%= reqStatusLabels[p.status] || 'Unknown' %></span></td>
+          <td><%= p.reason || '' %></td>
+          <td><%= new Date(p.created_at).toLocaleString() %></td>
+        </tr>
+        <% }) %>
+      </tbody>
+    </table>
+    </div>
+    <% } else { %><p class="muted">No deposit or withdrawal requests yet.</p><% } %>
   </div>
 </section>

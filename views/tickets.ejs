@@ -17,7 +17,7 @@
           <td><%= t.won_count %>/<%= t.entry_count %></td>
           <td>
             <% if (t.status === 'cancelled') { %><span class="badge b-err">CANCELLED</span>
-            <% } else if (t.status === 'settled') { %><%- t.won_count > 0 ? '<span class="badge b-ok">WON</span>' : '<span class="badge b-muted">LOST</span>' %>
+            <% } else if (t.status === 'settled') { %><% if (t.won_count > 0) { %><span class="badge b-ok">WON</span><% } else { %><span class="badge b-muted">LOST</span><% } %>
             <% } else { %><span class="badge b-info">ACTIVE</span><% } %>
           </td>
         </tr>

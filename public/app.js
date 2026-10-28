@@ -3,7 +3,7 @@
   'use strict';
 
   /* ---------- Money formatting (minor units -> currency string) ---------- */
-  /* SCAN fix (A-18/D-25): minor-unit divisor follows the currency's
+  /* Minor-unit divisor follows the currency's
      real fraction digits (JPY 0, KWD 3, most 2) instead of a hardcoded
      100 — Intl resolves them from the currency code itself. */
   function decFor(code) {
@@ -51,7 +51,7 @@
       }
       return 0;
     }
-    // DS-023: bundle discounts, keyed exactly like the server - on the
+    // Bundle discounts, keyed exactly like the server - on the
     // number of draws SELECTED (Both counts once). The slip total and the
     // Buy button must show the price the server will actually charge.
     var bundleMap = {};
@@ -85,6 +85,16 @@
       }
       var buyBtn = document.getElementById('buyBtn');
       if (buyBtn) buyBtn.disabled = pops === 0;
+      // Cover All must reflect reality — it reads as "active" only
+      // when every pop is actually selected; any unselect / Clear /
+      // Quick Pick drops it back. (The old button carried a static ✓
+      // glyph that looked active at 0 selected.)
+      var coverBtn = document.getElementById('coverAll');
+      if (coverBtn) {
+        var allCovered = inputs.length > 0 && pops === inputs.length;
+        coverBtn.classList.toggle('is-active', allCovered);
+        coverBtn.setAttribute('aria-pressed', allCovered ? 'true' : 'false');
+      }
     }
     function pickRandom(n) {
       inputs.forEach(function (i) { i.checked = false; });
@@ -99,12 +109,18 @@
     form.addEventListener('change', function (e) {
       if (e.target && (e.target.name === 'draw_type' || e.target.name === 'wager' || e.target.name === 'num_draws')) recalc();
     });
-    document.getElementById('quickPick').addEventListener('click', function () { pickRandom(5); });
-    document.getElementById('coverAll').addEventListener('click', function () {
+    // These lookups are null-guarded — an unguarded getElementById
+    // throw here would abort the whole init IIFE, including the hero
+    // counters/countdowns initialised BELOW the playslip block.
+    var quickPickBtn = document.getElementById('quickPick');
+    if (quickPickBtn) quickPickBtn.addEventListener('click', function () { pickRandom(5); });
+    var coverAllBtn = document.getElementById('coverAll');
+    if (coverAllBtn) coverAllBtn.addEventListener('click', function () {
       inputs.forEach(function (i) { i.checked = true; });
       recalc();
     });
-    document.getElementById('clearBalls').addEventListener('click', function () {
+    var clearBallsBtn = document.getElementById('clearBalls');
+    if (clearBallsBtn) clearBallsBtn.addEventListener('click', function () {
       inputs.forEach(function (i) { i.checked = false; });
       recalc();
     });
@@ -123,9 +139,10 @@
   // never tick up on their own (the old 'marketing' mode fabricated growth
   // with random increments; it is removed server-side and here).
   document.querySelectorAll('.live-count').forEach(function (el) {
+    el.setAttribute('data-counted', '1'); // marks the primary animation; the fallback below skips these
     var base = parseInt(el.getAttribute('data-count'), 10) || 0;
     var isMoney = el.getAttribute('data-money') === '1';
-    var sym = el.getAttribute('data-symbol') || '$'; // DS-041: server currency, never a hard-coded $
+    var sym = el.getAttribute('data-symbol') || '$'; // server currency, never a hard-coded $
     var dec = parseInt(el.getAttribute('data-decimals'), 10); if (!(dec >= 0)) dec = 2;
     function fmt(v) {
       if (isMoney) return sym + (v / Math.pow(10, dec)).toLocaleString('en-US', { minimumFractionDigits: dec, maximumFractionDigits: dec });
@@ -156,7 +173,7 @@
   var lastWinsKey = '';
   function tweenNum(el, from, to, isMoney) {
     var start = null, dur = 1000;
-    var sym = (el && el.getAttribute('data-symbol')) || '$'; // DS-041
+    var sym = (el && el.getAttribute('data-symbol')) || '$';
     var dec = parseInt(el && el.getAttribute('data-decimals'), 10); if (!(dec >= 0)) dec = 2;
     function fmt(v) {
       if (isMoney) return sym + (v / Math.pow(10, dec)).toLocaleString('en-US', { minimumFractionDigits: dec, maximumFractionDigits: dec });
@@ -226,8 +243,8 @@
       var ms = closeAt - now;
       if (ms <= 0) {
         el.textContent = 'Closing...';
-        // R-120: resync instead of freezing forever, and disable the buy
-        // form until fresh draws arrive (server enforces close via R-072).
+        // Resync instead of freezing forever, and disable the buy
+        // form until fresh draws arrive (the server enforces the close).
         if (!el.dataset.resynced) {
           el.dataset.resynced = '1';
           var form = document.querySelector('#buyForm, form[action$="/play/buy"]');
@@ -241,7 +258,10 @@
       var h = Math.floor(s / 3600); s -= h * 3600;
       var m = Math.floor(s / 60); s -= m * 60;
       function pad(n) { return (n < 10 ? '0' : '') + n; }
-      el.textContent = (d > 0 ? d + 'd ' : '') + pad(h) + ':' + pad(m) + ':' + pad(s);
+      /* The countdown format is ALWAYS "Dd HH:MM:SS" — the day part is
+         present for <24h and >24h alike (e.g. "0d 04:12:09",
+         "1d 02:03:04"), so every card shows the same structure. */
+      el.textContent = d + 'd ' + pad(h) + ':' + pad(m) + ':' + pad(s);
     });
   }
   if (document.querySelector('.countdown[data-close-at]')) {
@@ -307,7 +327,7 @@
     var prev = document.getElementById('chargePreview');
     if (!amt || !prev) return;
     function update() {
-      // DS-016: the input holds MAJOR units (e.g. 50), data-fixed holds
+      // The input holds MAJOR units (e.g. 50), data-fixed holds
       // MINOR units (100 = 1.00) and fmtMoney expects minor. Convert first -
       // the old code mixed all three and told a $50 depositor they would be
       // credited $0.00 (real charge $3.50, real credit $46.50).
@@ -384,6 +404,27 @@
     });
   }
 
+  /* ---------- (f1) Flash dismiss ---------- */
+  // Success flashes auto-dismiss after their data-auto-dismiss delay
+  // (layout sets 4000ms) with a fade; error flashes stay until closed.
+  // Both carry a visible [data-flash-close] button. role="alert" markup
+  // is untouched — this only removes the node after it has been shown.
+  document.querySelectorAll('.flash[data-flash]').forEach(function (fl) {
+    function dismiss() {
+      if (fl.classList.contains('is-fading')) return;
+      fl.classList.add('is-fading');
+      setTimeout(function () {
+        var wrap = fl.closest ? fl.closest('.flash-wrap') : null;
+        if (fl.parentNode) fl.parentNode.removeChild(fl);
+        if (wrap && !wrap.querySelector('.flash') && wrap.parentNode) wrap.parentNode.removeChild(wrap);
+      }, 320);
+    }
+    var closeBtn = fl.querySelector('[data-flash-close]');
+    if (closeBtn) closeBtn.addEventListener('click', dismiss);
+    var ms = parseInt(fl.getAttribute('data-auto-dismiss'), 10);
+    if (ms > 0) setTimeout(dismiss, ms);
+  });
+
   /* ---------- (f) Confirm on [data-confirm] ---------- */
   document.querySelectorAll('[data-confirm]').forEach(function (el) {
     el.addEventListener('click', function (e) {
@@ -430,7 +471,7 @@
     inp.name = (v.indexOf('@') === -1) ? 'phone' : 'email';
   });
 
-  /* Login: OTP flow (only rendered when admin enabled OTP) */
+  /* Login: OTP flow (only rendered when one-time-code sign-in is available) */
   var otpPaneEl = document.getElementById('loginOtp');
   if (otpPaneEl) (function () {
     var type = 'phone';
@@ -588,12 +629,12 @@
   var printBtn = document.getElementById('printBtn');
   if (printBtn) printBtn.addEventListener('click', function () { window.print(); });
 
-  /* ---------- Canned-reply picker (BP-15, staff support pages) ----------
+  /* ---------- Saved-reply picker ----------
      A <select data-canned-picker data-source="cannedData"> lists reply
      titles; the bodies live in a JSON island (#cannedData). Choosing one
      appends its text to the reply textarea of the enclosing form. The
-     picker never sends anything by itself — staff review and press Send. */
-  /* SCAN fix (D-17): the /play wallet-currency switch used an inline
+     picker never sends anything by itself — the reply is reviewed and sent manually. */
+  /* The /play wallet-currency switch used an inline
      onchange handler, which the site's own CSP (script-src without
      'unsafe-inline') blocks — changing currency silently did nothing.
      Delegated here like every other behaviour. */
@@ -622,5 +663,66 @@
     var cur = box.value || '';
     box.value = cur ? cur.replace(/\s+$/, '') + '\n\n' + row.body : row.body;
     box.focus();
+  });
+
+  /* ---------- Fallback: hero count-up, independent failure domain ----------
+     The primary count-up lives in the FIRST IIFE, after the playslip
+     block; if anything in that IIFE ever throws before it (e.g. on a
+     logged-in page variant), the hero numbers would sit at their raw
+     server values with no motion — the owner's "cards don't move after
+     login" report. This fallback lives in THIS IIFE (separate failure
+     domain): shortly after DOMContentLoaded it animates any .live-count
+     the primary loop did not mark data-counted="1". When the primary
+     loop ran (the normal case) this is a no-op. */
+  function fallbackCountUp() {
+    document.querySelectorAll('.live-count:not([data-counted])').forEach(function (el) {
+      el.setAttribute('data-counted', '1');
+      var base = parseInt(el.getAttribute('data-count'), 10) || 0;
+      var isMoney = el.getAttribute('data-money') === '1';
+      var sym = el.getAttribute('data-symbol') || '$';
+      var dec = parseInt(el.getAttribute('data-decimals'), 10); if (!(dec >= 0)) dec = 2;
+      function fmt(v) {
+        if (isMoney) return sym + (v / Math.pow(10, dec)).toLocaleString('en-US', { minimumFractionDigits: dec, maximumFractionDigits: dec });
+        return Math.round(v).toLocaleString('en-US');
+      }
+      var start = null, dur = 1400;
+      function step(ts) {
+        if (!start) start = ts;
+        var p = Math.min((ts - start) / dur, 1);
+        var eased = 1 - Math.pow(1 - p, 3);
+        el.textContent = fmt(base * eased);
+        if (p < 1) requestAnimationFrame(step);
+        else el.textContent = fmt(base);
+      }
+      requestAnimationFrame(step);
+    });
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function () { setTimeout(fallbackCountUp, 600); });
+  } else {
+    setTimeout(fallbackCountUp, 600);
+  }
+
+  /* Copy-to-clipboard for [data-copy-target="<input id>"] buttons (the
+     profile referral link). Views carry no inline <script>, so the
+     handler lives here. Feedback: the button label flips to "Copied"
+     for ~1.6s. */
+  document.querySelectorAll('[data-copy-target]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var el = document.getElementById(btn.getAttribute('data-copy-target'));
+      if (!el) return;
+      function done() {
+        var old = btn.textContent;
+        btn.textContent = 'Copied';
+        setTimeout(function () { btn.textContent = old; }, 1600);
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(el.value).then(done, function () { el.select(); document.execCommand('copy'); done(); });
+      } else {
+        el.select();
+        try { document.execCommand('copy'); } catch (e) {}
+        done();
+      }
+    });
   });
 })();

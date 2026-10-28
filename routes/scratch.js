@@ -6,6 +6,7 @@ const { requireLogin, requireRole, rateLimit } = require('../lib/auth');
 const { now, randHex, sha256, toMinor, decimalsFor, esc } = require('../lib/util');
 const ui = require('../lib/admin-ui');
 const { buyTicket, revealTicket, launchSeries, responsibleStatus, logEvent } = require('../lib/scratch');
+const { getBalances } = require('../lib/money');
 const { getCurrencies, getS } = require('../lib/settings');
 const engine = require('../lib/prize-engine');
 const audit = require('../lib/audit');
@@ -25,10 +26,10 @@ playerRouter.get('/scratch/my-tickets', requireLogin, async (req, res) => {
   if (tab === 'scratched') where = "st.status='revealed'";
   if (tab === 'history') where = '1=1';
   // DS-058: paginated (was a hard LIMIT 200 with no way to reach older tickets).
-  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
   const totalRow = await req.db.get(
     `SELECT COUNT(*) AS c FROM scratch_tickets st WHERE st.user_id=? AND ${where}`, [req.user.id]);
   const totalPages = Math.max(1, Math.ceil(Number(totalRow.c) / 25));
+  const page = Math.min(Math.max(1, parseInt(req.query.page, 10) || 1), totalPages); // D4-C2 clamp
   const tickets = await req.db.query(
     `SELECT st.public_id,st.currency,st.price,st.status,st.prize,st.purchased_at,st.revealed_at,s.title,s.game_type
      FROM scratch_tickets st JOIN scratch_series s ON s.id=st.series_id
@@ -132,23 +133,68 @@ playerRouter.post('/scratch/ticket/:publicId/reveal', requireLogin,
     }
   });
 
+/* U-02 (v20): a failed scratch buy re-renders the page the player was
+   buying from (the series detail, or the lobby when the series itself
+   is gone) with the TRUE reason in the flash local — the bare error
+   page and the generic 'Scratch purchase failed' are gone. Every local
+   the target view needs is rebuilt here, mirroring the GET handlers. */
+async function renderScratchBuyError(req, res, seriesId, message) {
+  const flash = { error: message, success: '' };
+  const series = await req.db.get(
+    `SELECT s.*, (SELECT COUNT(*) FROM scratch_outcomes o WHERE o.series_id=s.id AND o.ticket_id IS NULL) AS remaining,
+      (SELECT MAX(amount) FROM scratch_prize_tiers p WHERE p.series_id=s.id) AS top_prize,
+      (SELECT COALESCE(SUM(amount*quantity),0) FROM scratch_prize_tiers p WHERE p.series_id=s.id) AS total_prizes
+     FROM scratch_series s WHERE s.id = ?`, [seriesId]);
+  if (series) {
+    const tiers = await req.db.query('SELECT amount,quantity,label FROM scratch_prize_tiers WHERE series_id=? ORDER BY amount DESC', [series.id]);
+    return res.status(400).render('scratch_detail', { metaTitle: series.title, metaDesc: '', series, tiers, flash });
+  }
+  const list = await req.db.query(
+    `SELECT s.*, (SELECT COUNT(*) FROM scratch_outcomes o WHERE o.series_id=s.id AND o.ticket_id IS NULL) AS remaining,
+      (SELECT MAX(amount) FROM scratch_prize_tiers p WHERE p.series_id=s.id) AS top_prize,
+      (SELECT COALESCE(SUM(amount*quantity),0) FROM scratch_prize_tiers p WHERE p.series_id=s.id) AS total_prizes
+     FROM scratch_series s WHERE s.status='live' AND s.enabled=1 ORDER BY s.launched_at DESC`);
+  return res.status(400).render('scratch_lobby', { metaTitle: 'Scratch Cards', metaDesc: 'Instant scratch games with locked outcomes and verifiable commitments.', series: list, flash });
+}
+
 playerRouter.post('/scratch/:id/buy', requireLogin,
   rateLimit({ windowMs: 60000, max: 10, keyFn: req => `scratch-buy:${req.user.id}` }),
   async (req, res) => {
+    const seriesId = parseInt(req.params.id, 10);
     try {
       // R-024 (scratch half): the lottery buy enforces session_limit_minutes;
       // the scratch buy never did. Same rule, same session-start basis.
       const rp = await responsibleStatus(req.db, req.user.id);
       const lim = Number(rp.session_limit_minutes || 0);
       if (lim > 0 && req.sess && req.sess.created_at && (now() - Number(req.sess.created_at)) > lim * 60000)
-        return res.status(400).render('error', { status: 400, message: 'Your session limit has been reached. Please sign out and take a break before playing again.' });
-      const bought = await buyTicket(req.db, req.user.id, parseInt(req.params.id, 10), req.ip);
+        return renderScratchBuyError(req, res, seriesId, 'Your session limit has been reached. Please sign out and take a break before playing again.');
+      const bought = await buyTicket(req.db, req.user.id, seriesId, req.ip);
       res.redirect('/scratch/ticket/' + encodeURIComponent(bought.publicId));
     } catch (e) {
-      // R-117 (scratch half): generic user-facing message; details stay in
-      // the server log instead of echoing driver text to the player.
+      // U-02 (was R-117's generic message): map the engine's throw to
+      // its true reason. buyTicket's own messages (not on sale, sold
+      // out, responsible-play blocks, the outcome-claim race) pass
+      // through verbatim; postLedger's 'Insufficient balance' is
+      // enriched with the amounts; anything unknown states the one
+      // true fact left — buyTicket is transactional, so a throw means
+      // it rolled back and no money was taken. Driver text still never
+      // reaches the player; the real error stays in the server log.
       console.error('scratch buy failed:', e.message);
-      res.status(400).render('error', { status: 400, message: 'Scratch purchase failed. Please try again.' });
+      let msg = null;
+      if (e.message === 'Insufficient balance') {
+        const s = await req.db.get('SELECT * FROM scratch_series WHERE id = ?', [seriesId]);
+        if (s) {
+          const wallets = await getBalances(req.db, req.user.id);
+          const bal = Number((wallets.find(w => w.currency === s.currency) || { balance: 0 }).balance);
+          msg = `Not enough balance: this card costs ${req.fmt(s.price, s.currency)}, but your ${s.currency} wallet has ${req.fmt(bal, s.currency)} — you are ${req.fmt(Number(s.price) - bal, s.currency)} short. Add funds before buying.`;
+        }
+      }
+      if (!msg) {
+        msg = /not on sale|sold out|has ended|self-exclusion|cooling-off|daily loss limit|just claimed/.test(e.message)
+          ? e.message
+          : 'This scratch purchase could not be completed and no money was taken. Please contact support if this keeps happening.';
+      }
+      return renderScratchBuyError(req, res, seriesId, msg);
     }
   });
 
@@ -225,7 +271,7 @@ adminRouter.get('/', async (req, res) => {
         { key: 'launch_at', label: 'Auto-launch at (optional, UTC e.g. 2026-11-01 10:00)', type: 'text' },
         { key: 'ends_at', label: 'Auto-stop at (optional, UTC e.g. 2026-12-01 10:00)', type: 'text' },
       ], { csrf: req.csrfToken, submit: 'Create draft' })) +
-    ui.card('Prize Pool Planner (BP-23)', `<p class="muted">Set a price, an inventory and a target RTP — the planner generates a tier table whose total prize liability matches the target (see the rounding note on the preview). The plan creates a DRAFT: review it, hand-tune tiers via the series page if you like, then launch. Outcomes stay predetermined and committed at launch, exactly as with a hand-built series.</p>` +
+    ui.card('Prize Pool Planner', `<p class="muted">Set a price, an inventory and a target RTP — the planner generates a tier table whose total prize liability matches the target (see the rounding note on the preview). The plan creates a DRAFT: review it, hand-tune tiers via the series page if you like, then launch. Outcomes stay predetermined and committed at launch, exactly as with a hand-built series.</p>` +
       ui.formHtml(base + '/planner/preview', [
         { key: 'title', label: 'Title', type: 'text', required: true },
         { key: 'game_type', label: 'Game type', type: 'select', options: ['single', 'match3', 'six', 'bonus'] },
@@ -234,7 +280,7 @@ adminRouter.get('/', async (req, res) => {
         { key: 'total_tickets', label: 'Total tickets', type: 'number', required: true },
         { key: 'target_rtp', label: 'Target RTP % (e.g. 75)', type: 'text', value: getS(req.settings, 'scratch_planner_target_rtp', '75'), required: true },
       ], { csrf: req.csrfToken, submit: 'Preview plan' }));
-  res.send(ui.layout({ adminPath: req.adminPath, section: '/scratch', title: 'Scratch', body, csrf: req.csrfToken, flash: req.flashData || {}, assetV: req.app.locals.assetV || '1' }));
+  res.send(ui.layout({ adminPath: req.adminPath, section: '/scratch', title: 'Scratch', body, csrf: req.csrfToken, flash: req.flashData || {}, assetV: req.app.locals.assetV || '1', role: (req.user && req.user.admin_role) || 'super' }));
 });
 
 /* BP-23(a): Prize Pool Planner — preview the generated tier table and
@@ -278,7 +324,7 @@ adminRouter.post('/planner/preview', async (req, res) => {
         <div class="mt"><button class="btn btn-p" type="submit">Create draft series with this plan</button>
         <a class="btn" href="${base}">Cancel</a></div>
       </form>`);
-    res.send(ui.layout({ adminPath: req.adminPath, section: '/scratch', title: 'Scratch — prize plan', body, csrf: req.csrfToken, flash: req.flashData || {}, assetV: req.app.locals.assetV || '1' }));
+    res.send(ui.layout({ adminPath: req.adminPath, section: '/scratch', title: 'Scratch — prize plan', body, csrf: req.csrfToken, flash: req.flashData || {}, assetV: req.app.locals.assetV || '1', role: (req.user && req.user.admin_role) || 'super' }));
   } catch (e) {
     res.status(400).render('error', { status: 400, message: e.message });
   }
@@ -318,7 +364,7 @@ adminRouter.post('/planner/create', async (req, res) => {
 adminRouter.get('/:id', async (req, res) => {
   const series = await req.db.get('SELECT * FROM scratch_series WHERE id = ?', [req.params.id]);
   const base = req.adminPath + '/scratch';
-  if (!series) return res.status(404).send(ui.layout({ adminPath: req.adminPath, section: '/scratch', title: 'Scratch', body: ui.card('Not found', '<p class="muted">No such series.</p>'), csrf: req.csrfToken, flash: req.flashData || {}, assetV: req.app.locals.assetV || '1' }));
+  if (!series) return res.status(404).send(ui.layout({ adminPath: req.adminPath, section: '/scratch', title: 'Scratch', body: ui.card('Not found', '<p class="muted">No such series.</p>'), csrf: req.csrfToken, flash: req.flashData || {}, assetV: req.app.locals.assetV || '1', role: (req.user && req.user.admin_role) || 'super' }));
   const tiers = await req.db.query('SELECT amount,quantity,label FROM scratch_prize_tiers WHERE series_id=? ORDER BY amount DESC', [series.id]);
   const breakdown = series.status === 'draft' ? [] : await req.db.query(
     `SELECT o.prize AS amount, COUNT(*) AS total,
@@ -357,7 +403,7 @@ adminRouter.get('/:id', async (req, res) => {
         Number(b.amount) > 0 && Number(b.remaining) === 0 ? '⚠ exhausted' : (Number(b.remaining) === 0 ? 'gone' : 'live')]))) +
     ui.card('Tier plan', ui.table(['Prize', 'Quantity', 'Label'], tiers.map(t => [fmt(t.amount, series.currency), t.quantity, esc(t.label || '')]))) +
     `<p><a class="btn" href="${base}">← Back to series list</a></p>`;
-  res.send(ui.layout({ adminPath: req.adminPath, section: '/scratch', title: 'Scratch — ' + series.title, body, csrf: req.csrfToken, flash: req.flashData || {}, assetV: req.app.locals.assetV || '1' }));
+  res.send(ui.layout({ adminPath: req.adminPath, section: '/scratch', title: 'Scratch — ' + series.title, body, csrf: req.csrfToken, flash: req.flashData || {}, assetV: req.app.locals.assetV || '1', role: (req.user && req.user.admin_role) || 'super' }));
 });
 
 adminRouter.post('/create', async (req, res) => {
@@ -424,7 +470,7 @@ adminRouter.post('/:id/launch', async (req, res) => {
       const cap = engine.launchCapCheck(req.settings, srow, expo.totalLiability);
       if (cap.enforced && !cap.ok) {
         await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'scratch.guardrail_launch_blocked', entity: 'series', entityId: String(srow.id), detail: { liability: cap.liability, cap: cap.cap, capPct: cap.capPct }, ip: req.ip });
-        await req.setFlash('error', `Launch refused by the BP-23 guardrail: prize liability ${cap.liability} exceeds the cap of ${cap.capPct}% of full sales value (${cap.cap}). Lower the tiers or raise the cap in Automation → Scratch guardrails.`);
+        await req.setFlash('error', `Launch refused by the prize guardrail: prize liability ${cap.liability} exceeds the cap of ${cap.capPct}% of full sales value (${cap.cap}). Lower the tiers or raise the cap in Automation → Scratch guardrails.`);
         return res.redirect(req.adminPath + '/scratch');
       }
     }

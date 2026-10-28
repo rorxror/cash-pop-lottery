@@ -6,7 +6,7 @@
 
     <% if (typeof formError !== 'undefined' && formError) { %><div class="flash f-err"><%= formError %></div><% } %>
 
-    <!-- Social (only when admin enabled + configured) -->
+    <% /* Social (only when admin enabled + configured) */ %>
     <% if ((typeof facebookOn !== 'undefined' && facebookOn) || (typeof googleOn !== 'undefined' && googleOn)) { %>
     <div class="social-login">
       <% if (typeof googleOn !== 'undefined' && googleOn) { %>
@@ -19,9 +19,9 @@
     <div class="divider"><span>or sign in with</span></div>
     <% } %>
 
-    <!-- Sign-in method tabs: ONLY when both methods exist. With OTP off
+    <% /* Sign-in method tabs: ONLY when both methods exist. With OTP off
          (the default), a lone "Password" tab is visual noise, so no tabs render
-         and the password form stands alone. -->
+         and the password form stands alone. */ %>
     <% const otpAny = (typeof phoneOtpOn !== 'undefined' && phoneOtpOn) || (typeof emailOtpOn !== 'undefined' && emailOtpOn); %>
     <% if (otpAny) { %>
     <div class="segmented auth-methods" role="tablist">
@@ -30,7 +30,7 @@
     </div>
     <% } %>
 
-    <!-- TOTP SECOND STEP (rendered when totpRequired) -->
+    <% /* TOTP SECOND STEP (rendered when totpRequired) */ %>
     <% if (typeof totpRequired !== 'undefined' && totpRequired) { %>
     <div id="loginTotp">
       <p class="muted center">Enter the 6-digit code from your authenticator app (or a backup code).</p>
@@ -46,7 +46,7 @@
     </div>
     <% } %>
 
-    <!-- PASSWORD SIGN-IN (primary) -->
+    <% /* PASSWORD SIGN-IN (primary) */ %>
     <div id="loginPw"<%= (typeof totpRequired !== 'undefined' && totpRequired) ? ' hidden' : '' %>>
       <form id="pwForm" method="POST" action="/login">
         <input type="hidden" name="_csrf" value="<%= csrf %>">
@@ -58,12 +58,14 @@
           <label for="pwPassword">Password</label>
           <input type="password" id="pwPassword" name="password" placeholder="Your password" autocomplete="current-password" required>
         </div>
+        <%- captchaHtml %>
+        <%- recaptchaHtml %>
         <button type="submit" class="btn btn-p btn-lg btn-block">Sign In →</button>
       </form>
       <p class="muted sm center"><a href="/forgot">Forgot password?</a></p>
     </div>
 
-    <!-- OTP SIGN-IN (secondary, admin toggle only) -->
+    <% /* OTP SIGN-IN (secondary, admin toggle only) */ %>
     <% if (otpAny) { %>
     <div id="loginOtp" hidden data-phone-otp="<%= (typeof phoneOtpOn === 'undefined' || phoneOtpOn) ? 'true' : 'false' %>" data-email-otp="<%= (typeof emailOtpOn === 'undefined' || emailOtpOn) ? 'true' : 'false' %>">
       <div class="segmented auth-otp-types" role="tablist">
@@ -99,7 +101,7 @@
         <button type="button" class="btn btn-p btn-lg btn-block" id="otpVerifyBtn">Verify &amp; Continue</button>
         <p class="muted sm center"><a href="#" id="otpResend">Resend code</a> · <a href="#" id="otpBack">← Change number</a></p>
       </div>
-      <!-- Profile step for FIRST-TIME OTP users (registration details preserved) -->
+      <% /* Profile step for FIRST-TIME OTP users (registration details preserved) */ %>
       <div id="authStepProfile" hidden>
         <h2 style="font-size:22px;font-weight:700;letter-spacing:-0.3px;text-align:center;margin-bottom:4px;">Complete your profile</h2>
         <p class="muted center">Welcome! Just one more step to finish your registration.</p>

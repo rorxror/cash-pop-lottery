@@ -73,9 +73,25 @@ async function verifyProvider(key, ext, req) {
 }
 /* Unified captcha check (v14): every ENABLED provider must verify; when no
    provider is enabled, verification passes (nothing to check). */
+/* SCAN A-09 pattern, shared: absolute links are built from BASE_URL,
+   falling back to the request's own protocol + host — never a bare
+   relative path (D2-C9: OAuth redirect_uri was relative without
+   BASE_URL, which Google/Facebook reject outright). */
+function baseUrl(req) { return process.env.BASE_URL || (req.protocol + '://' + req.get('host')); }
+
 async function verifyCaptcha(req, opts = {}) {
   const capExt = await getExtension(req.db, 'custom_captcha');
-  if (extEnabled(capExt) && !checkCaptcha(req, !!opts.keepCustom)) return false;
+  if (extEnabled(capExt)) {
+    const ok = checkCaptcha(req, !!opts.keepCustom);
+    /* D2-C4 (v20): consumption must be PERSISTED. checkCaptcha nulls the
+       answer in memory only, and loadSession re-reads the row on every
+       request — so one solve used to replay across requests (a second
+       /forgot POST minted a second live reset token on the same answer).
+       Write the null back through the session store: one solve, one use.
+       (keepCustom flows — OTP request — deliberately do not consume.) */
+    if (!opts.keepCustom && req.sess) await touchSession(req.db, req.sess.id, { _captcha: null });
+    if (!ok) return false;
+  }
   for (const key of ['recaptcha', 'hcaptcha', 'turnstile']) {
     const ext = await getExtension(req.db, key);
     // R-042: fail CLOSED when a provider is enabled but has no secret —
@@ -86,6 +102,40 @@ async function verifyCaptcha(req, opts = {}) {
   }
   return true;
 }
+
+/* ---------- U-22: one identity = one account ---------- */
+/* normalizePhone does NOT add a '+' to a bare digit string (lib/util.js),
+   so the same international number can be stored as '1555…' (OTP path,
+   typed without '+') or '+1555…' (form path). phoneVariants returns both
+   spellings so every duplicate lookup sees the same identity. */
+function phoneVariants(norm) {
+  const p = String(norm || '');
+  if (!p) return [];
+  return [...new Set([p, p.startsWith('+') ? p.slice(1) : '+' + p])];
+}
+async function findUserByPhone(db, norm) {
+  const vs = phoneVariants(norm);
+  if (!vs.length) return null;
+  const ph = vs.map(() => '?').join(', ');
+  return db.get(`SELECT * FROM users WHERE phone IN (${ph})`, vs);
+}
+/* Canonical storage for NEW phone identities: the '+' form the register
+   form produces, so a stored row is visible to exact checks and to the
+   v20 unique index. (Bare local numbers without a country code cannot
+   be canonicalized this way by any path — they carry no country code to
+   prefix; every form in the app collects the dial code with the number.) */
+function canonicalPhone(norm) {
+  const p = String(norm || '');
+  if (!p) return '';
+  return p.startsWith('+') ? p : '+' + p;
+}
+/* An OAuth refusal whose TRUE reason is safe (and required) to show the
+   user, unlike internal OAuth errors which stay generic. */
+function oauthFail(message) { const e = new Error(message); e.exposeMessage = message; return e; }
+const OAUTH_UNVERIFIED_EXISTING_MSG = (provider) =>
+  `${provider} did not verify this email address to us, so we cannot sign you in with ${provider} for this account. Sign in with your existing method (your password or the provider you used before), then link ${provider} from inside your account while you are signed in.`;
+const OAUTH_UNVERIFIED_NEW_MSG = (provider) =>
+  `${provider} did not verify this email address to us, so this ${provider} sign-in cannot be used to create an account. Verify the email address with ${provider} and try again, or register with your email and password.`;
 
 async function recordLogin(req, userId, email, success) {
   const { browser, os } = parseUA(req.headers['user-agent']);
@@ -232,7 +282,13 @@ router.post('/login', loginLimiter, async (req, res) => {
         captchaHtml: '', recaptchaHtml: '', googleOn: false,
       });
     }
-    await touchSession(req.db, sess.id, { pending_user_id: u.id, pre_auth: true });
+    /* D2-C1 (v20): the stash CHANGES the session's kind (anon -> pre-auth),
+       so its expiry must become the 15-minute PREAUTH_TTL — touchSession
+       alone deliberately never moves expires_at (R-121), which left the
+       anon session's 1-hour TTL on a pending-TOTP session. The cookie
+       maxAge is re-issued at the same 15 minutes so browser and DB agree. */
+    await touchSession(req.db, sess.id, { pending_user_id: u.id, pre_auth: true }, { ttlMs: PREAUTH_TTL });
+    res.cookie('sid', sess.id, { httpOnly: true, sameSite: 'lax', secure: req.secure || getBool(req.settings, 'force_ssl', false), maxAge: PREAUTH_TTL });
     return res.render('login', {
       metaTitle: 'Two-Factor', metaDesc: '', totpRequired: true, emailPrefill: email,
       captchaHtml: '', recaptchaHtml: '', googleOn: false,
@@ -320,7 +376,7 @@ router.post('/register', rateLimit({ windowMs: 3600000, max: 20, keyFn: r => 're
     googleOn: getBool(req.settings, 'google_oauth_enabled', false) && !!process.env.GOOGLE_CLIENT_ID,
     facebookOn: getBool(req.settings, 'facebook_oauth_enabled', false) && !!process.env.FACEBOOK_APP_ID,
   });
-  if (!getBool(req.settings, 'registration_enabled', true)) return res.status(403).render('error', { status: 403, message: 'Registration is currently disabled.' });
+  if (!getBool(req.settings, 'registration_enabled', true)) return res.status(403).render('error', { status: 403, message: 'Registration is currently closed.' });
   if (!(await verifyCaptcha(req))) return render('Captcha verification failed.');
 
   /* SCAN fix (B-08): qs parsing turns name[x]=1 into an object — coerce
@@ -362,10 +418,12 @@ router.post('/register', rateLimit({ windowMs: 3600000, max: 20, keyFn: r => 're
   // failed (duplicate) registration no longer burns a single-use code.
   const emailLc = normalizeEmail(email);
   const ex = await req.db.get('SELECT id FROM users WHERE email = ?', [emailLc]);
-  if (ex) return render('An account with this email already exists.');
+  if (ex) return render('An account with this email already exists. Please sign in instead.');
   if (phone) {
-    const exPhone = await req.db.get('SELECT id FROM users WHERE phone = ?', [phone]);
-    if (exPhone) return render('An account with this phone number already exists.');
+    // U-22: variant-aware — a bare-digit row stored by the OTP path is
+    // the same identity as this '+' form (and vice versa).
+    const exPhone = await findUserByPhone(req.db, phone);
+    if (exPhone) return render('An account with this phone number already exists. Please sign in instead.');
   }
   if (getBool(req.settings, 'otp_registration', false)) {
     if (!otp_code || !(await consumeOtpCode(req.db, otp_code))) return render('Invalid or expired signup code. Ask support for a valid code.');
@@ -378,9 +436,23 @@ router.post('/register', rateLimit({ windowMs: 3600000, max: 20, keyFn: r => 're
     const ref = await req.db.get('SELECT id FROM users WHERE referral_code = ?', [refCode]);
     if (ref) referredBy = ref.id;
   }
-  const r = await req.db.run(
-    'INSERT INTO users (email, phone, name, password_hash, role, status, referred_by, terms_accepted_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-    [emailLc, phone, name.trim(), hashPassword(password), 'player', 'active', referredBy, agree ? now() : null, now()]);
+  // U-22: the INSERT itself is guarded — if a parallel registration (or
+  // the v20 unique indexes) wins the race, the loser gets the true
+  // duplicate reason, never a 500 and never a second row.
+  let r;
+  try {
+    r = await req.db.run(
+      'INSERT INTO users (email, phone, name, password_hash, role, status, referred_by, terms_accepted_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [emailLc, phone, name.trim(), hashPassword(password), 'player', 'active', referredBy, agree ? now() : null, now()]);
+  } catch (e) {
+    if (/unique|duplicate/i.test(String(e && e.message || ''))) {
+      const dupEmail = await req.db.get('SELECT id FROM users WHERE email = ?', [emailLc]);
+      if (dupEmail) return render('An account with this email already exists. Please sign in instead.');
+      if (phone && await findUserByPhone(req.db, phone)) return render('An account with this phone number already exists. Please sign in instead.');
+      return render('An account with this email or phone number already exists. Please sign in instead.');
+    }
+    throw e;
+  }
   // Referral code for the new player (used in their invite link)
   await req.db.run('UPDATE users SET referral_code = ? WHERE id = ?', ['CP' + r.id.toString(36).toUpperCase(), r.id]);
   const u = await req.db.get('SELECT * FROM users WHERE id = ?', [r.id]);
@@ -414,7 +486,7 @@ router.post('/forgot', rateLimit({ windowMs: 3600000, max: 10, keyFn: r => 'forg
     /* SCAN fix (A-09): same host fallback as the verify-email flow —
        without BASE_URL the old link was a bare relative path and the
        reset email was unusable. */
-    const link = (process.env.BASE_URL || (req.protocol + '://' + req.get('host'))) + '/reset/' + token;
+    const link = baseUrl(req) + '/reset/' + token;
     await notify.send(req.db, req.settings, 'email', 'password_reset', email, { name: u.name, link }).catch(() => {});
   }
   res.render('forgot', { metaTitle: 'Reset Password', metaDesc: '', sent: true });
@@ -422,6 +494,12 @@ router.post('/forgot', rateLimit({ windowMs: 3600000, max: 10, keyFn: r => 'forg
 router.get('/reset/:token', async (req, res) => {
   const pr = await req.db.get('SELECT * FROM password_resets WHERE token_hash = ? AND used = 0 AND expires_at > ?', [sha256('reset:' + req.params.token), now()]);
   if (!pr) return res.status(400).render('error', { status: 400, message: 'This reset link is invalid or expired.' });
+  /* D2-C7 (v20): the genuine emailed-link flow must arrive at the POST
+     WITH a session + CSRF token — the POST now refuses session-less
+     requests like every other auth POST (server.js). Create the anon
+     session here, exactly as GET /login, /register and /forgot do, so
+     the rendered form's hidden _csrf field carries a real token. */
+  await anonSession(req, res);
   res.render('reset', { metaTitle: 'Set New Password', metaDesc: '', token: req.params.token });
 });
 router.post('/reset/:token', loginLimiter, async (req, res) => { // R-091: reset POST was rate-limit-free
@@ -495,7 +573,7 @@ router.post('/login/otp/request', loginLimiter, async (req, res) => {
   // phones/emails at operator cost.
   if (!getBool(req.settings, 'registration_enabled', true)) {
     const acct = idType === 'phone'
-      ? await req.db.get('SELECT id FROM users WHERE phone = ? OR phone = ?', [identifier, identifier.startsWith('+') ? identifier.slice(1) : '+' + identifier])
+      ? await findUserByPhone(req.db, identifier)
       : await req.db.get('SELECT id FROM users WHERE email = ?', [identifier]);
     if (!acct) return res.status(400).json({ ok: false, error: 'Could not send the code.' });
   }
@@ -524,8 +602,7 @@ router.post('/login/otp/verify', loginLimiter, async (req, res) => {
   // so a form-registered +1555... account is found by a bare 1555... OTP login.
   let u = null;
   if (idType === 'phone') {
-    const alt = identifier.startsWith('+') ? identifier.slice(1) : '+' + identifier;
-    u = await req.db.get('SELECT * FROM users WHERE phone = ? OR phone = ?', [identifier, alt]);
+    u = await findUserByPhone(req.db, identifier);
   } else {
     u = await req.db.get('SELECT * FROM users WHERE email = ?', [identifier]);
   }
@@ -538,9 +615,26 @@ router.post('/login/otp/verify', loginLimiter, async (req, res) => {
     // phone-derived placeholder instead (unique by construction: the phone itself
     // was just proven unused). Real email can be added to the profile later.
     const otpEmail = idType === 'email' ? identifier : 'phone' + identifier.replace(/\D/g, '') + '@phone.local';
-    const r = await req.db.run(
-      'INSERT INTO users (email, phone, name, password_hash, role, status, profile_completed, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      [otpEmail, idType === 'phone' ? identifier : '', identifier.split('@')[0], '', 'player', 'active', 0, now()]);
+    // U-22: store the phone in the canonical '+' form. The old code stored
+    // the bare digit form when the user typed no '+', and that row was
+    // invisible to the form/agent exact phone checks — the same number
+    // could then register a second account through the form.
+    const storedPhone = idType === 'phone' ? canonicalPhone(identifier) : '';
+    let r;
+    try {
+      r = await req.db.run(
+        'INSERT INTO users (email, phone, name, password_hash, role, status, profile_completed, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        [otpEmail, storedPhone, identifier.split('@')[0], '', 'player', 'active', 0, now()]);
+    } catch (e) {
+      if (/unique|duplicate/i.test(String(e && e.message || ''))) {
+        // A parallel creation won the race (or the v20 index fired):
+        // refuse with the true reason — never a twin, never a 500.
+        const dupPhone = idType === 'phone' ? await findUserByPhone(req.db, identifier) : null;
+        if (dupPhone) return res.status(409).json({ ok: false, error: 'An account with this phone number already exists. Please sign in instead.' });
+        return res.status(409).json({ ok: false, error: 'An account with this email already exists. Please sign in instead.' });
+      }
+      throw e;
+    }
     u = await req.db.get('SELECT * FROM users WHERE id = ?', [r.id]);
     await audit.log(req.db, { actorId: u.id, actorRole: 'player', action: 'user.register_otp', entity: 'user', entityId: u.id, detail: { idType }, ip: req.ip });
     isNew = true;
@@ -624,13 +718,16 @@ router.get('/auth/facebook', async (req, res) => {
   const id = process.env.FACEBOOK_APP_ID;
   if (!getBool(req.settings, 'facebook_oauth_enabled', false) || !id)
     return res.status(503).render('error', { status: 503, message: 'Facebook sign-in is unavailable right now. Please try again later.' });
-  const redirect = encodeURIComponent((process.env.BASE_URL || '') + '/auth/facebook/callback');
+  const redirect = encodeURIComponent(baseUrl(req) + '/auth/facebook/callback'); // D2-C9: host fallback, never relative
   const state = randHex(12);
   // v16: ALWAYS store the state, even for logged-out visitors. The old code
   // only stored it when a session already existed, so an anonymous start
   // left the callback check skipped entirely (OAuth CSRF / login-CSRF).
   if (!req.sess) await anonSession(req, res);
-  await require('../lib/auth').touchSession(req.db, req.sess.id, { oauth_state: state });
+  // U-22: a fully signed-in user starting OAuth is LINKING the provider
+  // to their account (the in-account linking entry point) — remember
+  // whose account the callback must link to, never switch accounts.
+  await require('../lib/auth').touchSession(req.db, req.sess.id, { oauth_state: state, oauth_link_user_id: req.user ? req.user.id : null });
   res.redirect(`https://www.facebook.com/v18.0/dialog/oauth?client_id=${id}&redirect_uri=${redirect}&state=${state}&scope=email,public_profile`);
 });
 router.get('/auth/facebook/callback', async (req, res) => {
@@ -640,24 +737,45 @@ router.get('/auth/facebook/callback', async (req, res) => {
     // v16: STRICT state check — a missing stored state now FAILS instead of
     // skipping validation, and the state is single-use (cleared after check).
     if (!req.sessionData.oauth_state || req.query.state !== req.sessionData.oauth_state) throw new Error('bad state');
-    if (req.sess) await require('../lib/auth').touchSession(req.db, req.sess.id, { oauth_state: null });
-    const redirect = (process.env.BASE_URL || '') + '/auth/facebook/callback';
+    // U-22: capture linking intent BEFORE the single-use state is cleared.
+    const linkUserId = (req.user && req.user.id) || req.sessionData.oauth_link_user_id || null;
+    if (req.sess) await require('../lib/auth').touchSession(req.db, req.sess.id, { oauth_state: null, oauth_link_user_id: null });
+    const redirect = baseUrl(req) + '/auth/facebook/callback'; // D2-C9: host fallback, never relative
     const tok = await fetch(`https://graph.facebook.com/v18.0/oauth/access_token?client_id=${id}&client_secret=${secret}&redirect_uri=${encodeURIComponent(redirect)}&code=${req.query.code}`, { signal: AbortSignal.timeout(8000) }); // DS-015: provider calls need a deadline
     const tj = await tok.json();
     if (!tj.access_token) throw new Error('token exchange failed');
     const me = await fetch(`https://graph.facebook.com/me?fields=id,name,email&access_token=${tj.access_token}`, { signal: AbortSignal.timeout(8000) }); // DS-015
     const profile = await me.json();
     if (!profile.id) throw new Error('no profile from Facebook');
-    // R-096: refuse no-email Facebook signups instead of inserting '' (the
-    // second such user used to crash on the UNIQUE email column).
-    if (!profile.email) throw new Error('Facebook account has no email address on file');
-    let u = await req.db.get('SELECT * FROM users WHERE facebook_id = ?', [profile.id]);
-    if (!u && profile.email) u = await req.db.get('SELECT * FROM users WHERE email = ?', [String(profile.email).toLowerCase()]);
-    if (!u) {
+    const providerId = String(profile.id);
+    const emailLc = profile.email ? normalizeEmail(profile.email) : '';
+    /* U-22 identity resolution. Facebook's /me response carries NO
+       email-verification field, so an email-only match is an UNVERIFIED
+       claim and must never merge (the old code signed the claimant into
+       the existing account and linked their facebook_id to it). Trusted
+       matches, in order: (1) a signed-in user's linking intent, (2) an
+       already-recorded facebook_id. Email alone only CREATES a new
+       account when it matches nobody. */
+    let u = await req.db.get('SELECT * FROM users WHERE facebook_id = ?', [providerId]);
+    const emailUser = emailLc ? await req.db.get('SELECT * FROM users WHERE email = ?', [emailLc]) : null;
+    let linking = false;
+    if (linkUserId) {
+      const linkUser = await req.db.get('SELECT * FROM users WHERE id = ?', [linkUserId]);
+      if (!linkUser) throw oauthFail('Your signed-in session has expired. Sign in again, then link Facebook from inside your account.');
+      if (u && u.id !== linkUser.id) throw oauthFail('This Facebook account is already linked to a different account, so it cannot be linked to this one.');
+      if (emailUser && emailUser.id !== linkUser.id) throw oauthFail('The email address on this Facebook account belongs to a different account, so it cannot be linked to this one. Sign in to that account if it is yours.');
+      if (linkUser.facebook_id && linkUser.facebook_id !== providerId) throw oauthFail('A different Facebook account is already linked to this account.');
+      u = linkUser; linking = true;
+    } else if (!u && emailUser) {
+      throw oauthFail(OAUTH_UNVERIFIED_EXISTING_MSG('Facebook'));
+    } else if (!u) {
+      // R-096: refuse no-email Facebook signups instead of inserting '' (the
+      // second such user used to crash on the UNIQUE email column).
+      if (!emailLc) throw new Error('Facebook account has no email address on file');
       if (!getBool(req.settings, 'registration_enabled', true)) throw new Error('registration disabled');
       const r = await req.db.run(
         'INSERT INTO users (email, phone, name, password_hash, role, status, facebook_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        [profile.email ? String(profile.email).toLowerCase() : '', '', String(profile.name || 'Facebook User'), '', 'player', 'active', profile.id, now()]);
+        [emailLc, '', String(profile.name || 'Facebook User'), '', 'player', 'active', providerId, now()]);
       u = await req.db.get('SELECT * FROM users WHERE id = ?', [r.id]);
       await audit.log(req.db, { actorId: u.id, actorRole: 'player', action: 'user.register_oauth', entity: 'user', entityId: u.id, detail: { provider: 'facebook' }, ip: req.ip });
     }
@@ -665,22 +783,27 @@ router.get('/auth/facebook/callback', async (req, res) => {
     // Facebook callback previously checked neither).
     const { oauthAccountCheck, touchSession } = require('../lib/auth');
     const chk = oauthAccountCheck(u);
-    if (!chk.ok) { await recordLogin(req, u.id, u.email || profile.id, false); throw new Error(chk.error); }
+    if (!chk.ok) { await recordLogin(req, u.id, u.email || providerId, false); throw new Error(chk.error); }
     if (!u.facebook_id) {
-      await req.db.run('UPDATE users SET facebook_id = ? WHERE id = ?', [profile.id, u.id]);
+      await req.db.run('UPDATE users SET facebook_id = ? WHERE id = ?', [providerId, u.id]);
+      u.facebook_id = providerId;
+      if (linking) await audit.log(req.db, { actorId: u.id, actorRole: 'player', action: 'user.oauth_linked', entity: 'user', entityId: u.id, detail: { provider: 'facebook' }, ip: req.ip });
     }
-    if (chk.totpRequired) {
+    if (chk.totpRequired && !linking) {
       if (!req.sess) await anonSession(req, res);
-      await touchSession(req.db, req.sess.id, { pending_user_id: u.id, pre_auth: true });
+      // D2-C1 (v20): OAuth pre-auth stash — same TTL rule as password login.
+      await touchSession(req.db, req.sess.id, { pending_user_id: u.id, pre_auth: true }, { ttlMs: PREAUTH_TTL });
+      res.cookie('sid', req.sess.id, { httpOnly: true, sameSite: 'lax', secure: req.secure || getBool(req.settings, 'force_ssl', false), maxAge: PREAUTH_TTL });
       return res.render('login', {
         metaTitle: 'Two-Factor', metaDesc: '', totpRequired: true, emailPrefill: u.email || '',
         captchaHtml: '', recaptchaHtml: '', googleOn: false,
       });
     }
-    await recordLogin(req, u.id, u.email || profile.id, true);
-    return finishLogin(req, res, u, 'Welcome back!');
+    await recordLogin(req, u.id, u.email || providerId, true);
+    return finishLogin(req, res, u, linking ? 'Facebook is now linked to your account.' : 'Welcome back!');
   } catch (e) {
     console.error('[oauth] Facebook callback failed:', e.message);
+    if (e.exposeMessage) return res.status(400).render('error', { status: 400, message: e.exposeMessage });
     return res.status(400).render('error', { status: 400, message: 'Facebook sign-in failed. Please try again.' });
   }
 });
@@ -690,11 +813,12 @@ router.get('/auth/google', async (req, res) => {
   const id = process.env.GOOGLE_CLIENT_ID;
   if (!getBool(req.settings, 'google_oauth_enabled', false) || !id)
     return res.status(503).render('error', { status: 503, message: 'Google sign-in is unavailable right now. Please try again later.' });
-  const redirect = encodeURIComponent((process.env.BASE_URL || '') + '/auth/google/callback');
+  const redirect = encodeURIComponent(baseUrl(req) + '/auth/google/callback'); // D2-C9: host fallback, never relative
   const state = randHex(12);
   // v16: same anonymous-start fix as Facebook (see above).
   if (!req.sess) await anonSession(req, res);
-  await require('../lib/auth').touchSession(req.db, req.sess.id, { oauth_state: state });
+  // U-22: linking intent, same as the Facebook start route above.
+  await require('../lib/auth').touchSession(req.db, req.sess.id, { oauth_state: state, oauth_link_user_id: req.user ? req.user.id : null });
   res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?client_id=${id}&redirect_uri=${redirect}&response_type=code&scope=openid%20email%20profile&state=${state}`);
 });
 router.get('/auth/google/callback', async (req, res) => {
@@ -703,8 +827,10 @@ router.get('/auth/google/callback', async (req, res) => {
     if (!id || !secret) throw new Error('not configured');
     // v16: STRICT single-use state check (see Facebook callback).
     if (!req.sessionData.oauth_state || req.query.state !== req.sessionData.oauth_state) throw new Error('bad state');
-    if (req.sess) await require('../lib/auth').touchSession(req.db, req.sess.id, { oauth_state: null });
-    const redirect = (process.env.BASE_URL || '') + '/auth/google/callback';
+    // U-22: capture linking intent BEFORE the single-use state is cleared.
+    const linkUserId = (req.user && req.user.id) || req.sessionData.oauth_link_user_id || null;
+    if (req.sess) await require('../lib/auth').touchSession(req.db, req.sess.id, { oauth_state: null, oauth_link_user_id: null });
+    const redirect = baseUrl(req) + '/auth/google/callback'; // D2-C9: host fallback, never relative
     const tok = await fetch('https://oauth2.googleapis.com/token', {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, signal: AbortSignal.timeout(8000), // DS-015: provider calls need a deadline
       body: new URLSearchParams({ code: req.query.code, client_id: id, client_secret: secret, redirect_uri: redirect, grant_type: 'authorization_code' }).toString(),
@@ -713,17 +839,39 @@ router.get('/auth/google/callback', async (req, res) => {
     if (!tj.access_token) throw new Error('token exchange failed');
     const me = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', { headers: { Authorization: 'Bearer ' + tj.access_token }, signal: AbortSignal.timeout(8000) }); // DS-015
     const profile = await me.json();
-    if (!profile.email) throw new Error('no email from Google');
-    // v16: Google tells us whether it verified this email — refuse an
-    // explicitly unverified one instead of trusting any returned address.
-    if ('verified_email' in profile && !profile.verified_email) throw new Error('email not verified by Google');
-    const emailLc = String(profile.email).toLowerCase();
-    let u = await req.db.get('SELECT * FROM users WHERE email = ?', [emailLc]);
-    if (!u) {
+    const providerId = String(profile.id || profile.sub || '');
+    const emailLc = profile.email ? normalizeEmail(profile.email) : '';
+    /* U-22: only a STRICTLY verified email may identify an existing
+       account. v16 refused an explicitly unverified one but silently
+       trusted the email when the verified_email field was absent —
+       absent now means unverified too. Trusted matches, in order:
+       (1) a signed-in user's linking intent, (2) an already-recorded
+       google_id, (3) a provider-verified email match. */
+    const emailVerified = profile.verified_email === true;
+    let u = providerId ? await req.db.get('SELECT * FROM users WHERE google_id = ?', [providerId]) : null;
+    const emailUser = emailLc ? await req.db.get('SELECT * FROM users WHERE email = ?', [emailLc]) : null;
+    let linking = false;
+    if (linkUserId) {
+      if (!providerId) throw new Error('no profile id from Google');
+      const linkUser = await req.db.get('SELECT * FROM users WHERE id = ?', [linkUserId]);
+      if (!linkUser) throw oauthFail('Your signed-in session has expired. Sign in again, then link Google from inside your account.');
+      if (u && u.id !== linkUser.id) throw oauthFail('This Google account is already linked to a different account, so it cannot be linked to this one.');
+      if (emailUser && emailUser.id !== linkUser.id) throw oauthFail('The email address on this Google account belongs to a different account, so it cannot be linked to this one. Sign in to that account if it is yours.');
+      if (providerId && linkUser.google_id && linkUser.google_id !== providerId) throw oauthFail('A different Google account is already linked to this account.');
+      u = linkUser; linking = true;
+    } else if (!u && emailUser) {
+      if (!emailVerified) throw oauthFail(OAUTH_UNVERIFIED_EXISTING_MSG('Google'));
+      u = emailUser;
+    } else if (!u) {
+      if (!emailLc) throw new Error('no email from Google');
+      if (!emailVerified) throw oauthFail(OAUTH_UNVERIFIED_NEW_MSG('Google'));
       if (!getBool(req.settings, 'registration_enabled', true)) throw new Error('registration disabled');
+      // U-22: the provider link (google_id) is recorded from birth —
+      // the old INSERT never wrote it, so no Google account was ever
+      // actually linked and a changed Google email would twin.
       const r = await req.db.run(
-        'INSERT INTO users (email, phone, name, password_hash, role, status, email_verified, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        [emailLc, '', String(profile.name || emailLc.split('@')[0]), '', 'player', 'active', 1, now()]);
+        'INSERT INTO users (email, phone, name, password_hash, role, status, email_verified, google_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [emailLc, '', String(profile.name || emailLc.split('@')[0]), '', 'player', 'active', 1, providerId, now()]);
       u = await req.db.get('SELECT * FROM users WHERE id = ?', [r.id]);
       await audit.log(req.db, { actorId: u.id, actorRole: 'player', action: 'user.register_oauth', entity: 'user', entityId: u.id, detail: { provider: 'google' }, ip: req.ip });
     }
@@ -733,26 +881,37 @@ router.get('/auth/google/callback', async (req, res) => {
     const { oauthAccountCheck, touchSession } = require('../lib/auth');
     const chk = oauthAccountCheck(u);
     if (!chk.ok) { await recordLogin(req, u.id, emailLc, false); throw new Error(chk.error); }
-    if (!u.email_verified) {
+    // U-22: record the provider link on an existing account (the column
+    // existed since v1 but was never written for Google).
+    if (providerId && !u.google_id) {
+      await req.db.run('UPDATE users SET google_id = ? WHERE id = ?', [providerId, u.id]);
+      u.google_id = providerId;
+      if (linking) await audit.log(req.db, { actorId: u.id, actorRole: 'player', action: 'user.oauth_linked', entity: 'user', entityId: u.id, detail: { provider: 'google' }, ip: req.ip });
+    }
+    if (!u.email_verified && emailVerified && emailLc && u.email === emailLc) {
       // v16: an existing password-registered user who signs in via Google has
       // just proven ownership of this email — mark it verified so the
       // verified-contact gate (deposits/withdrawals) stops blocking them.
       // Previously they stayed unverified forever despite Google's proof.
+      // U-22: only on Google's actual verification of THIS address.
       await req.db.run('UPDATE users SET email_verified = 1 WHERE id = ?', [u.id]);
       u.email_verified = 1;
     }
-    if (chk.totpRequired) {
+    if (chk.totpRequired && !linking) {
       if (!req.sess) await anonSession(req, res);
-      await touchSession(req.db, req.sess.id, { pending_user_id: u.id, pre_auth: true });
+      // D2-C1 (v20): OAuth pre-auth stash — same TTL rule as password login.
+      await touchSession(req.db, req.sess.id, { pending_user_id: u.id, pre_auth: true }, { ttlMs: PREAUTH_TTL });
+      res.cookie('sid', req.sess.id, { httpOnly: true, sameSite: 'lax', secure: req.secure || getBool(req.settings, 'force_ssl', false), maxAge: PREAUTH_TTL });
       return res.render('login', {
         metaTitle: 'Two-Factor', metaDesc: '', totpRequired: true, emailPrefill: emailLc,
         captchaHtml: '', recaptchaHtml: '', googleOn: false,
       });
     }
     await recordLogin(req, u.id, emailLc, true);
-    return finishLogin(req, res, u);
+    return finishLogin(req, res, u, linking ? 'Google is now linked to your account.' : undefined);
   } catch (e) {
     console.error('[oauth] Google callback failed:', e.message);
+    if (e.exposeMessage) return res.status(400).render('error', { status: 400, message: e.exposeMessage });
     return res.status(400).render('error', { status: 400, message: 'Google sign-in failed. Please try again.' });
   }
 });

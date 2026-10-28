@@ -6,11 +6,11 @@
 const express = require('express');
 const router = express.Router();
 const QRCode = require('qrcode');
-const { now, randHex, sha256, hashPassword, validEmail, toMinor, esc, fromMinor, fmtMoney, decimalsFor } = require('../lib/util');
+const { now, randHex, sha256, hashPassword, validEmail, toMinor, esc, fromMinor, fmtMoney, decimalsFor, validSlug } = require('../lib/util');
 const { getS, getBool, setSetting, getCurrencies, getSettings, keyCol } = require('../lib/settings');
 const { requireLogin, requireRole, createSession, destroySession, destroyUserSessions, verifyTotp, rateLimit } = require('../lib/auth');
 const { decideDeposit, decideWithdrawal, getBalances, postLedger, markWithdrawalPaid, settleAgentCommissions, releaseReferralCredits, decodeUserData } = require('../lib/money');
-const { RAILS, getRail, isBlockedRail } = require('../lib/rails');
+const { RAILS, getRail, isBlockedRail, validateRailCredentials } = require('../lib/rails');
 const { getExtensions, setExtension, EXTENSION_FIELDS } = require('../lib/extensions');
 const { ensureUpcomingDraws, createTestDraw, settleDraw, cancelDraw, publicDrawInfo } = require('../lib/draws');
 const { runNow } = require('../lib/cron');
@@ -68,12 +68,16 @@ function dateRange(req) {
   let to = req.query.to ? new Date(req.query.to + 'T23:59:59').getTime() : now();
   let from = req.query.from ? new Date(req.query.from + 'T00:00:00').getTime() : to - 30 * 86400000;
   let error = null, capped = false;
-  if (Number.isNaN(to) || Number.isNaN(from)) error = 'Invalid date range.';
+  /* U-20.1: an invalid date used to flow NaN into fmtDateInput() when the
+     handler rendered its own error state — RangeError -> 500, so the
+     "Invalid date range" branch was unreachable. Substitute a safe
+     default range for rendering; the error message still shows. */
+  if (Number.isNaN(to) || Number.isNaN(from)) { error = 'Invalid date range.'; to = now(); from = to - 30 * 86400000; }
   else if (from > to) error = 'Start date must be before end date.';
   else if (to - from > 366 * 86400000) { from = to - 366 * 86400000; capped = true; }
   return { from, to, error, capped };
 }
-function fmtDateInput(ms) { return new Date(ms).toISOString().slice(0, 10); }
+function fmtDateInput(ms) { const d = new Date(ms); return Number.isNaN(d.getTime()) ? '' : d.toISOString().slice(0, 10); }
 function d(ms) { return ms ? new Date(ms).toLocaleString() : '—'; }
 function money(req, minor, cur) { return req.fmt(minor, cur); }
 /* R-055: corrupt JSON in one row must never crash a whole admin page (the
@@ -128,8 +132,12 @@ async function notifyDrawCancelled(db, settings, drawId) {
 async function csrf(req) { return req.csrfToken; }
 
 function shell(req, section, title, body) {
-  return ui.layout({ adminPath: adminPath(req), section, title, body, csrf: req.csrfToken, flash: req.flashData || {}, assetV: req.app.locals.assetV || '1' });
+  /* U-26: the sidebar is grouped and filtered by staff role (see
+     lib/admin-ui.js NAV_GROUPS). Rendering only — rbac.js is untouched. */
+  const role = (req.user && (req.user.admin_role || 'super')) || 'super';
+  return ui.layout({ adminPath: adminPath(req), section, title, body, csrf: req.csrfToken, flash: req.flashData || {}, assetV: req.app.locals.assetV || '1', role });
 }
+const isSuperReq = (req) => ((req.user && (req.user.admin_role || 'super')) || 'super') === 'super';
 const notFound = (req, res, msg) => res.status(404).send(shell(req, '', 'Not found', `<div class="alert a-err">${esc(msg)}</div>`));
 
 /* ============================================================
@@ -142,7 +150,7 @@ router.get('/', async (req, res) => {
   const winsToday = await req.db.get("SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE type IN ('win','scratch_prize') AND created_at > ?", [day]);
   const pendDep = await req.db.get("SELECT COUNT(*) AS c FROM deposits WHERE status = 'pending'");
   const pendWd = await req.db.get("SELECT COUNT(*) AS c FROM withdrawals WHERE status = 'pending'");
-  const openSup = await req.db.get("SELECT COUNT(*) AS c FROM support_tickets WHERE status = 'open'");
+  const openSup = await req.db.get("SELECT COUNT(*) AS c FROM support_tickets WHERE status = 'open' AND deleted_at IS NULL");
   const pendAppr = await req.db.get("SELECT COUNT(*) AS c FROM pending_approvals WHERE status = 'open'");
   const openFlags = await req.db.get('SELECT COUNT(*) AS c FROM account_flags WHERE reviewed_at IS NULL');
   const lastRecon = await req.db.get('SELECT * FROM reconciliation_reports ORDER BY checked_at DESC LIMIT 1');
@@ -225,8 +233,27 @@ router.get('/', async (req, res) => {
   const reconBanner = lastRecon && lastRecon.mismatch_count > 0
     ? `<div class="alert a-err">Ledger reconciliation found ${lastRecon.mismatch_count} mismatch(es) on ${d(lastRecon.checked_at)} — see <a href="${R(req, '/reconciliation')}">Reconciliation</a>.</div>`
     : '';
+  /* U-26 TWO DOORS (§5.3): the incident switches (maintenance mode +
+     the deposit/withdrawal gates) also live here, where an operator
+     lands during an incident. The form posts to the SAME
+     /settings/toggles route and carries every other toggle as a
+     hidden input at its current value, because that handler rewrites
+     the whole toggle set — a partial form would switch siblings off.
+     Super-only: /settings/* POSTs are super-only in lib/rbac.js, so
+     other roles never see a control that would refuse them. */
+  const DOOR_TOGGLES = ['maintenance_mode', 'deposits_enabled', 'withdrawals_enabled'];
+  const siteStatusCard = !isSuperReq(req) ? '' : ui.card('Site status — incident switches',
+    `<p class="muted">These are the same switches as Settings → System configuration — one set of switches, two doors. Saving here changes them there too.</p>
+     <form method="POST" action="${R(req, '/settings/toggles')}" class="adm-form"><input type="hidden" name="_csrf" value="${req.csrfToken}">
+     ${TOGGLES.filter(([k]) => !DOOR_TOGGLES.includes(k) && getS(req.settings, k, '0') === '1').map(([k]) => `<input type="hidden" name="${esc(k)}" value="1">`).join('')}
+     ${[['maintenance_mode', 'Maintenance mode', 'Block the player site with a maintenance page (admin panel + admin login still work).'],
+        ['deposits_enabled', 'Deposits (global)', 'Master kill switch for deposits.'],
+        ['withdrawals_enabled', 'Withdrawals (global)', 'Master kill switch for withdrawals.']]
+       .map(([k, label, help]) => `<div class="field"><label class="check"><input type="checkbox" name="${esc(k)}" value="1" ${getS(req.settings, k, '0') === '1' ? 'checked' : ''}> ${esc(label)}</label><small class="muted">${esc(help)}</small></div>`).join('')}
+     <div class="mt"><button class="btn btn-p" type="submit">Save site status</button></div></form>`);
   const body = `
     ${reconBanner}
+    ${siteStatusCard}
     ${ui.kpis([
       { n: money(req, soldAll.s, getS(req.settings, 'base_currency', 'USD')), l: 'Sold amount (all time)', href: R(req, '/reports?type=business') },
       { n: money(req, prizeAll.s, getS(req.settings, 'base_currency', 'USD')), l: 'Given prize (all time)', href: R(req, '/reports?type=business') },
@@ -282,7 +309,8 @@ router.get('/draws', async (req, res) => {
   };
   const body = `
     ${pendingCard}
-    ${ui.card('Upcoming draws', ui.table(['ID', 'Type', 'Date', 'Closes', 'Status', 'Seed hash', 'Winning #', 'Exposure (BP-23)', ''],
+    ${isSuperReq(req) ? `<p class="muted">Wager options, draw times and the prize table are set in <a href="${R(req, '/settings')}">Settings → Game economy</a>.</p>` : ''}
+    ${ui.card('Upcoming draws', ui.table(['ID', 'Type', 'Date', 'Closes', 'Status', 'Seed hash', 'Winning #', 'Exposure', ''],
       upcoming.map(dr => [
         `<a href="${R(req, '/draws/' + dr.id)}">#${dr.id}</a>`, dr.draw_type + (dr.is_test ? ' ' + ui.badge('TEST', 'warn') : ''), esc(dr.draw_date), d(dr.close_at),
         ui.statusBadge(dr.status), `<span class="code">${esc(String(dr.seed_hash).slice(0, 16))}…</span>`, dr.winning_number || '—',
@@ -529,7 +557,7 @@ router.get('/automation', async (req, res) => {
          <div class="field"><label class="check"><input type="checkbox" name="scratch_auto_next_enabled" value="1" ${getBool(S, 'scratch_auto_next_enabled', false) ? 'checked' : ''}> Auto-create next series</label></div>
          <div class="field"><label>Template series</label><select name="scratch_template_series_id"><option value="">— none —</option>${series.map((x) => `<option value="${x.id}" ${String(x.id) === getS(S, 'scratch_template_series_id', '') ? 'selected' : ''}>${esc(x.title)} (#${x.id}, ${esc(x.status)})</option>`).join('')}</select></div>
        </div>
-       <h4 class="mt">Smart Prize &amp; Profit Engine (BP-23)</h4>
+       <h4 class="mt">Smart Prize &amp; Profit Engine</h4>
        <p class="muted">Aggregate-level controls only — pools, RTP targets and exposure. Outcomes stay predetermined/committed (scratch) and beacon-derived (pop); nothing here can change a sold ticket or a single result.</p>
        <div class="form-grid">
          <div class="field"><label>Planner target RTP % (also used by smart auto-next)</label><input type="text" name="scratch_planner_target_rtp" value="${esc(getS(S, 'scratch_planner_target_rtp', '75'))}"></div>
@@ -575,7 +603,7 @@ router.get('/automation', async (req, res) => {
         }
       }
     }
-    body += ui.card('Exposure alerts (BP-23)', alerts.length ? ui.table(['When', 'Source', 'Detail'], alerts) : '<p class="muted">No exposure alerts right now. Scratch guardrail and draw-liability alerts appear here live when thresholds are crossed (enable them in Scratch automation above).</p>');
+    body += ui.card('Exposure alerts', alerts.length ? ui.table(['When', 'Source', 'Detail'], alerts) : '<p class="muted">No exposure alerts right now. Scratch guardrail and draw-liability alerts appear here live when thresholds are crossed (enable them in Scratch automation above).</p>');
   }
   body += ui.card('Failure alerts', failed.length || failAudits.length
     ? ui.table(['When', 'Process', 'Detail'], [
@@ -583,6 +611,9 @@ router.get('/automation', async (req, res) => {
         ...failAudits.map((a) => [d(a.created_at), 'scheduler', esc(a.detail || a.action)]),
       ])
     : '<p class="muted">No failed automation runs recorded. Failures appear here and in the Audit Trail the moment a run errors.</p>');
+  /* U-26: Automation and Cron Jobs control the same scheduled jobs —
+     say so on both pages so neither looks like a separate system. */
+  body += `<p class="muted">The processes above are the same scheduled jobs listed under <a href="${R(req, '/cron')}">Cron Jobs</a> — pausing or running a job in either place changes the same job.</p>`;
   res.send(shell(req, '/automation', 'Automation Console', body));
 });
 
@@ -640,7 +671,7 @@ router.post('/automation/scratch', async (req, res) => {
   const action = ['alert', 'close_sales', 'stop_auto_next'].includes(req.body.scratch_guardrail_action) ? req.body.scratch_guardrail_action : null;
   const drawAlert = String(req.body.draw_liability_alert || '0').trim();
   if (rtp === null || cap === null || thr === null || !action || !/^\d+(\.\d{1,2})?$/.test(drawAlert)) {
-    await req.setFlash('error', 'Invalid BP-23 value: RTP 1–100, cap 1–200, threshold 1–500, draw alert an amount like 500 or 500.00. Nothing was saved.');
+    await req.setFlash('error', 'Invalid prize-engine value: RTP 1–100, cap 1–200, threshold 1–500, draw alert an amount like 500 or 500.00. Nothing was saved.');
     return res.redirect(R(req, '/automation'));
   }
   const vals = {
@@ -698,8 +729,8 @@ router.get('/bonuses', async (req, res) => {
      <form method="POST" action="${R(req, '/bonuses/master')}"><input type="hidden" name="_csrf" value="${req.csrfToken}"><input type="hidden" name="on" value="${getBool(S, 'bonus_enabled', true) ? '0' : '1'}"><button class="btn ${getBool(S, 'bonus_enabled', true) ? 'btn-d' : 'btn-p'}">${getBool(S, 'bonus_enabled', true) ? 'Turn bonus engine OFF' : 'Turn bonus engine ON'}</button></form>`);
   body += ui.card('Campaigns', campaigns.length ? ui.table(
     ['Campaign', 'Audience', 'Amount', 'Trigger', 'Window', 'Granted', 'Caps', 'State', ''],
-    campaigns.map((c) => [esc(c.name), esc(c.audience) + (c.audience_n ? ' (' + c.audience_n + ')' : ''),
-      c.amount_type === 'percent' ? c.amount + '% of deposit' : money(c.amount, c.currency), esc(c.trigger_type),
+    campaigns.map((c) => [esc(c.name), esc(BONUS_AUDIENCE_LABELS[c.audience] || humanLabel(c.audience)) + (c.audience_n ? ' (' + c.audience_n + ')' : ''),
+      c.amount_type === 'percent' ? c.amount + '% of deposit' : money(c.amount, c.currency), esc(BONUS_TRIGGER_LABELS[c.trigger_type] || humanLabel(c.trigger_type)),
       (c.starts_at ? d(c.starts_at) : '—') + ' → ' + (c.ends_at ? d(c.ends_at) : '—'),
       money(c.granted_total, c.currency),
       'per-user ' + (c.per_user_cap > 0 ? money(c.per_user_cap, c.currency) : '∞') + ' · budget ' + (c.budget_cap > 0 ? money(c.budget_cap, c.currency) : '∞'),
@@ -710,12 +741,12 @@ router.get('/bonuses', async (req, res) => {
     : '<p class="muted">No campaigns yet. Create the first one below.</p>');
   body += ui.card('Create campaign', ui.formHtml(R(req, '/bonuses/save'), [
     { key: 'name', label: 'Campaign name', type: 'text', required: true },
-    { key: 'audience', label: 'Audience', type: 'select', options: ['all', 'new', 'first_n', 'random_n'] },
-    { key: 'audience_n', label: 'Audience N (for first_n / random_n)', type: 'number', value: '0' },
+    { key: 'audience', label: 'Audience', type: 'select', options: [{ v: 'all', l: 'All players' }, { v: 'new', l: 'New players' }, { v: 'first_n', l: 'First N' }, { v: 'random_n', l: 'Random N' }] },
+    { key: 'audience_n', label: 'Audience N (for the First N and Random N options)', type: 'number', value: '0' },
     { key: 'amount_type', label: 'Amount type', type: 'select', options: ['fixed', 'percent'] },
     { key: 'amount', label: 'Amount (fixed: major units e.g. 5.00 · percent: e.g. 10 = 10%)', type: 'text', required: true },
     { key: 'currency', label: 'Currency', type: 'select', options: currencies.length ? currencies : ['USD'] },
-    { key: 'trigger_type', label: 'Trigger', type: 'select', options: ['manual', 'signup', 'first_deposit', 'scheduled'] },
+    { key: 'trigger_type', label: 'Trigger', type: 'select', options: [{ v: 'manual', l: 'Manual' }, { v: 'signup', l: 'Sign-up' }, { v: 'first_deposit', l: 'First deposit' }, { v: 'scheduled', l: 'Scheduled' }] },
     { key: 'starts_at', label: 'Valid from (optional, UTC e.g. 2026-11-01 10:00)', type: 'text' },
     { key: 'ends_at', label: 'Valid until (optional, UTC)', type: 'text' },
     { key: 'wagering_x', label: 'Wagering requirement (x grant amount, 0 = none)', type: 'text', value: '0' },
@@ -724,7 +755,7 @@ router.get('/bonuses', async (req, res) => {
   ], { csrf: req.csrfToken, submit: 'Create campaign' }));
   body += ui.card('Grant log (latest 50)', grants.length ? ui.table(
     ['When', 'Campaign', 'Player', 'Amount', 'Trigger', 'Wagering progress'],
-    grants.map((g) => [d(g.created_at), esc(g.campaign_name), esc(g.user_email), money(g.amount, g.currency), esc(g.trigger_type || ''),
+    grants.map((g) => [d(g.created_at), esc(g.campaign_name), esc(g.user_email), money(g.amount, g.currency), esc(BONUS_TRIGGER_LABELS[g.trigger_type] || humanLabel(g.trigger_type || '')),
       g.wagering_required > 0 ? money(g.wagered, g.currency) + ' / ' + money(g.wagering_required, g.currency) : '—']))
     : '<p class="muted">No grants yet.</p>');
   res.send(shell(req, '/bonuses', 'Bonus Campaigns', body));
@@ -836,6 +867,7 @@ router.get('/users', async (req, res) => {
   const tabs = USER_FILTERS.map(([key, label]) =>
     `<a class="tab${f === key ? ' active' : ''}" href="${R(req, '/users')}?f=${key}">${esc(label)} <span class="count">${badges[key]}</span></a>`).join('');
   const body = `<div class="tabs">${tabs}</div>` +
+    `<div class="btn-row" style="margin-bottom:12px"><a class="btn btn-sm" href="${R(req, '/data')}?dataset=users">Export users (CSV) →</a></div>` +
     (req.query.agent ? `<p class="muted">Showing players of agent #${esc(req.query.agent)} — <a href="${R(req, '/users')}">clear filter</a></p>` : '') +
     ui.filtersHtml(R(req, '/users'), [{ key: 'q', label: 'Search name/email/phone' }, { key: 'f', type: 'hidden' }, { key: 'agent', type: 'hidden' }], { q, f, agent: req.query.agent || '' }) +
     ui.table(['ID', 'Name', 'Email', 'Status', 'KYC', 'Agent', 'Joined', ''],
@@ -875,8 +907,8 @@ router.get('/users/:id', async (req, res) => {
            it changes only through the KYC queue decision or the
            manual-verify attestation below (which requires a note). The
            old dropdown let any editor set 'verified' unattested. */
-        { key: 'kyc_override', label: 'KYC requirement for this user (BP-21)', type: 'select', options: ['default', 'required', 'exempt'], value: u.kyc_override || 'default', help: 'default = follows the global KYC switch (Settings → KYC). required = this user must be KYC-approved before gated actions even when the global switch is off. exempt = never gated.' },
-        { key: 'auto_withdrawal_limit', label: 'Auto-withdrawal limit (BP-22)', type: 'text', value: u.auto_withdrawal_limit === null || u.auto_withdrawal_limit === undefined ? '' : String(u.auto_withdrawal_limit), help: 'Blank = follow the global limit in Settings → Withdrawal & risk controls. A value (major units, e.g. 25.50) is this user\'s own ceiling; 0 = never auto-approve for this user. Auto-approval never pays out by itself.' },
+        { key: 'kyc_override', label: 'KYC requirement for this user', type: 'select', options: ['default', 'required', 'exempt'], value: u.kyc_override || 'default', help: 'default = follows the global KYC switch (Settings → KYC). required = this user must be KYC-approved before gated actions even when the global switch is off. exempt = never gated.' },
+        { key: 'auto_withdrawal_limit', label: 'Auto-withdrawal limit', type: 'text', value: u.auto_withdrawal_limit === null || u.auto_withdrawal_limit === undefined ? '' : String(u.auto_withdrawal_limit), help: 'Blank = follow the global limit in Settings → Withdrawal & risk controls. A value (major units, e.g. 25.50) is this user\'s own ceiling; 0 = never auto-approve for this user. Auto-approval never pays out by itself.' },
         { key: 'agent_id', label: 'Agent', type: 'select', options: [{ v: '', l: 'Unassigned' }].concat(agents.map(a => ({ v: String(a.id), l: '#' + a.id + ' — ' + a.name }))), value: u.agent_id ? String(u.agent_id) : '' },
         { key: 'notes', label: 'Notes', type: 'textarea', value: u.notes },
       ], { csrf: req.csrfToken, submit: 'Save biodata' }) + `<p class="muted">KYC status: <strong>${esc(u.kyc_status)}</strong> — changes only through the KYC review queue or the manual-verification attestation (see the KYC card).</p>` +
@@ -922,18 +954,18 @@ router.get('/users/:id', async (req, res) => {
         ['Payout details last changed', u.payout_updated_at ? d(u.payout_updated_at) : 'Never'],
         ['Profile completed', (u.profile_completed === 0) ? '✗ Pending (signed up via OTP, name/terms not yet collected)' : '✓ Yes'],
       ]))}
-      ${ui.card('KYC documents (BP-21)', (kycDocs.length ? ui.table(['#', 'Type', 'File', 'Status', 'Submitted', ''], kycDocs.map(doc => ['#' + doc.id, esc(({ national_id: 'National ID card', passport: 'Passport', driving_licence: 'Driving licence' }[doc.doc_type]) || doc.doc_type), esc(doc.original_name), ui.statusBadge(doc.status === 'approved' ? 'verified' : doc.status), d(doc.created_at), `<a class="btn btn-sm" href="${R(req, '/kyc/' + doc.id)}">Review</a>`])) : '<p class="muted">No documents submitted.</p>') + (u.kyc_status !== 'verified' ? `<h4 class="mt">Mark verified manually (off-platform verification)</h4>
+      ${ui.card('KYC documents', (kycDocs.length ? ui.table(['#', 'Type', 'File', 'Status', 'Submitted', ''], kycDocs.map(doc => ['#' + doc.id, esc(({ national_id: 'National ID card', passport: 'Passport', driving_licence: 'Driving licence' }[doc.doc_type]) || doc.doc_type), esc(doc.original_name), ui.statusBadge(doc.status === 'approved' ? 'verified' : doc.status), d(doc.created_at), `<a class="btn btn-sm" href="${R(req, '/kyc/' + doc.id)}">Review</a>`])) : '<p class="muted">No documents submitted.</p>') + (u.kyc_status !== 'verified' ? `<h4 class="mt">Mark verified manually (off-platform verification)</h4>
         <form method="POST" action="${R(req, '/users/' + u.id + '/kyc-verify')}" class="adm-form">
           <input type="hidden" name="_csrf" value="${req.csrfToken}">
           <div class="field"><label>Attestation note (required — recorded in the audit log)</label><textarea name="note" required maxlength="500" placeholder="What was verified, where, and by whom"></textarea></div>
           <div class="mt"><button class="btn btn-p" type="submit">Mark verified manually</button></div>
         </form>` : '<p class="muted">This user is KYC-verified.</p>'))}
-      ${ui.card('Fraud flags', flags.length ? ui.table(['When', 'Flag', 'Detail', 'Reviewed'], flags.map(f => [d(f.created_at), esc(f.flag_type), `<span class="code">${esc(String(f.detail).slice(0, 120))}</span>`, f.reviewed_at ? '✓ ' + d(f.reviewed_at) : `<a class="btn btn-sm" href="${R(req, '/flags')}">Review</a>`])) : '<p class="muted">No flags.</p>')}
+      ${ui.card('Fraud flags', flags.length ? ui.table(['When', 'Flag', 'Detail', 'Reviewed'], flags.map(f => [d(f.created_at), esc(FLAG_LABELS[f.flag_type] || String(f.flag_type || '').replace(/_/g, ' ')), esc(flagDetailText(f.detail)), f.reviewed_at ? '✓ ' + d(f.reviewed_at) : `<a class="btn btn-sm" href="${R(req, '/flags')}">Review</a>`])) : '<p class="muted">No flags.</p>')}
       ${ui.card('Referral credits (pending = awaiting referee deposit + wagering)', ui.table(['When', 'Referee', 'Amount', 'Status'], refCredits.map(c => [d(c.created_at), '#' + c.referee_id, money(req, c.amount, c.currency), ui.statusBadge(c.status)])))}
       ${ui.card('Recent tickets', ui.table(['Ticket', 'Total', 'Status', 'When'], tickets.map(t =>
         [`<span class="code">${esc(t.public_id)}</span>`, money(req, t.total, t.currency), ui.statusBadge(t.status), d(t.created_at)]))) + `<p class="mt"><a class="btn btn-sm" href="${R(req, '/tickets')}?q=${encodeURIComponent(u.email)}">View all tickets for this player →</a></p>`}
       ${ui.card('Recent transactions', ui.table(['When', 'Type', 'Amount', 'Balance after'], txs.map(t =>
-        [d(t.created_at), esc(t.type), `<span class="${t.amount >= 0 ? 'pos' : 'neg'}">${money(req, t.amount, t.currency)}</span>`, money(req, t.balance_after, t.currency)]))) + `<p class="mt"><a class="btn btn-sm" href="${R(req, '/reports')}?type=transaction&q=${encodeURIComponent(u.email)}">View all transactions for this player →</a></p>`}
+        [d(t.created_at), esc(txLabel(t.type)), `<span class="${t.amount >= 0 ? 'pos' : 'neg'}">${money(req, t.amount, t.currency)}</span>`, money(req, t.balance_after, t.currency)]))) + `<p class="mt"><a class="btn btn-sm" href="${R(req, '/reports')}?type=transaction&q=${encodeURIComponent(u.email)}">View all transactions for this player →</a></p>`}
       ${ui.card('Login history', ui.table(['When', 'IP', 'Browser', 'OS', 'OK'], logins.map(l =>
         [d(l.created_at), esc(l.ip), esc(l.browser), esc(l.os), l.success ? '✓' : '✗']))) + `<p class="mt"><a class="btn btn-sm" href="${R(req, '/login-history')}?q=${encodeURIComponent(u.email)}">View full login history →</a></p>`}
       ${ui.card('Activity timeline', ui.table(['When', 'Action', 'Detail'], acts.map(a =>
@@ -953,7 +985,12 @@ router.post('/users/:id', async (req, res) => {
   // crashed (500) on a missing field. R-057: whitelist kyc_status and verify
   // agent_id BEFORE writing anything.
   const b = req.body || {};
-  const name = String(b.name || '').trim();
+  /* U-20.3: String()-coercing a non-string body value (name[a]=b parses to
+     an object under qs) stored the literal text "[object Object]" as the
+     user's name. Only genuine strings are accepted; anything else reads
+     as empty and fails the normal validation below. */
+  const str = (v, max) => (typeof v === 'string' ? v : '').slice(0, max);
+  const name = str(b.name, 255).trim();
   /* SCAN fix (C-06): kyc_status from the request body is IGNORED — the
      status changes only via the KYC queue / manual-verify attestation. */
   const kyc = u.kyc_status;
@@ -975,18 +1012,26 @@ router.post('/users/:id', async (req, res) => {
     const ag = await req.db.get("SELECT id FROM users WHERE id = ? AND role = 'agent'", [agentId]);
     if (!ag) { await req.setFlash('error', 'That agent does not exist. Nothing was saved.'); return res.redirect(R(req, '/users/' + u.id)); }
   }
+  {
+    const phoneIn = str(b.phone, 32).trim();
+    if (phoneIn) {
+      const { isBlockedPhone } = require('../lib/phone-countries');
+      if (isBlockedPhone(req.settings, phoneIn)) { await req.setFlash('error', 'Phone numbers from this country are not accepted on this platform. Nothing was saved.'); return res.redirect(R(req, '/users/' + u.id)); }
+    }
+  }
   await req.db.run('UPDATE users SET name = ?, phone = ?, address = ?, city = ?, state = ?, zip = ?, country = ?, kyc_status = ?, notes = ?, agent_id = ?, kyc_override = ?, auto_withdrawal_limit = ? WHERE id = ?',
-    [name, String(b.phone || '').slice(0, 32),
-     String(b.address || '').slice(0, 255), String(b.city || '').slice(0, 128),
-     String(b.state || '').slice(0, 128), String(b.zip || '').slice(0, 32),
-     String(b.country || '').slice(0, 64),
-     kyc, String(b.notes || '').slice(0, 2000), agentId, kycOverride, autoLimit, u.id]);
+    [name, str(b.phone, 32),
+     str(b.address, 255), str(b.city, 128),
+     str(b.state, 128), str(b.zip, 32),
+     str(b.country, 64),
+     kyc, str(b.notes, 2000), agentId, kycOverride, autoLimit, u.id]);
   // v14: admin email changes NEVER swap immediately — a verification link
   // goes to the NEW address; the swap happens only when it is clicked.
   let emailChangeMsg = '';
   let emailChangeRefused = false, emailChangePending = false;
-  if (req.body.email && validEmail(req.body.email) && req.body.email.toLowerCase() !== u.email) {
-    const newEmail = req.body.email.trim().toLowerCase();
+  const emailIn = typeof b.email === 'string' ? b.email : '';
+  if (emailIn && validEmail(emailIn) && emailIn.toLowerCase() !== u.email) {
+    const newEmail = emailIn.trim().toLowerCase();
     // Never let an admin-initiated change steal an address another account
     // owns (the verify-click swap also re-checks at click time).
     const dup = await req.db.get('SELECT id FROM users WHERE email = ? AND id != ?', [newEmail, u.id]);
@@ -1001,7 +1046,7 @@ router.post('/users/:id', async (req, res) => {
     const token = randHex(24);
     await req.db.run('INSERT INTO email_verifications (user_id, new_email, token_hash, expires_at, used, created_at) VALUES (?, ?, ?, ?, 0, ?)',
       [u.id, newEmail, sha256('verify:' + token), now() + 24 * 3600 * 1000, now()]);
-    const link = (process.env.BASE_URL || '') + '/verify-email/' + token;
+    const link = (process.env.BASE_URL || (req.protocol + '://' + req.get('host'))) + '/verify-email/' + token; // D2-C9/D3-C8: A-09 host fallback
     const sent = await notify.send(req.db, req.settings, 'email', 'email_verification', newEmail, { name: u.name, link }).catch(() => ({ status: 'failed' }));
     emailChangeMsg = sent.status === 'sent'
       ? ' Email change requested — verification link sent to the new address (old email stays until verified).'
@@ -1011,7 +1056,7 @@ router.post('/users/:id', async (req, res) => {
   // R-057: audit the email actually STORED (unchanged until the new
   // address verifies), not the requested one — the old detail logged the
   // requested address even when the change was refused.
-  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'user.update', entity: 'user', entityId: u.id, detail: { by: req.user.id, old: { name: u.name, email: u.email, phone: u.phone, kyc_status: u.kyc_status, agent_id: u.agent_id, kyc_override: u.kyc_override || 'default', auto_withdrawal_limit: u.auto_withdrawal_limit }, new: { name, email_stored: u.email, email_requested: req.body.email || u.email, email_change_refused: emailChangeRefused, email_change_pending: emailChangePending, phone: req.body.phone, kyc_status: kyc, agent_id: agentId, kyc_override: kycOverride, auto_withdrawal_limit: autoLimit } }, ip: req.ip });
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'user.update', entity: 'user', entityId: u.id, detail: { by: req.user.id, old: { name: u.name, email: u.email, phone: u.phone, kyc_status: u.kyc_status, agent_id: u.agent_id, kyc_override: u.kyc_override || 'default', auto_withdrawal_limit: u.auto_withdrawal_limit }, new: { name, email_stored: u.email, email_requested: emailIn || u.email, email_change_refused: emailChangeRefused, email_change_pending: emailChangePending, phone: str(b.phone, 32), kyc_status: kyc, agent_id: agentId, kyc_override: kycOverride, auto_withdrawal_limit: autoLimit } }, ip: req.ip });
   await req.setFlash('success', 'User updated.' + emailChangeMsg);
   res.redirect(R(req, '/users/' + u.id));
 });
@@ -1024,7 +1069,7 @@ router.post('/users/:id/kyc-verify', async (req, res) => {
   if (!u || u.role === 'admin') return notFound(req, res, 'User not found.');
   const note = String(req.body.note || '').trim().slice(0, 500);
   if (!note) { await req.setFlash('error', 'A note is required for manual verification — record what was verified off-platform. Nothing changed.'); return res.redirect(R(req, '/users/' + u.id)); }
-  await req.db.run("UPDATE users SET kyc_status = 'verified', kyc_note = ? WHERE id = ?", [note, u.id]);
+  await req.db.run("UPDATE users SET kyc_status = 'verified', kyc_note = '' WHERE id = ?", [u.id]);
   await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'kyc.manual_verify', entity: 'user', entityId: u.id, detail: { note, previous_status: u.kyc_status }, ip: req.ip });
   await req.setFlash('success', 'User marked KYC-verified (manual attestation recorded in the audit log).');
   res.redirect(R(req, '/users/' + u.id));
@@ -1063,7 +1108,7 @@ router.post('/users/:id/reset-password', async (req, res) => {
   await req.db.run('INSERT INTO password_resets (user_id, token_hash, expires_at, used, created_at) VALUES (?, ?, ?, 0, ?)',
     [u.id, sha256('reset:' + token), now() + 3600000, now()]);
   await destroyUserSessions(req.db, u.id);
-  const link = (process.env.BASE_URL || '') + '/reset/' + token;
+  const link = (process.env.BASE_URL || (req.protocol + '://' + req.get('host'))) + '/reset/' + token; // D2-C9/D3-C8: A-09 host fallback
   let msg;
   if (u.email && !u.email.endsWith('@phone.local')) {
     const sent = await notify.send(req.db, req.settings, 'email', 'password_reset', u.email, { name: u.name, link }).catch(() => ({ status: 'failed' }));
@@ -1089,12 +1134,11 @@ router.post('/users/:id/revoke-sessions', async (req, res) => {
 router.post('/users/:id/adjust', async (req, res) => {
   const u = await req.db.get('SELECT * FROM users WHERE id = ?', [req.params.id]);
   if (!u || u.role === 'admin') return notFound(req, res, 'User not found.');
-  const { toMinor } = require('../lib/util');
-  const amount = toMinor(req.body.amount);
+  const currency = getS(req.settings, 'base_currency', 'USD');
+  const amount = toMinor(req.body.amount, decimalsFor(currency, getCurrencies(req.settings))); // D1-C6: base-currency decimals, not the bare 2dp default
   const remark = String(req.body.remark || '').trim();
   if (amount === null || amount <= 0 || !remark) { await req.setFlash('error', 'Enter a valid amount and a remark.'); return res.redirect(R(req, '/users/' + u.id)); }
   const signed = req.body.direction === 'subtract' ? -amount : amount;
-  const currency = getS(req.settings, 'base_currency', 'USD');
   // R-013: a balance adjustment is a money action — at/above the threshold
   // it queues for a second approver instead of executing immediately.
   const mc = await maybeMakerChecker(req, 'balance.adjust', 'user', u.id, Math.abs(signed), currency, { currency, signed, direction: req.body.direction, remark });
@@ -1222,7 +1266,10 @@ router.get('/agents', async (req, res) => {
 });
 
 router.post('/agents', async (req, res) => {
-  const { name, email, password } = req.body;
+  /* U-20.4: same object-field guard as POST /staff. */
+  const name = typeof req.body.name === 'string' ? req.body.name : '';
+  const email = typeof req.body.email === 'string' ? req.body.email : '';
+  const password = typeof req.body.password === 'string' ? req.body.password : '';
   // v14: agents get a 10-char minimum + forced reset on first login (they
   // must set their own password before doing anything).
   const pwErr = passwordError(password, 'agent', getBool(req.settings, 'secure_password', true));
@@ -1286,8 +1333,8 @@ router.post('/agents/:id/settle-commissions', async (req, res) => {
 });
 
 router.post('/agents/:id/fund', async (req, res) => {
-  const amount = toMinor(req.body.amount);
   const currency = String(req.body.currency || '').toUpperCase().slice(0, 8);
+  const amount = toMinor(req.body.amount, decimalsFor(currency, getCurrencies(req.settings))); // D1-C6: the funded currency's decimals
   if (!amount || amount <= 0) { await req.setFlash('error', 'Invalid amount.'); return res.redirect(R(req, '/agents/' + req.params.id)); }
   // R-051: funding used to work for ANY id — a typo funded a nonexistent
   // agent's float (or a player's id). Verify existence + agent role + active.
@@ -1357,7 +1404,7 @@ router.get('/deposits', async (req, res) => {
     <button class="btn btn-sm" type="submit">Filter</button>
     ${(fQ || fMethod || fFrom || fTo) ? `<a class="btn btn-sm" href="${R(req, '/deposits')}${status ? '?status=' + esc(status) : ''}">Clear</a>` : ''}
   </form>`;
-  const body = depStrip + moneyTabs(req, R(req, '/deposits'), counts, status) + dFilterForm + ui.table(['ID', 'Player', 'Method', 'Amount', 'Charge', 'Net', 'Status', 'When', ''],
+  const body = depStrip + moneyTabs(req, R(req, '/deposits'), counts, status) + dFilterForm + `<div class="btn-row" style="margin-bottom:12px"><a class="btn btn-sm" href="${R(req, '/data')}?dataset=deposits">Export deposits (CSV) →</a></div>` + ui.table(['ID', 'Player', 'Method', 'Amount', 'Charge', 'Net', 'Status', 'When', ''],
     rows.map(x => [`<span class="code">${esc(x.public_id)}</span>`, esc(x.email), esc(x.method_name || '—'),
       money(req, x.amount, x.currency), money(req, x.charge, x.currency), money(req, x.net, x.currency),
       ui.statusBadge(x.status), d(x.created_at), `<a class="btn btn-sm" href="${R(req, '/deposits/' + x.id)}">Review</a>`])) +
@@ -1376,9 +1423,9 @@ router.get('/deposits/:id', async (req, res) => {
     ? `<span class="badge b-warn">Awaiting second approval — decide in Approvals</span>`
     : x.status === 'pending'
     ? `<form method="POST" action="${R(req, '/deposits/' + x.id + '/approve')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-p">Approve & credit</button></form>
-       <form method="POST" action="${R(req, '/deposits/' + x.id + '/reject')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-d">Reject</button></form>`
+       <form method="POST" action="${R(req, '/deposits/' + x.id + '/reject')}" class="adm-form" style="display:inline-flex;gap:8px;align-items:end;flex-wrap:wrap"><input type="hidden" name="_csrf" value="${req.csrfToken}"><div class="field"><label>Reason shown to the player (the player sees this)</label><input type="text" name="decision_reason" maxlength="500" placeholder="e.g. Receipt unreadable — please re-upload"></div><button class="btn btn-d">Reject</button></form>`
     : x.status === 'approved'
-    ? `<form method="POST" action="${R(req, '/deposits/' + x.id + '/revoke')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-d">Revoke</button></form>`
+    ? `<form method="POST" action="${R(req, '/deposits/' + x.id + '/revoke')}" class="adm-form" style="display:inline-flex;gap:8px;align-items:end;flex-wrap:wrap"><input type="hidden" name="_csrf" value="${req.csrfToken}"><div class="field"><label>Reason shown to the player (the player sees this)</label><input type="text" name="decision_reason" maxlength="500"></div><button class="btn btn-d">Revoke</button></form>`
     : `<span class="muted">No actions available for ${esc(x.status)} deposits.</span>`;
   const body = ui.card('Deposit ' + x.public_id, `
     <div class="grid2"><div>
@@ -1392,7 +1439,7 @@ router.get('/deposits/:id', async (req, res) => {
     </div><div>
       <h4>Player-submitted proof</h4>
       ${ui.table(['Field', 'Value'], Object.entries(userData).map(([k, v]) => [esc(k), esc(v)]))}
-      <h4 class="mt">Admin note</h4>
+      <h4 class="mt">Admin note (internal — never shown to the player)</h4>
       ${ui.formHtml(R(req, '/deposits/' + x.id + '/note'), [{ key: 'admin_note', label: 'Note', type: 'textarea', value: x.admin_note }], { csrf: req.csrfToken, submit: 'Save note', grid: false })}
     </div></div>
     <h4 class="mt">Webhook events for this deposit</h4>
@@ -1426,16 +1473,49 @@ async function maybeMakerChecker(req, action, entity, entityId, amount, currency
   await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'approval.requested', entity, entityId, detail: { action, amount, currency }, ip: req.ip });
   return { queued: true, conflictId: conflict ? conflict.id : null };
 }
+/* D3-C6 (v20): decision -> past tense, spelled per word. The old
+   decision + 'd' construction produced "rejectd" in delivered mail
+   and admin flashes ('approve'+'d' and 'revoke'+'d' happened to spell
+   correctly; 'reject'+'d' does not). */
+/* U-24 (v20): fraud flags render for a human reviewer — the flag type
+   gets a plain label and the stored JSON detail becomes readable
+   key/value text (IP, the other account, the device) instead of a raw
+   JSON blob. Unknown keys fall back to spaced words, never raw JSON. */
+const FLAG_LABELS = { shared_device: 'Shared device / IP' };
+/* U-24 (v20): ledger types and bonus enums render as human labels in
+   admin tables/selects — never the raw snake_case value. The fallback
+   is the CSV humaniser (spaced + capitalised), never the raw value. */
+const TX_LABELS = { deposit: 'Deposit', deposit_revoke: 'Deposit reversed', bonus: 'Bonus', bonus_revoke: 'Bonus reversed', withdrawal: 'Withdrawal', withdrawal_hold: 'Withdrawal hold', withdrawal_release: 'Withdrawal released', withdrawal_revoke: 'Withdrawal reversed', ticket_purchase: 'Lottery ticket', win: 'Lottery win', draw_refund: 'Draw refund', scratch_purchase: 'Scratch ticket', scratch_prize: 'Scratch prize', referral_commission: 'Referral commission', agent_commission: 'Agent commission', agent_funding: 'Agent funding', adjustment: 'Adjustment', transfer_in: 'Transfer in', transfer_out: 'Transfer out', commission: 'Commission' };
+const BONUS_AUDIENCE_LABELS = { all: 'All players', new: 'New players', first_n: 'First N', random_n: 'Random N' };
+const BONUS_TRIGGER_LABELS = { manual: 'Manual', signup: 'Sign-up', first_deposit: 'First deposit', scheduled: 'Scheduled' };
+function flagDetailText(raw) {
+  try {
+    const o = JSON.parse(raw || '{}');
+    const parts = [];
+    if (o.ip) parts.push('IP ' + o.ip);
+    if (o.other_user_id) parts.push('shared with user #' + o.other_user_id);
+    if (o.ua) parts.push('device: ' + o.ua);
+    for (const [k, v] of Object.entries(o)) {
+      if (['ip', 'ua', 'other_user_id'].includes(k)) continue;
+      parts.push(k.replace(/_/g, ' ') + ': ' + v);
+    }
+    return parts.join(' · ') || '—';
+  } catch { return String(raw || '—'); }
+}
+function decidedWord(decision) {
+  return { approve: 'approved', reject: 'rejected', revoke: 'revoked', mark_paid: 'paid', paid: 'paid' }[decision] || decision;
+}
 async function decideDep(req, res, decision) {
   try {
     const row = await req.db.get('SELECT * FROM deposits WHERE id = ?', [req.params.id]);
     if (!row) throw new Error('Deposit not found');
-    const mc = await maybeMakerChecker(req, 'deposit.' + decision, 'deposit', row.id, row.net, row.currency);
+    const playerReason = String(req.body.decision_reason || '').trim().slice(0, 500);
+    const mc = await maybeMakerChecker(req, 'deposit.' + decision, 'deposit', row.id, row.net, row.currency, { decision_reason: playerReason });
     if (mc) {
       await req.setFlash('success', 'This action exceeds the maker-checker threshold and is queued for a second approver (see Approvals).' + (mc.conflictId ? ` Note: approval #${mc.conflictId} for this deposit is already open — decide each in Approvals.` : mc.duplicate ? ' (This decision was already queued.)' : ''));
       return res.redirect(R(req, '/deposits/' + req.params.id));
     }
-    const dep = await decideDeposit(req.db, parseInt(req.params.id, 10), decision, req.user.id, req.settings);
+    const dep = await decideDeposit(req.db, parseInt(req.params.id, 10), decision, req.user.id, req.settings, playerReason);
     await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'deposit.' + decision, entity: 'deposit', entityId: dep.public_id, detail: { amount: dep.net, old_status: dep.status, new_status: decision }, ip: req.ip });
     const u = await req.db.get('SELECT email, name FROM users WHERE id = ?', [dep.user_id]);
     if (decision === 'approve') {
@@ -1447,7 +1527,7 @@ async function decideDep(req, res, decision) {
       // saw a stuck deposit. Rejections now notify like approvals do.
       notify.send(req.db, req.settings, 'email', 'deposit_rejected', u.email, { name: u.name, amount: money(req, dep.net, dep.currency) }).catch(() => {});
     }
-    await req.setFlash('success', 'Deposit ' + decision + 'd.');
+    await req.setFlash('success', 'Deposit ' + decidedWord(decision) + '.');
   } catch (e) { await req.setFlash('error', e.message); }
   res.redirect(R(req, '/deposits/' + req.params.id));
 }
@@ -1505,7 +1585,28 @@ router.get('/withdrawals', async (req, res) => {
     <button class="btn btn-sm" type="submit">Filter</button>
     ${(fQ || fMethod || fFrom || fTo) ? `<a class="btn btn-sm" href="${R(req, '/withdrawals')}${status ? '?status=' + esc(status) : ''}">Clear</a>` : ''}
   </form>`;
-  const body = wdStrip + moneyTabs(req, R(req, '/withdrawals'), counts, status, [['paid', 'Paid']]) + wFilterForm + ui.table(['ID', 'Player', 'Method', 'Amount', 'Charge', 'Net payout', 'Status', 'When', ''],
+  /* U-26 TWO DOORS (§5.2): the auto-withdrawal limit also lives here,
+     on the page where withdrawals are worked. Same /settings/risk
+     route, same auto_withdrawal_limit key; every other risk field is
+     carried hidden at its current value because that handler rewrites
+     the whole risk set. Editable only for super (the role that can
+     save it in Settings); other roles see the current value. */
+  const autoWdNow = getS(req.settings, 'auto_withdrawal_limit', '0');
+  const riskHidden = (k, v) => `<input type="hidden" name="${esc(k)}" value="${esc(v)}">`;
+  const autoWdCard = ui.card('Auto-withdrawal limit',
+    isSuperReq(req)
+      ? `<p class="muted">A withdrawal at or under this amount is auto-approved once every gate passes (wagering, OTP, KYC, payout lock). Auto-approval never pays out by itself — payout still needs the mark-paid step. This is the same setting as Settings → Withdrawal &amp; risk controls.</p>
+         <form method="POST" action="${R(req, '/settings/risk')}" class="adm-form"><input type="hidden" name="_csrf" value="${req.csrfToken}">
+         ${getS(req.settings, 'withdrawal_turnover_required', '1') === '1' ? riskHidden('withdrawal_turnover_required', '1') : ''}
+         ${riskHidden('withdrawal_daily_cap', (parseFloat(getS(req.settings, 'withdrawal_daily_cap', '0')) / 100).toFixed(2))}
+         ${riskHidden('withdrawal_monthly_cap', (parseFloat(getS(req.settings, 'withdrawal_monthly_cap', '0')) / 100).toFixed(2))}
+         ${riskHidden('payout_lock_hours', getS(req.settings, 'payout_lock_hours', '48'))}
+         ${riskHidden('maker_checker_threshold', (parseFloat(getS(req.settings, 'maker_checker_threshold', '0')) / 100).toFixed(2))}
+         ${riskHidden('referral_cap_per_referee', (parseFloat(getS(req.settings, 'referral_cap_per_referee', '0')) / 100).toFixed(2))}
+         <div class="field"><label for="wd_auto_limit">Auto-withdrawal limit (e.g. 50.00; 0 = OFF — everything manual)</label><input id="wd_auto_limit" type="text" name="auto_withdrawal_limit" value="${esc(autoWdNow)}"></div>
+         <div class="mt"><button class="btn btn-p" type="submit">Save auto-withdrawal limit</button></div></form>`
+      : `<p class="muted">Auto-withdrawal limit is currently <strong>${esc(autoWdNow)}</strong> (0 = OFF — everything manual). Only the super admin can change it, in Settings → Withdrawal &amp; risk controls.</p>`);
+  const body = wdStrip + autoWdCard + moneyTabs(req, R(req, '/withdrawals'), counts, status, [['paid', 'Paid']]) + wFilterForm + ui.table(['ID', 'Player', 'Method', 'Amount', 'Charge', 'Net payout', 'Status', 'When', ''],
     rows.map(x => [`<span class="code">${esc(x.public_id)}</span>`, esc(x.email), esc(x.method_name || '—'),
       money(req, x.amount, x.currency), money(req, x.charge, x.currency), money(req, x.net, x.currency),
       ui.statusBadge(x.status), d(x.created_at), `<a class="btn btn-sm" href="${R(req, '/withdrawals/' + x.id)}">Review</a>`])) +
@@ -1523,10 +1624,10 @@ router.get('/withdrawals/:id', async (req, res) => {
     ? `<span class="badge b-warn">Awaiting second approval — decide in Approvals</span>`
     : x.status === 'pending'
     ? `<form method="POST" action="${R(req, '/withdrawals/' + x.id + '/approve')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-p">Approve</button></form>
-       <form method="POST" action="${R(req, '/withdrawals/' + x.id + '/reject')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-d">Reject & release</button></form>`
+       <form method="POST" action="${R(req, '/withdrawals/' + x.id + '/reject')}" class="adm-form" style="display:inline-flex;gap:8px;align-items:end;flex-wrap:wrap"><input type="hidden" name="_csrf" value="${req.csrfToken}"><div class="field"><label>Reason shown to the player (the player sees this)</label><input type="text" name="decision_reason" maxlength="500" placeholder="e.g. Payout details do not match your account name"></div><button class="btn btn-d">Reject & release</button></form>`
     : x.status === 'approved'
     ? `<form method="POST" action="${R(req, '/withdrawals/' + x.id + '/mark-paid')}" class="adm-form" style="display:inline-flex;gap:8px;align-items:end;"><input type="hidden" name="_csrf" value="${req.csrfToken}"><div class="field"><label>Provider payout ID (required)</label><input type="text" name="provider_payout_id" required maxlength="255" placeholder="e.g. PSP payout reference"></div><button class="btn btn-p">Mark as paid</button></form>
-       <form method="POST" action="${R(req, '/withdrawals/' + x.id + '/revoke')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-d">Revoke</button></form>`
+       <form method="POST" action="${R(req, '/withdrawals/' + x.id + '/revoke')}" class="adm-form" style="display:inline-flex;gap:8px;align-items:end;flex-wrap:wrap"><input type="hidden" name="_csrf" value="${req.csrfToken}"><div class="field"><label>Reason shown to the player (the player sees this)</label><input type="text" name="decision_reason" maxlength="500"></div><button class="btn btn-d">Revoke</button></form>`
     : `<span class="muted">No actions available.</span>`;
   const body = ui.card('Withdrawal ' + x.public_id, `
     <div class="grid2"><div>
@@ -1540,7 +1641,7 @@ router.get('/withdrawals/:id', async (req, res) => {
     </div><div>
       <h4>Player payout details</h4>
       ${ui.table(['Field', 'Value'], Object.entries(userData).map(([k, v]) => [esc(k), esc(v)]))}
-      <h4 class="mt">Admin note</h4>
+      <h4 class="mt">Admin note (internal — never shown to the player)</h4>
       ${ui.formHtml(R(req, '/withdrawals/' + x.id + '/note'), [{ key: 'admin_note', label: 'Note', type: 'textarea', value: x.admin_note }], { csrf: req.csrfToken, submit: 'Save note', grid: false })}
     </div></div>
     <div class="btn-row mt">${actions}</div>`);
@@ -1551,18 +1652,19 @@ async function decideWd(req, res, decision) {
   try {
     const row = await req.db.get('SELECT * FROM withdrawals WHERE id = ?', [req.params.id]);
     if (!row) throw new Error('Withdrawal not found');
-    const mc = await maybeMakerChecker(req, 'withdrawal.' + decision, 'withdrawal', row.id, row.net, row.currency);
+    const playerReason = String(req.body.decision_reason || '').trim().slice(0, 500);
+    const mc = await maybeMakerChecker(req, 'withdrawal.' + decision, 'withdrawal', row.id, row.net, row.currency, { decision_reason: playerReason });
     if (mc) {
       await req.setFlash('success', 'This action exceeds the maker-checker threshold and is queued for a second approver (see Approvals).' + (mc.conflictId ? ` Note: approval #${mc.conflictId} for this withdrawal is already open — decide each in Approvals.` : mc.duplicate ? ' (This decision was already queued.)' : ''));
       return res.redirect(R(req, '/withdrawals/' + req.params.id));
     }
-    const w = await decideWithdrawal(req.db, parseInt(req.params.id, 10), decision, req.user.id);
+    const w = await decideWithdrawal(req.db, parseInt(req.params.id, 10), decision, req.user.id, '', playerReason);
     await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'withdrawal.' + decision, entity: 'withdrawal', entityId: w.public_id, detail: { amount: w.net, old_status: w.status, new_status: decision }, ip: req.ip });
     if (decision !== 'revoke' || true) {
       const u = await req.db.get('SELECT email, name FROM users WHERE id = ?', [w.user_id]);
-      notify.send(req.db, req.settings, 'email', 'withdrawal_decided', u.email, { name: u.name, amount: money(req, w.net, w.currency), status: decision + 'd' }).catch(() => {});
+      notify.send(req.db, req.settings, 'email', 'withdrawal_decided', u.email, { name: u.name, amount: money(req, w.net, w.currency), status: decidedWord(decision) }).catch(() => {});
     }
-    await req.setFlash('success', 'Withdrawal ' + decision + 'd.');
+    await req.setFlash('success', 'Withdrawal ' + decidedWord(decision) + '.');
   } catch (e) { await req.setFlash('error', e.message); }
   res.redirect(R(req, '/withdrawals/' + req.params.id));
 }
@@ -1584,6 +1686,13 @@ router.post('/withdrawals/:id/mark-paid', async (req, res) => {
     }
     const w = await markWithdrawalPaid(req.db, parseInt(req.params.id, 10), req.body.provider_payout_id, req.user.id);
     await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'withdrawal.mark_paid', entity: 'withdrawal', entityId: w.public_id, detail: { provider_payout_id: String(req.body.provider_payout_id || '').trim(), old_status: 'approved', new_status: 'paid' }, ip: req.ip });
+    /* D3-C7 (v20): the direct mark-paid path sent NO notification —
+       the maker-checker path sends withdrawal_decided with status
+       'paid' for the same event. Same call, same template. */
+    try {
+      const u = await req.db.get('SELECT email, name FROM users WHERE id = ?', [w.user_id]);
+      if (u && u.email) notify.send(req.db, req.settings, 'email', 'withdrawal_decided', u.email, { name: u.name, amount: money(req, w.net, w.currency), status: 'paid' }).catch(() => {});
+    } catch {}
     await req.setFlash('success', 'Withdrawal marked as paid.');
   } catch (e) { await req.setFlash('error', e.message); }
   res.redirect(R(req, '/withdrawals/' + req.params.id));
@@ -1619,7 +1728,7 @@ router.get('/methods', async (req, res) => {
 const METHOD_FIELDS = (m = {}) => [
   { key: 'name', label: 'Method name', type: 'text', value: m.name, required: true },
   { key: 'kind', label: 'Kind', type: 'select', options: ['deposit', 'withdrawal', 'both'], value: m.kind || 'both' },
-  { key: 'rail', label: 'Rail', type: 'select', options: RAILS.map(r => r.key), value: m.rail || 'bank_transfer', help: 'EBT is blocked by policy and cannot be saved.' },
+  { key: 'rail', label: 'Rail', type: 'select', options: RAILS.map(r => ({ v: r.key, l: r.name })), value: m.rail || 'bank_transfer', help: 'EBT is blocked by policy and cannot be saved.' },
   { key: 'logo_url', label: 'Logo URL', type: 'text', value: m.logo_url },
   { key: 'currency', label: 'Currency', type: 'text', value: m.currency || 'USD', required: true },
   { key: 'rate', label: 'Rate to base currency', type: 'text', value: m.rate || '1' },
@@ -1681,6 +1790,7 @@ router.post('/methods/new', async (req, res) => {
     const pctNew = pctRawNew === '' ? 0 : parseFloat(pctRawNew);
     if (!(rateNew > 0)) throw new Error('Rate must be greater than 0.');
     if (pctNew < 0) throw new Error('Percent charge cannot be negative.');
+    if (pctNew >= 100) throw new Error('Percent charge must be less than 100% — at 100% or more, a deposit would credit the player nothing and could never be approved cleanly.');
     const f = validateMethodFields(req.body, req.settings);
     const cf = parseCustomFields(req.body.custom_fields);
     const slug = 'm-' + randHex(4) + '-' + Date.now().toString(36);
@@ -1713,6 +1823,7 @@ router.post('/methods/:id', async (req, res) => {
     const pctEdit = pctRawEdit === '' ? 0 : parseFloat(pctRawEdit);
     if (!(rateEdit > 0)) throw new Error('Rate must be greater than 0.');
     if (pctEdit < 0) throw new Error('Percent charge cannot be negative.');
+    if (pctEdit >= 100) throw new Error('Percent charge must be less than 100% — at 100% or more, a deposit would credit the player nothing and could never be approved cleanly.');
     const f = validateMethodFields(req.body, req.settings);
     const cf = parseCustomFields(req.body.custom_fields);
     await req.db.run(`UPDATE payment_methods SET kind=?, name=?, rail=?, logo_url=?, currency=?, rate=?, min_amount=?, max_amount=?, fixed_charge=?, percent_charge=?, instruction=?, custom_fields=?, enabled=? WHERE id=?`,
@@ -1759,13 +1870,19 @@ router.get('/methods/:id/credentials', async (req, res) => {
     try { saved[r.field_key] = decryptField(r.field_value, r.field_enc); }
     catch (e) { saved[r.field_key] = '[unreadable — encryption key not configured]'; }
   }
-  const fields = (rail ? rail.credentialFields : []).map(f => ({ ...f, value: saved[f.key] || '' }));
+  /* U-21 §5.2: pass the rails.js field definition THROUGH (help text,
+     options, secret marker, required) instead of rebuilding a stripped
+     copy — the old map dropped every field's help text. Password fields
+     render EMPTY: a stored secret is never echoed back into the page;
+     the operator sees the field's own help plus the keep-saved note. */
+  const fields = (rail ? rail.credentialFields : []).map(f => ({ ...f,
+    type: f.type === 'password' ? 'password' : f.type,
+    value: f.type === 'password' ? '' : (saved[f.key] || ''),
+    help: f.type === 'password' ? ((f.help ? f.help + ' ' : '') + 'Leave blank to keep the saved value.') : f.help,
+  }));
   const body = ui.card(`Gateway credentials — ${m.name} (${rail ? rail.name : m.rail})`,
     `<p class="muted">Credentials are stored server-side. Receiving details (wallet address, UPI ID, bank account, QR code) ARE shown to players on the deposit page so they can pay; secret keys are never shown to players. ${rail && rail.webhook ? 'This rail supports provider webhooks with signature verification.' : 'This rail runs in manual mode: players submit proof, staff approves.'} ${keyConfigured() ? 'Credentials are encrypted at rest (AES-256-GCM).' : 'No encryption key is configured — credentials are stored in plaintext. Set CREDENTIAL_ENCRYPTION_KEY and re-save to encrypt.'}</p>` +
-    (fields.length ? ui.formHtml(R(req, '/methods/' + m.id + '/credentials'), fields.map(f =>
-      f.type === 'select' ? { key: f.key, label: f.label, type: 'select', options: f.options, value: saved[f.key] || '' }
-      : f.type === 'textarea' ? { key: f.key, label: f.label, type: 'textarea', value: saved[f.key] || '' }
-      : { key: f.key, label: f.label, type: f.type === 'password' ? 'password' : 'text', value: f.type === 'password' ? '' : (saved[f.key] || ''), help: f.type === 'password' ? 'Leave blank to keep the saved value.' : '' }),
+    (fields.length ? ui.formHtml(R(req, '/methods/' + m.id + '/credentials'), fields,
       { csrf: req.csrfToken, submit: 'Save credentials' })
     : '<p class="muted">This rail needs no credentials.</p>'));
   res.send(shell(req, '/methods', 'Credentials — ' + m.name, body));
@@ -1784,10 +1901,27 @@ router.post('/methods/:id/credentials', async (req, res) => {
     return res.redirect(R(req, '/methods/' + m.id + '/credentials'));
   }
   const rail = getRail(m.rail);
-  for (const f of (rail ? rail.credentialFields : [])) {
-    let v = String(req.body[f.key] || '');
-    if (f.type === 'password' && !v) continue; // keep saved
-    if (f.required && !v) { await req.setFlash('error', `"${f.label}" is required.`); return res.redirect(R(req, '/methods/' + m.id + '/credentials')); }
+  const credFields = rail ? rail.credentialFields : [];
+  /* U-21 §5.1: validate the MERGED config (posted values, with blank
+     password fields taking their already-saved value — keep-saved
+     semantics) BEFORE any row is written. A refusal therefore leaves
+     the stored config untouched, and a required password field with no
+     saved value fails with its true reason instead of silently passing
+     through the old keep-saved `continue` (the blank-save bug). */
+  const savedCreds = {};
+  for (const r of await req.db.query('SELECT field_key, field_value, field_enc FROM gateway_credentials WHERE method_id = ?', [m.id])) {
+    try { savedCreds[r.field_key] = decryptField(r.field_value, r.field_enc); } catch (e) { savedCreds[r.field_key] = ''; }
+  }
+  const incoming = {};
+  for (const f of credFields) {
+    const posted = typeof req.body[f.key] === 'string' ? req.body[f.key] : '';
+    incoming[f.key] = (f.type === 'password' && !posted) ? (savedCreds[f.key] || '') : posted;
+  }
+  const vres = validateRailCredentials(m.rail, incoming);
+  if (!vres.ok) { await req.setFlash('error', 'Credentials NOT saved: ' + vres.error); return res.redirect(R(req, '/methods/' + m.id + '/credentials')); }
+  for (const f of credFields) {
+    let v = typeof req.body[f.key] === 'string' ? req.body[f.key] : '';
+    if (f.type === 'password' && !v) continue; // keep saved (existence already proven by the merged validation above)
     const enc = keyConfigured();
     const stored = enc ? encryptField(v) : v;
     const ex = await req.db.get('SELECT id FROM gateway_credentials WHERE method_id = ? AND field_key = ?', [m.id, f.key]);
@@ -1876,7 +2010,7 @@ router.get('/reports', async (req, res) => {
     const total = (await req.db.get(`SELECT COUNT(*) AS c FROM transactions tr JOIN users u ON u.id=tr.user_id WHERE tr.created_at BETWEEN ? AND ?` + (qLike ? ' AND LOWER(u.email) LIKE LOWER(?)' : ''), qLike ? [from, to, qLike] : [from, to])).c;
     const rows = await req.db.query(`SELECT tr.*, u.email FROM transactions tr JOIN users u ON u.id=tr.user_id WHERE tr.created_at BETWEEN ? AND ?` + (qLike ? ' AND LOWER(u.email) LIKE LOWER(?)' : '') + ` ORDER BY tr.created_at DESC LIMIT ? OFFSET ?`, qLike ? [from, to, qLike, PER, (page - 1) * PER] : [from, to, PER, (page - 1) * PER]);
     body += ui.card('Transaction report', ui.table(['When', 'Player', 'Type', 'Amount', 'Balance after'], rows.map(t =>
-      [d(t.created_at), esc(t.email), esc(t.type), `<span class="${t.amount >= 0 ? 'pos' : 'neg'}">${money(req, t.amount, t.currency)}</span>`, money(req, t.balance_after, t.currency)]))) +
+      [d(t.created_at), esc(t.email), esc(txLabel(t.type)), `<span class="${t.amount >= 0 ? 'pos' : 'neg'}">${money(req, t.amount, t.currency)}</span>`, money(req, t.balance_after, t.currency)]))) +
       ui.paginate(repBase, page, PER, total);
   } else if (type === 'payment') {
     const total = (await req.db.get(`SELECT COUNT(*) AS c FROM deposits d JOIN users u ON u.id=d.user_id WHERE d.created_at BETWEEN ? AND ?` + (qLike ? ' AND LOWER(u.email) LIKE LOWER(?)' : ''), qLike ? [from, to, qLike] : [from, to])).c;
@@ -1898,6 +2032,330 @@ router.get('/reports', async (req, res) => {
   res.send(shell(req, '/reports', 'Reports', body));
 });
 
+/* ============================================================ DATA — IMPORT & EXPORT (U-23)
+   Export: per-dataset CSV downloads (human headers, major-unit amounts,
+   paged reads, honest cap, audit-logged). Import: dry-run → execute for
+   adjudicated non-money master data ONLY (see adj-chain.md). Money data
+   (balances, ledger, deposits, withdrawals) has NO import route at all. */
+const EXPORT_CAP = 10000, EXPORT_PAGE = 500;
+function csvCell(v) {
+  let s = v === null || v === undefined ? '' : String(v);
+  // Spreadsheet formula-injection guard for text cells (plain numbers pass).
+  if (/^[=+@]/.test(s) || (/^-/.test(s) && !/^-\d+(\.\d+)?$/.test(s))) s = "'" + s;
+  return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+function csvDateTime(ms) { const n = Number(ms); return n ? new Date(n).toISOString().replace('T', ' ').slice(0, 19) + ' UTC' : ''; }
+function humanLabel(s) { const t = String(s === null || s === undefined ? '' : s).replace(/_/g, ' ').trim(); return t ? t.charAt(0).toUpperCase() + t.slice(1) : ''; }
+function txLabel(s) { return TX_LABELS[s] || humanLabel(s || ''); }
+function yesNo(v) { return v ? 'Yes' : 'No'; }
+function majorOf(req, minor, cur) { return fromMinor(Number(minor) || 0, decimalsFor(cur, req.currencies)); }
+function userDataText(stored) {
+  try { const o = decodeUserData(stored); return Object.entries(o || {}).filter(([, v]) => String(v) !== '').map(([k, v]) => `${k}: ${v}`).join('; '); } catch { return ''; }
+}
+/* roles follow lib/rbac.js sets; GETs are otherwise readable by all staff,
+   so each export gates itself (same pattern as the credentials page). */
+const EXPORT_DEFS = {
+  users: { label: 'Users', roles: ['super', 'risk'], timed: 'u.created_at', order: 'u.id ASC',
+    desc: 'Every account: players, agents and staff, with verification and KYC status.',
+    headers: ['User ID', 'Full name', 'Email', 'Phone', 'Account type', 'Status', 'Email verified', 'Phone verified', 'KYC status', 'Country', 'Agent', 'Referral code', 'Referred by', 'Joined', 'Last login'],
+    from: 'FROM users u LEFT JOIN users a ON a.id = u.agent_id LEFT JOIN users rb ON rb.id = u.referred_by',
+    select: 'SELECT u.*, a.email AS agent_email, rb.email AS referred_by_email',
+    row: (req, u) => [u.id, u.name, u.email, u.phone || '', u.role === 'admin' ? `Staff (${u.admin_role || 'super'})` : humanLabel(u.role), humanLabel(u.status), yesNo(u.email_verified), yesNo(u.mobile_verified), humanLabel(u.kyc_status || 'none'), u.country || '', u.agent_email || '', u.referral_code || '', u.referred_by_email || '', csvDateTime(u.created_at), csvDateTime(u.last_login_at)] },
+  ledger: { label: 'Ledger (transactions)', roles: ['super', 'finance'], timed: 'tr.created_at', order: 'tr.id ASC',
+    desc: 'The full money ledger — every credit and debit ever posted.',
+    headers: ['Transaction ID', 'Date and time', 'Player email', 'Type', 'Amount', 'Currency', 'Balance after', 'Reference type', 'Reference ID', 'Details'],
+    from: 'FROM transactions tr JOIN users u ON u.id = tr.user_id',
+    select: 'SELECT tr.*, u.email AS user_email',
+    row: (req, t) => [t.id, csvDateTime(t.created_at), t.user_email, humanLabel(t.type), majorOf(req, t.amount, t.currency), t.currency, majorOf(req, t.balance_after, t.currency), humanLabel(t.ref_type || ''), t.ref_id || '', t.meta && t.meta !== '{}' ? t.meta : ''] },
+  tickets: { label: 'Lottery tickets', roles: ['super', 'finance'], timed: 't.created_at', order: 't.id ASC',
+    desc: 'Lottery tickets with their entry counts and wins.',
+    headers: ['Ticket reference', 'Date and time', 'Player email', 'Numbers (pops)', 'Wager per pop', 'Currency', 'Draw type', 'Number of draws', 'Total paid', 'Status', 'Entries', 'Winning entries'],
+    from: 'FROM tickets t JOIN users u ON u.id = t.user_id',
+    select: "SELECT t.*, u.email AS user_email, (SELECT COUNT(*) FROM ticket_entries te WHERE te.ticket_id = t.id) AS entries_count, (SELECT COUNT(*) FROM ticket_entries te2 WHERE te2.ticket_id = t.id AND te2.status = 'won') AS entries_won",
+    row: (req, t) => [t.public_id, csvDateTime(t.created_at), t.user_email, safeJsonArray(t.pops).join(', '), majorOf(req, t.wager, t.currency), t.currency, humanLabel(String(t.draw_type || '').toLowerCase()), t.num_draws, majorOf(req, t.total, t.currency), humanLabel(t.status), t.entries_count, t.entries_won] },
+  ticket_entries: { label: 'Ticket entries (per draw)', roles: ['super', 'finance'], timed: 't.created_at', order: 'te.id ASC',
+    desc: 'One row per ticket entry in a draw, with its result.',
+    headers: ['Entry ID', 'Ticket reference', 'Player email', 'Draw ID', 'Draw type', 'Draw date', 'Entry status', 'Win amount', 'Currency', 'Settled at'],
+    from: 'FROM ticket_entries te JOIN tickets t ON t.id = te.ticket_id JOIN users u ON u.id = t.user_id JOIN draws dr ON dr.id = te.draw_id',
+    select: 'SELECT te.*, t.public_id AS ticket_ref, t.currency AS ticket_currency, u.email AS user_email, dr.draw_type AS d_type, dr.draw_date AS d_date',
+    row: (req, e) => [e.id, e.ticket_ref, e.user_email, e.draw_id, humanLabel(String(e.d_type || '').toLowerCase()), e.d_date, humanLabel(e.status), majorOf(req, e.win_amount, e.ticket_currency), e.ticket_currency, csvDateTime(e.settled_at)] },
+  draws: { label: 'Draws and results', roles: ['super', 'finance'], timed: 'dr.created_at', order: 'dr.id ASC',
+    desc: 'Every draw with its winning number once settled.',
+    headers: ['Draw ID', 'Draw type', 'Draw date', 'Entries close', 'Status', 'Winning number', 'Test draw', 'Entries', 'Created'],
+    from: 'FROM draws dr',
+    select: 'SELECT dr.*, (SELECT COUNT(*) FROM ticket_entries te WHERE te.draw_id = dr.id) AS entries_count',
+    row: (req, dr) => [dr.id, humanLabel(String(dr.draw_type || '').toLowerCase()), dr.draw_date, csvDateTime(dr.close_at), humanLabel(dr.status), dr.winning_number === null || dr.winning_number === undefined ? '' : dr.winning_number, yesNo(dr.is_test), dr.entries_count, csvDateTime(dr.created_at)] },
+  deposits: { label: 'Deposits', roles: ['super', 'finance'], timed: 'd.created_at', order: 'd.id ASC',
+    desc: 'Deposit requests with amounts, charges and the payment proof players submitted.',
+    headers: ['Deposit reference', 'Date and time', 'Player email', 'Method', 'Amount', 'Charge', 'Net credited', 'Currency', 'Status', 'Payment details submitted', 'Provider reference', 'Decided at', 'Admin note'],
+    from: 'FROM deposits d JOIN users u ON u.id = d.user_id LEFT JOIN payment_methods m ON m.id = d.method_id',
+    select: 'SELECT d.*, u.email AS user_email, m.name AS method_name',
+    row: (req, x) => [x.public_id, csvDateTime(x.created_at), x.user_email, x.method_name || '', majorOf(req, x.amount, x.currency), majorOf(req, x.charge, x.currency), majorOf(req, x.net, x.currency), x.currency, humanLabel(x.status), userDataText(x.user_data), x.provider_txn_id || '', csvDateTime(x.decided_at), x.admin_note || ''] },
+  withdrawals: { label: 'Withdrawals', roles: ['super', 'finance'], timed: 'w.created_at', order: 'w.id ASC',
+    desc: 'Withdrawal requests with the payout details players supplied.',
+    headers: ['Withdrawal reference', 'Date and time', 'Player email', 'Method', 'Amount', 'Charge', 'Net to pay', 'Currency', 'Status', 'Payout details supplied', 'Provider payout ID', 'Decided at', 'Paid at', 'Admin note'],
+    from: 'FROM withdrawals w JOIN users u ON u.id = w.user_id LEFT JOIN payment_methods m ON m.id = w.method_id',
+    select: 'SELECT w.*, u.email AS user_email, m.name AS method_name',
+    row: (req, x) => [x.public_id, csvDateTime(x.created_at), x.user_email, x.method_name || '', majorOf(req, x.amount, x.currency), majorOf(req, x.charge, x.currency), majorOf(req, x.net, x.currency), x.currency, humanLabel(x.status), userDataText(x.user_data), x.provider_payout_id || '', csvDateTime(x.decided_at), csvDateTime(x.payout_at), x.admin_note || ''] },
+  agents: { label: 'Agents', roles: ['super', 'finance'], timed: 'u.created_at', order: 'u.id ASC',
+    desc: 'Agent accounts with assigned player counts and float balances.',
+    headers: ['Agent ID', 'Full name', 'Email', 'Phone', 'Status', 'Players assigned', 'Float balances', 'Joined'],
+    from: "FROM users u WHERE u.role = 'agent'",
+    select: 'SELECT u.*, (SELECT COUNT(*) FROM users p WHERE p.agent_id = u.id) AS players_count',
+    row: (req, u, extra) => [u.id, u.name, u.email, u.phone || '', humanLabel(u.status), u.players_count, (extra && extra.floats) || '', csvDateTime(u.created_at)] },
+  support_tickets: { label: 'Support tickets', roles: ['super', 'support'], timed: 's.created_at', order: 's.id ASC',
+    desc: 'Support tickets (including soft-deleted ones, marked as such).',
+    headers: ['Ticket reference', 'Date and time', 'Player email', 'Subject', 'Priority', 'Status', 'Messages', 'Last updated', 'Deleted'],
+    from: 'FROM support_tickets s JOIN users u ON u.id = s.user_id',
+    select: 'SELECT s.*, u.email AS user_email, (SELECT COUNT(*) FROM support_messages sm WHERE sm.ticket_id = s.id) AS msg_count',
+    row: (req, s) => [s.public_id, csvDateTime(s.created_at), s.user_email, s.subject, humanLabel(s.priority || 'medium'), humanLabel(s.status), s.msg_count, csvDateTime(s.updated_at), yesNo(s.deleted_at)] },
+};
+function exportRange(req) {
+  // Date filter is OPTIONAL for exports: no dates = full history (the cap
+  // still applies). When dates ARE given, the shared reports helper
+  // validates them (and caps the span at 366 days).
+  if (!req.query.from && !req.query.to) return { from: null, to: null, error: null };
+  const r = dateRange(req);
+  return { from: r.from, to: r.to, error: r.error };
+}
+router.get('/data', async (req, res) => {
+  const { normalizeRole } = require('../lib/rbac');
+  const role = normalizeRole(req.user);
+  const chosen = EXPORT_DEFS[req.query.dataset] ? req.query.dataset : '';
+  const exportRows = Object.entries(EXPORT_DEFS).filter(([, def]) => def.roles.includes(role)).map(([key, def]) =>
+    `<tr><td><strong>${esc(def.label)}</strong>${chosen === key ? ' <span class="badge b-info">selected</span>' : ''}<br><span class="muted">${esc(def.desc)}</span></td>
+     <td><form method="GET" action="${R(req, '/data/export/' + key)}" class="filters">
+       <input type="date" name="from" aria-label="From date"><input type="date" name="to" aria-label="To date">
+       <button class="btn btn-sm" type="submit">Download CSV</button></form>
+       <span class="muted">Leave the dates empty for the full history.</span></td></tr>`).join('');
+  const exportCard = ui.card('Export data (CSV download)',
+    `<p class="muted">Each file has clear column headings, amounts in full currency units (for example 25.00) with the currency named, and readable dates. One download holds at most ${EXPORT_CAP.toLocaleString('en-US')} rows — if a set is larger, the file says so in the download headers and the audit trail records that it was capped; narrow the date range to get the rest. Every download is recorded in the audit trail with the dataset and row count. For on-screen viewing, use <a href="${R(req, '/reports')}">Reports</a>.</p>` +
+    `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Dataset</th><th>Download</th></tr></thead><tbody>${exportRows || '<tr><td colspan="2" class="muted">Your staff role cannot download data exports.</td></tr>'}</tbody></table></div>`);
+  let importCard;
+  if (role !== 'super') {
+    importCard = ui.card('Import data', '<p class="muted">Only the super admin can import data.</p>');
+  } else {
+    const defList = Object.values(IMPORT_DEFS).map(def =>
+      `<li><strong>${esc(def.label)}</strong> — columns: <span class="code">${def.columns.map(esc).join(', ')}</span> (matched by ${esc(def.keyDesc)}; rows that already exist are skipped, never overwritten)</li>`).join('');
+    importCard = ui.card('Import data (checked before anything is saved)',
+      `<div class="alert a-warn"><strong>Money can never be imported.</strong> Balances, the ledger (transaction history), deposits and withdrawals are not accepted here in any form — money records are only ever created by the payment and game flows themselves, so an imported spreadsheet can never create, change or delete money. If you need to correct a balance, use the balance adjustment on the player's page, where the change is checked and recorded.</div>
+       <p class="muted">You can import only this reference content:</p><ul>${defList}</ul>
+       <p class="muted">How it works: open your .csv file, copy its full contents and paste them below, then choose <strong>Check the file</strong>. Nothing is saved at that step — you get a row-by-row report first (ready / already exists / rejected with the reason), and only the separate <strong>Import</strong> button on that report saves anything. Maximum ${IMPORT_MAX_ROWS} rows and about 900 KB per import. Accounts, tickets, draws and payment settings cannot be imported — they are created in their own screens, where their checks run.</p>` +
+      `<form method="POST" action="${R(req, '/data/import')}" class="adm-form"><input type="hidden" name="_csrf" value="${req.csrfToken}">
+       <div class="field"><label for="imp_dataset">What are you importing?</label><select id="imp_dataset" name="dataset">${Object.entries(IMPORT_DEFS).map(([k, def]) => `<option value="${k}">${esc(def.label)}</option>`).join('')}</select></div>
+       <div class="field"><label for="imp_filename">File name (for the audit record)</label><input type="text" id="imp_filename" name="filename" placeholder="e.g. pages-export.csv"></div>
+       <div class="field"><label for="imp_csv">CSV contents</label><textarea id="imp_csv" name="csv_text" rows="10" required placeholder="Paste the full contents of the .csv file here"></textarea></div>
+       <div class="mt"><button class="btn btn-p" type="submit">Check the file</button></div></form>`);
+  }
+  res.send(shell(req, '/data', 'Data — Import & Export', exportCard + importCard));
+});
+router.get('/data/export/:dataset', async (req, res) => {
+  const { normalizeRole } = require('../lib/rbac');
+  const def = EXPORT_DEFS[req.params.dataset];
+  if (!def) return notFound(req, res, 'That dataset does not exist.');
+  if (!def.roles.includes(normalizeRole(req.user))) return res.status(403).render('error', { status: 403, message: 'Your staff role does not permit this export.' });
+  const range = exportRange(req);
+  if (range.error) { await req.setFlash('error', range.error); return res.redirect(R(req, '/data')); }
+  const hasRange = range.from !== null;
+  const baseFrom = def.from;
+  const whereSql = hasRange ? (baseFrom.includes('WHERE') ? ` AND ${def.timed} BETWEEN ? AND ?` : ` WHERE ${def.timed} BETWEEN ? AND ?`) : '';
+  const params = hasRange ? [range.from, range.to] : [];
+  const total = Number((await req.db.get(`SELECT COUNT(*) AS c ${baseFrom}${whereSql}`, params)).c) || 0;
+  const capped = total > EXPORT_CAP;
+  const fileDate = new Date().toISOString().slice(0, 10);
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="${req.params.dataset}-${fileDate}.csv"`);
+  res.setHeader('X-Export-Total', String(total));
+  if (capped) res.setHeader('X-Export-Cap', String(EXPORT_CAP));
+  res.write(def.headers.map(csvCell).join(',') + '\r\n');
+  let written = 0;
+  const limit = Math.min(total, EXPORT_CAP);
+  while (written < limit) {
+    const pageRows = await req.db.query(`${def.select} ${baseFrom}${whereSql} ORDER BY ${def.order} LIMIT ? OFFSET ?`, [...params, Math.min(EXPORT_PAGE, limit - written), written]);
+    if (!pageRows.length) break;
+    let extraById = {};
+    if (req.params.dataset === 'agents' && pageRows.length) {
+      const floats = await req.db.query(`SELECT agent_id, currency, balance FROM agent_floats WHERE agent_id IN (${pageRows.map(() => '?').join(',')}) ORDER BY currency`, pageRows.map(a => a.id));
+      for (const f of floats) { const s = `${f.currency} ${majorOf(req, f.balance, f.currency)}`; extraById[f.agent_id] = extraById[f.agent_id] ? extraById[f.agent_id] + '; ' + s : s; }
+    }
+    for (const r of pageRows) {
+      res.write(def.row(req, r, { floats: extraById[r.id] || '' }).map(csvCell).join(',') + '\r\n');
+      written++;
+    }
+  }
+  res.end();
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'data.export', entity: 'data', entityId: req.params.dataset, detail: { dataset: req.params.dataset, rows: written, total, capped, from: hasRange ? range.from : null, to: hasRange ? range.to : null }, ip: req.ip });
+});
+
+/* ---------- U-23 import: adjudicated non-money master data only ---------- */
+const IMPORT_MAX_ROWS = 1000, IMPORT_MAX_BYTES = 900 * 1024;
+/* Minimal RFC-4180 CSV parser: quoted fields, "" escapes, CRLF/LF.
+   Returns { rows: string[][] } or { error } — malformed quoting fails
+   the whole file cleanly; nothing is ever partially parsed into a write. */
+function parseCsv(text) {
+  const rows = []; let row = [], field = '', inQ = false, i = 0;
+  const s = String(text || '').replace(/^\uFEFF/, '');
+  const pushField = () => { row.push(field); field = ''; };
+  const pushRow = () => { pushField(); rows.push(row); row = []; };
+  while (i < s.length) {
+    const c = s[i];
+    if (inQ) {
+      if (c === '"') { if (s[i + 1] === '"') { field += '"'; i += 2; continue; } inQ = false; i++; continue; }
+      field += c; i++; continue;
+    }
+    if (c === '"') { if (field.length) return { error: 'The CSV has a quote in the middle of a value (row ' + (rows.length + 1) + '). Please re-export or fix the file and try again.' }; inQ = true; i++; continue; }
+    if (c === ',') { pushField(); i++; continue; }
+    if (c === '\r') { if (s[i + 1] === '\n') i++; pushRow(); i++; continue; }
+    if (c === '\n') { pushRow(); i++; continue; }
+    field += c; i++;
+  }
+  if (inQ) return { error: 'The CSV has an unclosed quote. Please fix the file and try again.' };
+  if (field.length || row.length) pushRow();
+  return { rows };
+}
+const IMPORT_DEFS = {
+  pages: { label: 'Content pages', keyDesc: 'the page address (slug)',
+    columns: ['slug', 'name', 'title', 'meta_title', 'meta_desc', 'body', 'status', 'sort'], required: ['slug', 'name', 'title'],
+    keyOf: r => String(r.slug || '').toLowerCase(),
+    validate(r) {
+      if (!validSlug(r.slug)) return 'Page address (slug) must be lowercase letters, numbers and dashes only.';
+      if (r.name.length > 200) return 'Name is too long (max 200 characters).';
+      if (r.title.length > 300) return 'Title is too long (max 300 characters).';
+      if (r.status && !['published', 'draft'].includes(r.status)) return 'Status must be "published" or "draft".';
+      if (r.sort && !/^\d{1,6}$/.test(r.sort)) return 'Sort order must be a whole number (0 or more).';
+      return '';
+    },
+    exists: async (db, r) => !!(await db.get('SELECT id FROM pages WHERE slug = ?', [r.slug])),
+    insert: async (tx, r) => { await tx.run('INSERT INTO pages (name, slug, title, meta_title, meta_desc, body, status, sort) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', [r.name, r.slug, r.title, r.meta_title || '', r.meta_desc || '', r.body || '', r.status || 'published', parseInt(r.sort || '0', 10) || 0]); } },
+  canned_replies: { label: 'Canned support replies', keyDesc: 'the reply title',
+    columns: ['title', 'body'], required: ['title', 'body'],
+    keyOf: r => String(r.title || '').toLowerCase(),
+    validate(r) {
+      if (r.title.length > 120) return 'Title is too long (max 120 characters).';
+      if (r.body.length > 5000) return 'Reply text is too long (max 5000 characters).';
+      return '';
+    },
+    exists: async (db, r) => !!(await db.get('SELECT id FROM canned_replies WHERE LOWER(title) = LOWER(?)', [r.title])),
+    insert: async (tx, r, req) => { const t = now(); await tx.run('INSERT INTO canned_replies (title, body, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?)', [r.title, r.body, req.user.id, t, t]); } },
+  notif_templates: { label: 'Notification templates', keyDesc: 'the channel + template name',
+    columns: ['channel', 'slug', 'subject', 'body', 'enabled'], required: ['channel', 'slug', 'body'],
+    keyOf: r => String(r.channel || '').toLowerCase() + ':' + String(r.slug || '').toLowerCase(),
+    validate(r) {
+      if (!['email', 'sms', 'push'].includes(String(r.channel || '').toLowerCase())) return 'Channel must be email, sms or push.';
+      if (!/^[a-z0-9_]{1,64}$/.test(r.slug || '')) return 'Template name (slug) must be lowercase letters, numbers and underscores only.';
+      if (r.subject && r.subject.length > 300) return 'Subject is too long (max 300 characters).';
+      if (r.body.length > 10000) return 'Message body is too long (max 10000 characters).';
+      if (r.enabled && !['1', '0', 'yes', 'no', 'true', 'false'].includes(String(r.enabled).toLowerCase())) return 'Enabled must be yes or no.';
+      return '';
+    },
+    exists: async (db, r) => !!(await db.get('SELECT id FROM notif_templates WHERE channel = ? AND slug = ?', [String(r.channel).toLowerCase(), r.slug])),
+    insert: async (tx, r) => { const en = r.enabled === undefined || r.enabled === '' ? 1 : (['1', 'yes', 'true'].includes(String(r.enabled).toLowerCase()) ? 1 : 0); await tx.run('INSERT INTO notif_templates (channel, slug, subject, body, enabled) VALUES (?, ?, ?, ?, ?)', [String(r.channel).toLowerCase(), r.slug, r.subject || '', r.body, en]); } },
+  content_blocks: { label: 'Content blocks', keyDesc: 'the block key',
+    columns: ['key', 'title', 'body'], required: ['key', 'body'],
+    keyOf: r => String(r.key || '').toLowerCase(),
+    validate(r) {
+      if (!/^[a-z0-9_]{1,64}$/.test(r.key || '')) return 'Block key must be lowercase letters, numbers and underscores only.';
+      if (r.title && r.title.length > 300) return 'Title is too long (max 300 characters).';
+      if (r.body.length > 100000) return 'Body is too long (max 100000 characters).';
+      return '';
+    },
+    exists: async (db, r, req) => !!(await db.get(`SELECT ${keyCol(req.driver)} AS k FROM content_blocks WHERE ${keyCol(req.driver)} = ?`, [r.key])),
+    insert: async (tx, r, req) => { await tx.run(`INSERT INTO content_blocks (${keyCol(req.driver)}, title, body, updated_at) VALUES (?, ?, ?, ?)`, [r.key, r.title || '', r.body, now()]); } },
+};
+/* Build the full validation plan for a CSV. Writes NOTHING. Each row ends
+   up ready / duplicate / rejected with the true reason. */
+async function buildImportPlan(req, datasetKey, csvText) {
+  const def = IMPORT_DEFS[datasetKey];
+  if (!def) return { error: 'Choose what you are importing first.' };
+  const text = typeof csvText === 'string' ? csvText : '';
+  if (!text.trim()) return { error: 'Paste the CSV contents first — nothing was checked.' };
+  if (Buffer.byteLength(text, 'utf8') > IMPORT_MAX_BYTES) return { error: 'The file is too large for one import (maximum about 900 KB). Split it into smaller files.' };
+  const parsed = parseCsv(text);
+  if (parsed.error) return { error: parsed.error };
+  const raw = (parsed.rows || []).filter(r => !(r.length === 1 && String(r[0]).trim() === ''));
+  if (!raw.length) return { error: 'The file is empty — nothing was checked.' };
+  const header = raw[0].map(h => String(h || '').trim().toLowerCase());
+  for (const col of def.required) if (!header.includes(col)) return { error: `The file is missing the "${col}" column, so none of its rows can be read. The first row must name the columns: ${def.columns.join(', ')}.` };
+  const unknown = header.filter(h => h && !def.columns.includes(h));
+  const dataRows = raw.slice(1);
+  if (!dataRows.length) return { error: 'The file has column names but no data rows.' };
+  if (dataRows.length > IMPORT_MAX_ROWS) return { error: `The file has ${dataRows.length} rows — one import is limited to ${IMPORT_MAX_ROWS}. Split the file and import in parts.` };
+  const seen = new Map();
+  const plan = { def, dataset: datasetKey, rows: [], ready: 0, duplicates: 0, rejected: 0, unknownColumns: unknown };
+  for (let idx = 0; idx < dataRows.length; idx++) {
+    const cells = dataRows[idx];
+    const rowNo = idx + 2; // 1-based + header row
+    if (cells.length !== header.length) { plan.rows.push({ n: rowNo, key: '', status: 'rejected', reason: `This row has ${cells.length} values but the file has ${header.length} columns — the row does not line up with the column names.` }); plan.rejected++; continue; }
+    const rec = {};
+    header.forEach((h, i) => { if (h) rec[h] = String(cells[i] === undefined ? '' : cells[i]).trim(); });
+    const key = def.keyOf(rec);
+    const missing = def.required.find(c => !rec[c]);
+    if (missing) { plan.rows.push({ n: rowNo, key, status: 'rejected', reason: `Missing "${missing}" — every row needs a value in this column.` }); plan.rejected++; continue; }
+    const verr = def.validate(rec);
+    if (verr) { plan.rows.push({ n: rowNo, key, status: 'rejected', reason: verr }); plan.rejected++; continue; }
+    if (seen.has(key)) { plan.rows.push({ n: rowNo, key, status: 'duplicate', reason: `The same ${def.keyDesc} already appears in this file (row ${seen.get(key)}).` }); plan.duplicates++; continue; }
+    seen.set(key, rowNo);
+    if (await def.exists(req.db, rec, req)) { plan.rows.push({ n: rowNo, key, status: 'duplicate', reason: 'Already exists — it will be skipped, not overwritten.' }); plan.duplicates++; continue; }
+    plan.rows.push({ n: rowNo, key, status: 'ready', reason: '', data: rec });
+    plan.ready++;
+  }
+  return plan;
+}
+function importFilename(raw) {
+  const f = String(typeof raw === 'string' ? raw : '').trim().replace(/[^\w.\- ]/g, '').slice(0, 120);
+  return f || 'pasted-import.csv';
+}
+router.post('/data/import', async (req, res) => {
+  const { normalizeRole } = require('../lib/rbac');
+  if (normalizeRole(req.user) !== 'super') return res.status(403).render('error', { status: 403, message: 'Only the super admin can import data.' });
+  const dataset = typeof req.body.dataset === 'string' ? req.body.dataset : '';
+  const csvText = (typeof req.importCsvText === 'string' && req.importCsvText) ? req.importCsvText : (typeof req.body.csv_text === 'string' ? req.body.csv_text : '');
+  const filename = importFilename(req.body.filename);
+  const plan = await buildImportPlan(req, dataset, csvText);
+  if (plan.error) { await req.setFlash('error', 'Import check failed: ' + plan.error); return res.redirect(R(req, '/data')); }
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'data.import_dry_run', entity: 'data', entityId: dataset, detail: { dataset, filename, ready: plan.ready, duplicates: plan.duplicates, rejected: plan.rejected }, ip: req.ip });
+  const rowsHtml = plan.rows.map(r => `<tr><td>${r.n}</td><td>${esc(r.key || '—')}</td><td>${r.status === 'ready' ? ui.badge('Ready', 'ok') : r.status === 'duplicate' ? ui.badge('Already exists', 'warn') : ui.badge('Rejected', 'err')}</td><td>${esc(r.reason || '—')}</td></tr>`).join('');
+  const executeForm = plan.ready ? `<form method="POST" action="${R(req, '/data/import/execute')}" class="adm-form">
+      <input type="hidden" name="_csrf" value="${req.csrfToken}">
+      <input type="hidden" name="dataset" value="${esc(dataset)}">
+      <input type="hidden" name="filename" value="${esc(filename)}">
+      <textarea name="csv_text" style="display:none">${esc(csvText)}</textarea>
+      <p class="muted">The file is checked again when you import. Only the ${plan.ready} ready row(s) are saved; existing and rejected rows are never written.</p>
+      <button class="btn btn-p" type="submit">Import ${plan.ready} row(s) now</button></form>` : '<p class="muted">Nothing in this file can be imported — every row already exists or was rejected.</p>';
+  const body = ui.card(`Import check — ${esc(plan.def.label)} (file: ${esc(filename)})`,
+    `<p><strong>${plan.ready}</strong> ready · <strong>${plan.duplicates}</strong> already exist (skipped) · <strong>${plan.rejected}</strong> rejected. <strong>Nothing has been saved yet.</strong></p>` +
+    (plan.unknownColumns.length ? `<p class="muted">Columns not used for this data and ignored: ${plan.unknownColumns.map(esc).join(', ')}.</p>` : '') +
+    `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Row</th><th>Key</th><th>Result</th><th>Reason</th></tr></thead><tbody>${rowsHtml}</tbody></table></div>` + executeForm) +
+    `<p class="mt"><a class="btn btn-sm" href="${R(req, '/data')}">← Back to Import &amp; Export</a></p>`;
+  res.send(shell(req, '/data', 'Import Check', body));
+});
+router.post('/data/import/execute', async (req, res) => {
+  const { normalizeRole } = require('../lib/rbac');
+  if (normalizeRole(req.user) !== 'super') return res.status(403).render('error', { status: 403, message: 'Only the super admin can import data.' });
+  const dataset = typeof req.body.dataset === 'string' ? req.body.dataset : '';
+  const csvText = typeof req.body.csv_text === 'string' ? req.body.csv_text : '';
+  const filename = importFilename(req.body.filename);
+  /* Execute RE-validates the file from scratch: the numbers the operator
+     saw at check time are recomputed here, and inserts run in ONE
+     transaction — a failure anywhere writes nothing. */
+  const plan = await buildImportPlan(req, dataset, csvText);
+  if (plan.error) { await req.setFlash('error', 'Import stopped: ' + plan.error); return res.redirect(R(req, '/data')); }
+  const readyRows = plan.rows.filter(r => r.status === 'ready');
+  let inserted = 0;
+  if (readyRows.length) {
+    await req.db.transaction(async (tx) => {
+      for (const r of readyRows) {
+        if (await plan.def.exists(tx, r.data, req)) continue; // changed since the check — skip, never overwrite
+        await plan.def.insert(tx, r.data, req);
+        inserted++;
+      }
+    });
+  }
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'data.import', entity: 'data', entityId: dataset, detail: { dataset, filename, inserted, duplicates: plan.duplicates, rejected: plan.rejected }, ip: req.ip });
+  await req.setFlash('success', `Import finished: ${inserted} new row(s) added to ${plan.def.label}. ${plan.duplicates} already existed (skipped), ${plan.rejected} rejected — see a fresh check for their reasons.`);
+  res.redirect(R(req, '/data'));
+});
+
 /* ============================================================ SUPPORT */
 router.get('/support', async (req, res) => {
   // R-062: the priority filter used to run AFTER the LIMIT (a High ticket
@@ -1907,29 +2365,53 @@ router.get('/support', async (req, res) => {
   const page = pageOf(req);
   const status = req.query.status || '';
   const prio = ['high', 'medium', 'low'].includes(req.query.priority) ? req.query.priority : '';
+  /* U-25: soft-deleted tickets are excluded from every normal list and
+     count; the Deleted view (deleted=1) shows ONLY soft-deleted rows. */
+  const deletedView = req.query.deleted === '1';
   const where = [], params = [];
-  if (status) { where.push('s.status = ?'); params.push(status); }
+  where.push(deletedView ? 's.deleted_at IS NOT NULL' : 's.deleted_at IS NULL');
+  if (status && !deletedView) { where.push('s.status = ?'); params.push(status); }
   if (prio) { where.push("COALESCE(s.priority, 'medium') = ?"); params.push(prio); }
-  const w = where.length ? 'WHERE ' + where.join(' AND ') : '';
+  const w = 'WHERE ' + where.join(' AND ');
   const total = (await req.db.get(`SELECT COUNT(*) AS c FROM support_tickets s ${w}`, params)).c;
-  const rows = await req.db.query(`SELECT s.*, u.email FROM support_tickets s JOIN users u ON u.id=s.user_id ${w} ORDER BY s.updated_at DESC LIMIT ? OFFSET ?`, [...params, PER, (page - 1) * PER]);
-  const open = (await req.db.get("SELECT COUNT(*) AS c FROM support_tickets WHERE status='open'")).c;
+  const rows = await req.db.query(`SELECT s.*, u.email, du.email AS deleted_by_email FROM support_tickets s JOIN users u ON u.id=s.user_id LEFT JOIN users du ON du.id = s.deleted_by ${w} ORDER BY s.updated_at DESC LIMIT ? OFFSET ?`, [...params, PER, (page - 1) * PER]);
+  const open = (await req.db.get("SELECT COUNT(*) AS c FROM support_tickets WHERE status='open' AND deleted_at IS NULL")).c;
+  const deletedCount = (await req.db.get('SELECT COUNT(*) AS c FROM support_tickets WHERE deleted_at IS NOT NULL')).c;
   const supBase = (st, pr) => `${R(req, '/support')}?${[st ? 'status=' + st : '', pr ? 'priority=' + pr : ''].filter(Boolean).join('&')}`;
-  const body = `<div class="tabs"><a class="tab${!status ? ' active' : ''}" href="${supBase('', prio)}">All</a>
-    <a class="tab${status === 'open' ? ' active' : ''}" href="${supBase('open', prio)}">Open <span class="count">${open}</span></a>
-    <a class="tab${status === 'answered' ? ' active' : ''}" href="${supBase('answered', prio)}">Answered</a>
-    <a class="tab${status === 'closed' ? ' active' : ''}" href="${supBase('closed', prio)}">Closed</a></div>
+  const delBase = (pr) => `${R(req, '/support')}?deleted=1${pr ? '&priority=' + pr : ''}`;
+  /* U-26 TWO DOORS (§5.1): the ticket limits also live here, on the
+     queue they govern. Same /settings/support-limits route and the
+     same two keys the Settings card writes. Editable only for super
+     (that route is super-only); other roles see the current values. */
+  const supLimitsCard = ui.card('Ticket limits',
+    isSuperReq(req)
+      ? `<p class="muted">Caps enforced when a player opens support tickets. Set either limit to <strong>0</strong> for unlimited. This is the same setting as Settings → Support ticket limits.</p>` +
+        ui.formHtml(R(req, '/settings/support-limits'), [
+          { key: 'support_max_open_tickets', label: 'Max open tickets per player', type: 'number', value: getS(req.settings, 'support_max_open_tickets', '2'), help: 'Open = not closed. 0 = unlimited.' },
+          { key: 'support_max_new_tickets_24h', label: 'Max new tickets per player per 24 hours', type: 'number', value: getS(req.settings, 'support_max_new_tickets_24h', '3'), help: 'Rolling 24-hour window. 0 = unlimited.' },
+        ], { csrf: req.csrfToken, submit: 'Save ticket limits' })
+      : `<p class="muted">Max open tickets per player: <strong>${esc(getS(req.settings, 'support_max_open_tickets', '2'))}</strong> · Max new tickets per player per 24 hours: <strong>${esc(getS(req.settings, 'support_max_new_tickets_24h', '3'))}</strong> (0 = unlimited). Only the super admin can change these, in Settings → Support ticket limits.</p>`);
+  const body = supLimitsCard + `<div class="tabs"><a class="tab${!deletedView && !status ? ' active' : ''}" href="${supBase('', prio)}">All</a>
+    <a class="tab${!deletedView && status === 'open' ? ' active' : ''}" href="${supBase('open', prio)}">Open <span class="count">${open}</span></a>
+    <a class="tab${!deletedView && status === 'answered' ? ' active' : ''}" href="${supBase('answered', prio)}">Answered</a>
+    <a class="tab${!deletedView && status === 'closed' ? ' active' : ''}" href="${supBase('closed', prio)}">Closed</a>
+    <a class="tab${deletedView ? ' active' : ''}" href="${delBase(prio)}">Deleted <span class="count">${deletedCount}</span></a></div>
     <div class="tabs"><span class="muted">Priority:</span>
-    <a class="tab${!prio ? ' active' : ''}" href="${supBase(status, '')}">All</a>
-    <a class="tab${prio === 'high' ? ' active' : ''}" href="${supBase(status, 'high')}">High</a>
-    <a class="tab${prio === 'medium' ? ' active' : ''}" href="${supBase(status, 'medium')}">Medium</a>
-    <a class="tab${prio === 'low' ? ' active' : ''}" href="${supBase(status, 'low')}">Low</a></div>` +
+    <a class="tab${!prio ? ' active' : ''}" href="${deletedView ? delBase('') : supBase(status, '')}">All</a>
+    <a class="tab${prio === 'high' ? ' active' : ''}" href="${deletedView ? delBase('high') : supBase(status, 'high')}">High</a>
+    <a class="tab${prio === 'medium' ? ' active' : ''}" href="${deletedView ? delBase('medium') : supBase(status, 'medium')}">Medium</a>
+    <a class="tab${prio === 'low' ? ' active' : ''}" href="${deletedView ? delBase('low') : supBase(status, 'low')}">Low</a></div>` +
+    (deletedView
+      ? `<p class="muted">Soft-deleted tickets: hidden from all queues and counts, never erased — they stay here read-only as dispute evidence.</p>`
+      : `<p class="muted">Deleting a ticket is a soft delete: it is hidden from queues and counts, not erased, and stays viewable read-only under the Deleted filter as dispute evidence.</p>`) +
     ui.table(['ID', 'Player', 'Subject', 'Priority', 'Status', 'Updated', ''], rows.map(t =>
       [`<span class="code">${esc(t.public_id)}</span>`, esc(t.email), esc(t.subject),
        (t.priority || 'medium') === 'high' ? ui.badge('high', 'err') : (t.priority || 'medium') === 'low' ? ui.badge('low', 'muted') : ui.badge('medium', 'info'),
        ui.statusBadge(t.status), d(t.updated_at),
-       `<a class="btn btn-sm" href="${R(req, '/support/' + t.public_id)}">Open</a>`])) +
-    ui.paginate(supBase(status, prio), page, PER, total);
+       deletedView
+         ? `<a class="btn btn-sm" href="${R(req, '/support/' + t.public_id)}?view=deleted">View</a><br><span class="muted">deleted ${d(t.deleted_at)} by ${esc(t.deleted_by_email || ('#' + t.deleted_by))}</span>`
+         : `<a class="btn btn-sm" href="${R(req, '/support/' + t.public_id)}">Open</a> <form method="POST" action="${R(req, '/support/' + t.public_id + '/delete')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm">Delete</button></form>`])) +
+    ui.paginate(deletedView ? delBase(prio) : supBase(status, prio), page, PER, total);
   res.send(shell(req, '/support', 'Support Tickets', body));
 });
 /* BP-21 (v19): KYC review queue. Player-uploaded identity documents live
@@ -1942,7 +2424,19 @@ router.get('/kyc', async (req, res) => {
   const pending = await req.db.query(`SELECT kd.*, u.name AS uname, u.email AS uemail FROM kyc_documents kd JOIN users u ON u.id = kd.user_id WHERE kd.status = 'pending' ORDER BY kd.created_at ASC LIMIT 100`);
   const decided = await req.db.query(`SELECT kd.*, u.name AS uname, u.email AS uemail FROM kyc_documents kd JOIN users u ON u.id = kd.user_id WHERE kd.status != 'pending' ORDER BY kd.reviewed_at DESC LIMIT 30`);
   const rowP = (doc) => ['#' + doc.id, `<a href="${R(req, '/users/' + doc.user_id)}">${esc(doc.uname)}</a><br><span class="muted">${esc(doc.uemail)}</span>`, esc(KYC_DOC_LABELS[doc.doc_type] || doc.doc_type), esc(doc.original_name), (doc.size_bytes / 1024).toFixed(1) + ' KB', d(doc.created_at), `<a class="btn btn-sm btn-p" href="${R(req, '/kyc/' + doc.id)}">Review</a>`];
+  /* U-26 TWO DOORS (§5.4): the KYC master switch + gate scope also
+     live here, on the review queue. Same /settings/kyc route and the
+     same two keys the Settings card writes (that handler's complete
+     key set). Editable only for super; other roles keep the plain
+     note below the queue. */
+  const kycDoorCard = !isSuperReq(req) ? '' : ui.card('KYC requirement — master switch',
+    `<p class="muted">This is the same setting as Settings → KYC — one switch, two doors.</p>` +
+    ui.formHtml(R(req, '/settings/kyc'), [
+      { key: 'kyc_enabled', label: 'Enable KYC requirement for all users (master switch)', type: 'checkbox', value: getS(req.settings, 'kyc_enabled', '0') === '1', help: 'With the switch off, nobody is gated unless their per-user requirement is set to "required" on their user page. Users set to "exempt" are never gated.' },
+      { key: 'kyc_gate', label: 'Gate scope', type: 'select', options: [{ v: 'withdrawals', l: 'Withdrawals only' }, { v: 'deposits_and_withdrawals', l: 'Deposits and withdrawals' }], value: getS(req.settings, 'kyc_gate', 'withdrawals'), help: 'Withdrawals only = KYC approval is required before withdrawals. Deposits and withdrawals = deposits are gated too.' },
+    ], { csrf: req.csrfToken, submit: 'Save KYC settings' }));
   const body = `
+  ${kycDoorCard}
   ${ui.card('KYC — pending review (' + pending.length + ')', pending.length ? ui.table(['#', 'Player', 'Document', 'File', 'Size', 'Submitted', ''], pending.map(rowP)) : '<p class="muted">No documents waiting for review.</p>')}
   ${ui.card('Recently decided', decided.length ? ui.table(['#', 'Player', 'Document', 'Status', 'Reviewed', ''], decided.map(doc => ['#' + doc.id, esc(doc.uname), esc(KYC_DOC_LABELS[doc.doc_type] || doc.doc_type), ui.statusBadge(doc.status === 'approved' ? 'verified' : doc.status), d(doc.reviewed_at), `<a class="btn btn-sm" href="${R(req, '/kyc/' + doc.id)}">Open</a>`])) : '<p class="muted">Nothing decided yet.</p>')}
   <p class="muted">KYC is a switchable module (Settings → KYC). It ships OFF; per-user requirements live on each user page (KYC requirement: default / required / exempt).</p>`;
@@ -2076,9 +2570,21 @@ router.post('/support/canned-replies/:id/delete', async (req, res) => {
   res.redirect(R(req, '/support/canned-replies'));
 });
 router.get('/support/:publicId', async (req, res) => {
-  const t = await req.db.get('SELECT s.*, u.email FROM support_tickets s JOIN users u ON u.id=s.user_id WHERE s.public_id = ?', [req.params.publicId]);
+  const t = await req.db.get('SELECT s.*, u.email, du.email AS deleted_by_email FROM support_tickets s JOIN users u ON u.id=s.user_id LEFT JOIN users du ON du.id = s.deleted_by WHERE s.public_id = ?', [req.params.publicId]);
   if (!t) return notFound(req, res, 'Ticket not found.');
+  /* U-25: a soft-deleted ticket is invisible in the normal flow (same
+     404 as a missing ticket) and reachable ONLY via ?view=deleted from
+     the Deleted filter, rendered read-only — no reply, close, reopen or
+     delete controls — as dispute evidence. */
+  if (t.deleted_at && req.query.view !== 'deleted') return notFound(req, res, 'Ticket not found.');
   const msgs = await req.db.query('SELECT * FROM support_messages WHERE ticket_id = ? ORDER BY created_at', [t.id]);
+  if (t.deleted_at) {
+    const body = ui.card('Ticket ' + t.public_id + ' — ' + t.subject, `
+    <p class="muted">From: ${esc(t.email)} · Status: ${ui.statusBadge(t.status)}</p>
+    <p class="msg staff">This ticket was soft-deleted on ${d(t.deleted_at)} by ${esc(t.deleted_by_email || ('user #' + t.deleted_by))}. It is read-only: hidden from queues, retained as dispute evidence, and it cannot be replied to, closed, reopened or deleted again.</p>
+    <div class="msgs">${msgs.map(m => `<div class="msg${m.author_role !== 'player' ? ' staff' : ''}"><div class="msg-h">${esc(m.author_role)} · ${d(m.created_at)}</div><div>${esc(m.body)}</div></div>`).join('')}</div>`);
+    return res.send(shell(req, '/support', 'Support', body));
+  }
   const canned = t.status !== 'closed' ? await listCanned(req.db) : [];
   const picker = canned.length ? `<div class="field"><label>Insert a canned reply</label><select data-canned-picker data-source="cannedData"><option value="">Choose a canned reply…</option>${canned.map(c => `<option value="${c.id}">${esc(c.title)}</option>`).join('')}</select></div><script type="application/json" id="cannedData">${JSON.stringify(canned.map(c => ({ id: c.id, body: c.body }))).replace(/</g, '\\u003c')}</script>` : '';
   const body = ui.card('Ticket ' + t.public_id + ' — ' + t.subject, `
@@ -2087,12 +2593,16 @@ router.get('/support/:publicId', async (req, res) => {
     ${t.status !== 'closed' ? ui.formHtml(R(req, '/support/' + t.public_id + '/reply'), [{ key: 'message', label: 'Reply', type: 'textarea' }], { csrf: req.csrfToken, submit: 'Send reply', grid: false, extra: picker }) : '<p class="muted">Ticket closed.</p>'}
     <div class="btn-row mt">
       ${t.status !== 'closed' ? `<form method="POST" action="${R(req, '/support/' + t.public_id + '/close')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm">Close ticket</button></form>` : `<form method="POST" action="${R(req, '/support/' + t.public_id + '/reopen')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm">Reopen</button></form>`}
-    </div>`);
+      <form method="POST" action="${R(req, '/support/' + t.public_id + '/delete')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm">Delete ticket</button></form>
+    </div>
+    <p class="muted">Deleting is a soft delete: the ticket is hidden from queues, not erased, and stays viewable read-only under the Deleted filter as dispute evidence.</p>`);
   res.send(shell(req, '/support', 'Support', body));
 });
 router.post('/support/:publicId/reply', async (req, res) => {
   const t = await req.db.get('SELECT * FROM support_tickets WHERE public_id = ?', [req.params.publicId]);
   if (!t) return notFound(req, res, 'Ticket not found.');
+  /* U-25: a reply must never resurrect a soft-deleted ticket. */
+  if (t.deleted_at) { await req.setFlash('error', 'This ticket has been deleted and can no longer be replied to.'); return res.redirect(R(req, '/support')); }
   if (t.status === 'closed') { await req.setFlash('error', 'Ticket is closed. Reopen it before replying.'); return res.redirect(R(req, '/support/' + t.public_id)); }
   const body = String(req.body.message || '').trim().slice(0, 5000);
   if (!body) return res.redirect(R(req, '/support/' + t.public_id));
@@ -2111,16 +2621,31 @@ router.post('/support/:publicId/close', async (req, res) => {
   // R-103: the old close/reopen flashed nothing and "succeeded" for a
   // missing ticket or an already-closed one. The status guard makes the
   // affected-row check meaningful on every driver.
-  const r = await req.db.run("UPDATE support_tickets SET status='closed', updated_at=? WHERE public_id=? AND status != 'closed'", [now(), req.params.publicId]);
-  if (r.changes !== 1) { await req.setFlash('error', 'Ticket not found or already closed.'); return res.redirect(R(req, '/support/' + req.params.publicId)); }
+  const r = await req.db.run("UPDATE support_tickets SET status='closed', updated_at=? WHERE public_id=? AND status != 'closed' AND deleted_at IS NULL", [now(), req.params.publicId]);
+  if (r.changes !== 1) { await req.setFlash('error', 'Ticket not found, already closed, or deleted.'); return res.redirect(R(req, '/support/' + req.params.publicId)); }
   await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'support.close', entity: 'support', entityId: req.params.publicId, detail: {}, ip: req.ip });
   res.redirect(R(req, '/support/' + req.params.publicId));
 });
 router.post('/support/:publicId/reopen', async (req, res) => {
-  const r = await req.db.run("UPDATE support_tickets SET status='open', updated_at=? WHERE public_id=? AND status != 'open'", [now(), req.params.publicId]);
-  if (r.changes !== 1) { await req.setFlash('error', 'Ticket not found or already open.'); return res.redirect(R(req, '/support/' + req.params.publicId)); }
+  const r = await req.db.run("UPDATE support_tickets SET status='open', updated_at=? WHERE public_id=? AND status != 'open' AND deleted_at IS NULL", [now(), req.params.publicId]);
+  if (r.changes !== 1) { await req.setFlash('error', 'Ticket not found, already open, or deleted.'); return res.redirect(R(req, '/support/' + req.params.publicId)); }
   await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'support.reopen', entity: 'support', entityId: req.params.publicId, detail: {}, ip: req.ip });
   res.redirect(R(req, '/support/' + req.params.publicId));
+});
+/* U-25: staff soft delete. Sets deleted_at/deleted_by (migration v19);
+   the row is NEVER hard-deleted — it leaves every queue and count and
+   stays viewable read-only under the Deleted filter as dispute
+   evidence. Executes on click (no confirmation, per the admin rule)
+   and sends NO notification email. Already-deleted or missing tickets
+   fail with a true-reason message. */
+router.post('/support/:publicId/delete', async (req, res) => {
+  const t = await req.db.get('SELECT * FROM support_tickets WHERE public_id = ?', [req.params.publicId]);
+  if (!t || t.deleted_at) { await req.setFlash('error', 'Ticket not found or already deleted.'); return res.redirect(R(req, '/support')); }
+  const r = await req.db.run('UPDATE support_tickets SET deleted_at = ?, deleted_by = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL', [now(), req.user.id, now(), t.id]);
+  if (r.changes !== 1) { await req.setFlash('error', 'Ticket not found or already deleted.'); return res.redirect(R(req, '/support')); }
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'support.delete', entity: 'support', entityId: t.public_id, detail: { ticket_id: t.id, status_at_delete: t.status }, ip: req.ip });
+  await req.setFlash('success', 'Ticket deleted. It is hidden from queues and stays viewable read-only under the Deleted filter.');
+  res.redirect(R(req, '/support'));
 });
 
 /* ============================================================ EXTENSIONS */
@@ -2252,7 +2777,7 @@ router.get('/notifications', async (req, res) => {
     const smtp = !!process.env.SMTP_HOST, sms = !!(process.env.TWILIO_SID && process.env.TWILIO_TOKEN);
     body += ui.card('Email (SMTP)', `<p>${smtp ? ui.badge('configured', 'ok') + ' Host: ' + esc(process.env.SMTP_HOST) : ui.badge('not configured', 'warn') + ' — set SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS/SMTP_FROM in .env (see README).'}</p>`) +
       ui.card('SMS (Twilio)', `<p>${sms ? ui.badge('configured', 'ok') : ui.badge('not configured', 'warn') + ' — set TWILIO_SID/TWILIO_TOKEN/TWILIO_FROM in .env.'}</p>`) +
-      ui.card('Push', `<p>${ui.badge('not configured', 'warn')} — plug an FCM/APNs provider into <span class="code">lib/notify.js</span>.</p>`) +
+      ui.card('Push', `<p>${ui.badge('not configured', 'warn')} — push notifications are not set up yet.</p>`) +
       `<p class="muted">When a provider is not configured, notifications are logged to the outbox and the site keeps working — nothing breaks.</p>`;
   }
   res.send(shell(req, '/notifications', 'Notifications', body));
@@ -2327,7 +2852,11 @@ router.post('/notifications/send', async (req, res) => {
       } else {
         const at = now() + cooling * 1000 * bi;
         for (const t of batches[bi]) {
-          await req.db.run("INSERT INTO notifications_log (channel, to_addr, subject, body, status, error, created_at, batch_no, scheduled_at) VALUES ('email', ?, ?, ?, 'queued', '', ?, ?, ?)", [t.email, subject, message, now(), bi + 1, at]);
+          /* D3-C5 (v20): queued batches bypassed the v20 outbox
+             masking — the raw subject/message (incl. any secret link)
+             was INSERTed verbatim while batch 1 went through
+             sendRaw/maskForLog. Same masking here, before INSERT. */
+          await req.db.run("INSERT INTO notifications_log (channel, to_addr, subject, body, status, error, created_at, batch_no, scheduled_at) VALUES ('email', ?, ?, ?, 'queued', '', ?, ?, ?)", [t.email, notify.maskForLog(subject), notify.maskForLog(message), now(), bi + 1, at]);
           queued++;
         }
       }
@@ -2385,13 +2914,16 @@ router.post('/notifications/process-due', async (req, res) => {
   // Count the full backlog honestly; only 200 process per run.
   const dueTotal = (await req.db.get("SELECT COUNT(*) AS c FROM notifications_log WHERE status = 'queued' AND scheduled_at > 0 AND scheduled_at <= ?", [now()])).c;
   const due = await req.db.query("SELECT * FROM notifications_log WHERE status = 'queued' AND scheduled_at > 0 AND scheduled_at <= ? ORDER BY scheduled_at LIMIT 200", [now()]);
-  let sent = 0, failed = 0;
+  let sent = 0, failed = 0, deferred = 0, retrying = 0;
   for (const row of due) {
     const r = await notify.sendQueued(req.db, req.settings, row);
-    if (r.status === 'sent') sent++; else failed++;
+    if (r.status === 'sent') sent++;
+    else if (r.status === 'deferred') deferred++;
+    else if (r.status === 'queued') retrying++;
+    else failed++;
   }
-  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'notify.process_due', entity: 'notification', entityId: '', detail: { due: dueTotal, processed: due.length, sent, failed }, ip: req.ip });
-  await req.setFlash('success', `Due batches processed: ${sent} sent, ${failed} failed (${dueTotal} due total, ${due.length} processed this run).`);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'notify.process_due', entity: 'notification', entityId: '', detail: { due: dueTotal, processed: due.length, sent, failed, retrying, deferred }, ip: req.ip });
+  await req.setFlash('success', `Due batches processed: ${sent} sent, ${failed} failed, ${retrying} scheduled for retry, ${deferred} deferred (notifications off) (${dueTotal} due total, ${due.length} processed this run).`);
   res.redirect(R(req, '/notifications?tab=outbox'));
 });
 router.get('/notifications/:id', async (req, res) => {
@@ -2523,7 +3055,7 @@ router.post('/content/:key', async (req, res) => {
 /* ============================================================ CRON JOBS */
 router.get('/cron', async (req, res) => {
   const jobs = await req.db.query('SELECT * FROM cron_jobs ORDER BY id');
-  const body = ui.card('Scheduled jobs', `<p class="muted">The scheduler runs inside the app (every 60s). Pause/resume or run any job on demand.</p>` +
+  const body = ui.card('Scheduled jobs', `<p class="muted">The scheduler runs inside the app (every 60s). Pause/resume or run any job on demand. These are the same jobs shown on the <a href="${R(req, '/automation')}">Automation</a> page — pausing or running a job in either place changes the same job.</p>` +
     ui.table(['Job', 'Every (min)', 'Next run', 'Last run', 'Last status', 'Message', 'Status', ''],
       jobs.map(j => [esc(j.name) + `<br><small class="muted">${esc(j.description || '')}</small>`, j.interval_minutes,
         j.next_run_at ? d(j.next_run_at) : '—', j.last_run_at ? d(j.last_run_at) : 'never',
@@ -2668,7 +3200,7 @@ router.get('/settings', async (req, res) => {
       { key: 'day_draw_time', label: 'Day draw time (HH:MM)', type: 'text', value: getS(s, 'day_draw_time', '14:00') },
       { key: 'eve_draw_time', label: 'Evening draw time (HH:MM)', type: 'text', value: getS(s, 'eve_draw_time', '21:00') },
       { key: 'commission_rate', label: 'Agent commission % on ticket sales', type: 'text', value: getS(s, 'commission_rate', '5') },
-      { key: 'deposit_mode', label: 'Deposit mode', type: 'select', options: ['manual'], value: 'manual', help: 'Deposits are ALWAYS manually reviewed. The old "auto" option implied an auto-approval that never existed, so it was removed (R-044).' },
+      { key: 'deposit_mode', label: 'Deposit mode', type: 'select', options: ['manual'], value: 'manual', help: 'Deposits are ALWAYS manually reviewed. The old "auto" option implied an auto-approval that never existed, so it was removed.' },
       { key: 'withdrawal_mode', label: 'Withdrawal mode', type: 'select', options: ['manual'], value: 'manual', help: 'Withdrawals are ALWAYS manually reviewed.' },
       { key: 'upcoming_draw_days', label: 'Upcoming draw days to pre-create (0 = disabled)', type: 'number', value: getS(s, 'upcoming_draw_days', '7'), help: 'How many days of Day/Evening draws the scheduler pre-creates. 0 disables pre-creation.' },
       { key: 'referral_rate', label: 'Referral commission % on referred ticket purchases', type: 'text', value: getS(s, 'referral_rate', '5') },
@@ -2679,23 +3211,27 @@ router.get('/settings', async (req, res) => {
      <form method="POST" action="${R(req, '/settings/prizes')}" class="adm-form"><input type="hidden" name="_csrf" value="${req.csrfToken}">
      <div class="prize-grid">${prizes.map(p => `<div class="field"><label>${p.pops_count} pop${p.pops_count > 1 ? 's' : ''} → ×</label><input type="number" name="mult_${p.pops_count}" value="${p.multiplier}" min="1"></div>`).join('')}</div>
      <div class="mt"><button class="btn btn-p" type="submit">Save prize table</button>
-     <button class="btn" type="submit" formaction="${R(req, '/settings/prizes/preview')}">Simulate first (BP-23 — no save)</button></div></form>`)}
+     <button class="btn" type="submit" formaction="${R(req, '/settings/prizes/preview')}">Simulate first (no save)</button></div></form>`)}
   ${ui.card('Withdrawal & risk controls', ui.formHtml(R(req, '/settings/risk'), [
       { key: 'withdrawal_turnover_required', label: 'Require 1× wagering before withdrawal', type: 'checkbox', value: getS(s, 'withdrawal_turnover_required', '1') === '1', help: 'Players must wager at least their approved deposits before withdrawing.' },
       { key: 'withdrawal_daily_cap', label: 'Daily withdrawal cap (e.g. 500.00; 0 = unlimited)', type: 'text', value: (parseFloat(getS(s, 'withdrawal_daily_cap', '0')) / 100).toFixed(2) },
       { key: 'withdrawal_monthly_cap', label: 'Monthly withdrawal cap (e.g. 5000.00; 0 = unlimited)', type: 'text', value: (parseFloat(getS(s, 'withdrawal_monthly_cap', '0')) / 100).toFixed(2) },
       { key: 'payout_lock_hours', label: 'Payout-detail change lock (hours, 24–72)', type: 'number', value: getS(s, 'payout_lock_hours', '48') },
       { key: 'maker_checker_threshold', label: 'Maker-checker threshold (e.g. 1000.00; 0 = disabled)', type: 'text', value: (parseFloat(getS(s, 'maker_checker_threshold', '0')) / 100).toFixed(2), help: 'Money actions at or above this amount need a second approver (see Approvals).' },
-      { key: 'auto_withdrawal_limit', label: 'Auto-withdrawal limit (e.g. 50.00; 0 = OFF — everything manual)', type: 'text', value: getS(s, 'auto_withdrawal_limit', '0'), help: 'BP-22 operator pre-authorization: a withdrawal at or under this amount (in the withdrawal\'s own currency) is AUTO-APPROVED by the system once every existing gate passes (wagering, OTP, KYC, payout lock). This deliberately bypasses maker-checker review for small amounts — set it knowingly. Auto-approval NEVER pays out by itself: payout still happens only through the normal mark-paid step with a provider payout ID. Per-user limits on the user page override this value.' },
+      { key: 'auto_withdrawal_limit', label: 'Auto-withdrawal limit (e.g. 50.00; 0 = OFF — everything manual)', type: 'text', value: getS(s, 'auto_withdrawal_limit', '0'), help: 'Operator pre-authorization: a withdrawal at or under this amount (in the withdrawal\'s own currency) is AUTO-APPROVED by the system once every existing gate passes (wagering, OTP, KYC, payout lock). This deliberately bypasses maker-checker review for small amounts — set it knowingly. Auto-approval NEVER pays out by itself: payout still happens only through the normal mark-paid step with a provider payout ID. Per-user limits on the user page override this value.' },
       { key: 'referral_cap_per_referee', label: 'Referral cap per referee (e.g. 50.00; 0 = unlimited)', type: 'text', value: (parseFloat(getS(s, 'referral_cap_per_referee', '0')) / 100).toFixed(2) },
     ], { csrf: req.csrfToken, submit: 'Save risk controls' }))}
-  ${ui.card('KYC — identity verification (BP-21)', ui.formHtml(R(req, '/settings/kyc'), [
+  ${ui.card('KYC — identity verification', ui.formHtml(R(req, '/settings/kyc'), [
       { key: 'kyc_enabled', label: 'Enable KYC requirement for all users (master switch)', type: 'checkbox', value: getS(s, 'kyc_enabled', '0') === '1', help: 'Ships OFF: with the switch off, nobody is gated unless their per-user requirement is set to "required" on their user page. Users set to "exempt" are never gated.' },
-      { key: 'kyc_gate', label: 'Gate scope', type: 'select', options: ['withdrawals', 'deposits_and_withdrawals'], value: getS(s, 'kyc_gate', 'withdrawals'), help: 'withdrawals = KYC approval is required before withdrawals only. deposits_and_withdrawals = deposits are gated too. Players submit documents on their /kyc page; review them under KYC in the menu.' },
+      { key: 'kyc_gate', label: 'Gate scope', type: 'select', options: [{ v: 'withdrawals', l: 'Withdrawals only' }, { v: 'deposits_and_withdrawals', l: 'Deposits and withdrawals' }], value: getS(s, 'kyc_gate', 'withdrawals'), help: 'Withdrawals only = KYC approval is required before withdrawals. Deposits and withdrawals = deposits are gated too. Players submit documents on their /kyc page; review them under KYC in the menu.' },
     ], { csrf: req.csrfToken, submit: 'Save KYC settings' }))}
   ${ui.card('Phone countries — dial codes & blocks', ui.formHtml(R(req, '/settings/phone-countries'), [
       { key: 'blocked_phone_countries', label: 'Blocked countries (ISO codes, comma-separated)', type: 'text', value: getS(s, 'blocked_phone_countries', ''), help: 'Example: PK,BD — players from these countries will NOT see their dial code in the phone dropdown and cannot register with that country number. Leave empty to allow all countries.' },
     ], { csrf: req.csrfToken, submit: 'Save phone countries' })) + `<p class="muted">The register and OTP phone fields show a country dial-code dropdown with all ${require('../lib/phone-countries').COUNTRIES.length} countries. Blocked countries are hidden from the dropdown and rejected server-side.</p>`}
+  ${ui.card('Support ticket limits', `<p class="muted">Caps enforced server-side when a player opens support tickets. Set either limit to <strong>0</strong> for unlimited.</p>` + ui.formHtml(R(req, '/settings/support-limits'), [
+      { key: 'support_max_open_tickets', label: 'Max open tickets per player', type: 'number', value: getS(s, 'support_max_open_tickets', '2'), help: 'Open = not closed. 0 = unlimited.' },
+      { key: 'support_max_new_tickets_24h', label: 'Max new tickets per player per 24 hours', type: 'number', value: getS(s, 'support_max_new_tickets_24h', '3'), help: 'Rolling 24-hour window. 0 = unlimited.' },
+    ], { csrf: req.csrfToken, submit: 'Save ticket limits' }))}
   ${ui.card('Homepage hero stats', `<p class="muted">Hero stats always show true database counts (players, tickets today, total paid out). The old 'marketing' mode — invented base numbers that ticked up by random amounts — was removed because it fabricated public statistics.</p>`)}
   ${ui.card('Currencies', `<p class="muted">JSON list of supported currencies. <span class="code">rate</span> = units per 1 base unit. First currency is the display default. Seeded rates are PLACEHOLDERS (no live FX updater exists) — update them here before enabling a currency. All 13 seeded payment rails are USD-only templates until the operator configures them per currency.</p>` +
     ui.formHtml(R(req, '/settings/currencies'), [
@@ -2856,6 +3392,23 @@ router.post('/settings/phone-countries', async (req, res) => {
   await req.setFlash('success', 'Phone country settings saved.');
   res.redirect(R(req, '/settings'));
 });
+/* U-19 (admin slice): the player backend enforces these exact keys when
+   a player opens support tickets. Both must be whole numbers >= 0;
+   0 = unlimited. An invalid value rejects the WHOLE save so a bad form
+   post can never half-apply one limit while persisting the other. */
+router.post('/settings/support-limits', async (req, res) => {
+  const keys = ['support_max_open_tickets', 'support_max_new_tickets_24h'];
+  const values = {};
+  for (const k of keys) {
+    const raw = typeof req.body[k] === 'string' ? req.body[k].trim() : '';
+    if (!/^\d+$/.test(raw)) { await req.setFlash('error', 'Ticket limits must be whole numbers of 0 or more (0 = unlimited). Nothing was saved.'); return res.redirect(R(req, '/settings')); }
+    values[k] = String(parseInt(raw, 10));
+  }
+  for (const k of keys) await setSetting(req.db, req.driver, k, values[k]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'settings.support_limits', entity: 'settings', entityId: '', detail: values, ip: req.ip });
+  await req.setFlash('success', 'Support ticket limits saved.');
+  res.redirect(R(req, '/settings'));
+});
 router.post('/settings/prizes/preview', async (req, res) => {
   /* BP-23(d): multiplier simulator. Parses the SAME fields as the save
      route with the same validation, but writes NOTHING — it renders the
@@ -2880,7 +3433,7 @@ router.post('/settings/prizes/preview', async (req, res) => {
   const current = Object.fromEntries(rows.map(r => [r.pops_count, r.multiplier]));
   const projCurrent = await engine.projectedMargin(req.db, current);
   const fmtPct = (x) => (x === null || x === undefined ? '—' : x.toFixed(1) + '%');
-  const body = ui.card('Multiplier simulator (BP-23) — nothing was saved',
+  const body = ui.card('Multiplier simulator — nothing was saved',
     `<p class="muted">Projected margin uses the REAL sales mix (all non-test entries ever sold, weighted by wager). Per-count RTP = multiplier ÷ 15. Margin at mix = 1 − expected payout ÷ stakes at that mix.</p>` +
     ui.table(['Pops', 'Current ×', 'Current RTP', 'Simulated ×', 'Simulated RTP', 'Entries sold', 'Stake share', 'Warning'],
       rows.map(r => {
@@ -3023,8 +3576,8 @@ router.post('/approvals/:id/approve', async (req, res) => {
     } else if (a.action === 'draw.cancel') {
       await cancelDraw(req.db, a.entity_id, req.settings, { actorId: req.user.id, ip: req.ip });
       await notifyDrawCancelled(req.db, req.settings, a.entity_id);
-    } else if (entity === 'deposit') await decideDeposit(req.db, a.entity_id, decision, req.user.id, req.settings);
-    else if (entity === 'withdrawal') await decideWithdrawal(req.db, a.entity_id, decision, req.user.id);
+    } else if (entity === 'deposit') await decideDeposit(req.db, a.entity_id, decision, req.user.id, req.settings, det.decision_reason || '');
+    else if (entity === 'withdrawal') await decideWithdrawal(req.db, a.entity_id, decision, req.user.id, '', det.decision_reason || '');
     else throw new Error('Unknown approval action');
     await req.db.run("UPDATE pending_approvals SET status = 'approved', decided_by = ?, decided_at = ? WHERE id = ?", [req.user.id, now(), a.id]);
     await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'approval.approved', entity: a.entity, entityId: a.entity_id, detail: { approval_id: a.id, action: a.action, amount: a.amount }, ip: req.ip });
@@ -3037,7 +3590,7 @@ router.post('/approvals/:id/approve', async (req, res) => {
     if (entity === 'withdrawal' && (decision === 'approve' || decision === 'reject' || decision === 'revoke' || decision === 'mark_paid')) {
       const w = await req.db.get('SELECT * FROM withdrawals WHERE id = ?', [a.entity_id]);
       const u = await req.db.get('SELECT email, name FROM users WHERE id = ?', [w.user_id]);
-      notify.send(req.db, req.settings, 'email', 'withdrawal_decided', u.email, { name: u.name, amount: money(req, w.net, w.currency), status: decision === 'mark_paid' ? 'paid' : decision + 'd' }).catch(() => {});
+      notify.send(req.db, req.settings, 'email', 'withdrawal_decided', u.email, { name: u.name, amount: money(req, w.net, w.currency), status: decidedWord(decision) }).catch(() => {});
     }
     await req.setFlash('success', 'Approved and executed.');
   } catch (e) { await req.setFlash('error', 'Execution failed: ' + e.message); }
@@ -3110,7 +3663,7 @@ router.post('/reconciliation/run', async (req, res) => {
 router.get('/flags', async (req, res) => {
   const open = await req.db.query(`SELECT f.*, u.email FROM account_flags f JOIN users u ON u.id = f.user_id WHERE f.reviewed_at IS NULL ORDER BY f.created_at DESC`);
   const done = await req.db.query(`SELECT f.*, u.email FROM account_flags f JOIN users u ON u.id = f.user_id WHERE f.reviewed_at IS NOT NULL ORDER BY f.created_at DESC LIMIT 50`);
-  const table = (rows, showReview) => ui.table(['When', 'User', 'Flag', 'Detail', 'Reviewed', ''], rows.map(f => [d(f.created_at), esc(f.email) + ` (<a href="${R(req, '/users/' + f.user_id)}">#${f.user_id}</a>)`, esc(f.flag_type), `<span class="code">${esc(String(f.detail).slice(0, 200))}</span>`, f.reviewed_at ? '✓ ' + d(f.reviewed_at) : '—',
+  const table = (rows, showReview) => ui.table(['When', 'User', 'Flag', 'Detail', 'Reviewed', ''], rows.map(f => [d(f.created_at), esc(f.email) + ` (<a href="${R(req, '/users/' + f.user_id)}">#${f.user_id}</a>)`, esc(FLAG_LABELS[f.flag_type] || String(f.flag_type || '').replace(/_/g, ' ')), esc(flagDetailText(f.detail)), f.reviewed_at ? '✓ ' + d(f.reviewed_at) : '—',
     showReview ? `<form method="POST" action="${R(req, '/flags/' + f.id + '/review')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm">Mark reviewed</button></form>` : '']));
   const body = ui.card('Open flags — review only, never auto-ban', `<p class="muted">Shared device/IP across accounts is a signal, not proof: households, agents and VPNs share IPs legitimately. Review and decide; the system never bans on a flag alone.</p>` + table(open, true)) +
     ui.card('Reviewed', table(done, false));
@@ -3143,7 +3696,12 @@ router.get('/staff', async (req, res) => {
   res.send(shell(req, '/staff', 'Staff', body));
 });
 router.post('/staff', async (req, res) => {
-  const { name, email, password, admin_role } = req.body;
+  /* U-20.4: raw body destructuring 500'd on object-typed fields
+     (name[a]=b -> name.trim is not a function). Accept strings only. */
+  const name = typeof req.body.name === 'string' ? req.body.name : '';
+  const email = typeof req.body.email === 'string' ? req.body.email : '';
+  const password = typeof req.body.password === 'string' ? req.body.password : '';
+  const admin_role = req.body.admin_role;
   const role = ['super', 'finance', 'support', 'risk'].includes(admin_role) ? admin_role : 'support';
   const pwErr = passwordError(password, 'admin', getBool(req.settings, 'secure_password', true));
   if (!name || !validEmail(email) || pwErr) { await req.setFlash('error', pwErr || 'Name and valid email required.'); return res.redirect(R(req, '/staff')); }
@@ -3175,14 +3733,22 @@ router.get('/security', async (req, res) => {
   const u = await req.db.get('SELECT totp_secret FROM users WHERE id = ?', [req.user.id]);
   const enforced = getBool(req.settings, 'admin_totp_required', false);
   res.send(shell(req, '/security', 'Security', ui.card('Authenticator (TOTP)', `
-    <p class="muted">Your authenticator protects the admin panel. ${enforced ? 'TOTP is REQUIRED for admins on this site (admin_totp_required is ON).' : 'TOTP enforcement is OFF (admin_totp_required). Enroll first, then an admin can enable enforcement in Settings → Toggles.'}</p>
+    <p class="muted">Your authenticator protects the admin panel. ${enforced ? 'TOTP is REQUIRED for admins on this site.' : 'TOTP is not required for admins yet. Enroll first, then turn on "Admin TOTP required" in Settings → Toggles.'}</p>
     <p>Status: ${u.totp_secret ? ui.badge('enabled', 'ok') : ui.badge('not enrolled', 'warn')}</p>
     ${u.totp_secret
       ? `<form method="POST" action="${R(req, '/security/totp/disable')}"><input type="hidden" name="_csrf" value="${req.csrfToken}"><div class="field"><label>Password (to confirm)</label><input type="password" name="password" required></div><div class="field"><label>Current authenticator code (or a backup code)</label><input type="text" name="totp_code" required autocomplete="off"></div><button class="btn btn-d" type="submit">Disable authenticator</button></form>`
-      : `<form method="POST" action="${R(req, '/security/totp/start')}"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-p" type="submit">Enroll authenticator</button></form>`}
+      : `<form method="POST" action="${R(req, '/security/totp/start')}"><input type="hidden" name="_csrf" value="${req.csrfToken}"><div class="field"><label>Password (to confirm)</label><input type="password" name="password" required></div><button class="btn btn-p" type="submit">Enroll authenticator</button></form>`}
   `)));
 });
-router.post('/security/totp/start', async (req, res) => {
+router.post('/security/totp/start', rateLimit({ windowMs: 15 * 60000, max: 10, keyFn: req => `admin-totp:${req.user.id}` }), async (req, res) => {
+  /* D2-C3 (v20): enrolment requires the current password, mirroring
+     the disable handler below (same field, same refusal). Admin
+     accounts always have a password, so no passwordless branch. */
+  {
+    const u = await req.db.get('SELECT password_hash FROM users WHERE id = ?', [req.user.id]);
+    const { verifyPassword: vpA } = require('../lib/util');
+    if (!u || !vpA(req.body.password || '', u.password_hash || '')) { await req.setFlash('error', 'Wrong password.'); return res.redirect(R(req, '/security')); }
+  }
   const authLib = require('../lib/auth');
   const secret = authLib.newTotpSecret();
   await authLib.touchSession(req.db, req.sess.id, { admin_totp_pending: secret });
@@ -3192,10 +3758,17 @@ router.post('/security/totp/start', async (req, res) => {
     <p><img src="${qrDataUrl}" alt="TOTP QR code" style="width:200px;height:200px"></p>
     <p class="muted">Or enter this secret manually: <span class="code">${esc(secret)}</span></p>
     <form method="POST" action="${R(req, '/security/totp/confirm')}"><input type="hidden" name="_csrf" value="${req.csrfToken}">
+    <div class="field"><label>Password (to confirm)</label><input type="password" name="password" required></div>
     <div class="field"><label>6-digit code from your app</label><input type="text" name="totp_code" required autocomplete="off"></div>
     <button class="btn btn-p" type="submit">Verify & enable</button></form>`)));
 });
 router.post('/security/totp/confirm', rateLimit({ windowMs: 15 * 60000, max: 10, keyFn: req => `admin-totp:${req.user.id}` }), async (req, res) => {
+  // D2-C3: password required again at confirm (mid-enrolment theft cannot finish it).
+  {
+    const u = await req.db.get('SELECT password_hash FROM users WHERE id = ?', [req.user.id]);
+    const { verifyPassword: vpB } = require('../lib/util');
+    if (!u || !vpB(req.body.password || '', u.password_hash || '')) { await req.setFlash('error', 'Wrong password.'); return res.redirect(R(req, '/security')); }
+  }
   const secret = req.sessionData.admin_totp_pending;
   if (!secret) { await req.setFlash('error', 'Setup session expired. Start again.'); return res.redirect(R(req, '/security')); }
   if (!verifyTotp(secret, req.body.totp_code)) { await req.setFlash('error', 'Invalid code. Try again.'); return res.redirect(R(req, '/security')); }
@@ -3211,7 +3784,7 @@ router.post('/security/totp/confirm', rateLimit({ windowMs: 15 * 60000, max: 10,
 router.post('/security/totp/disable', rateLimit({ windowMs: 15 * 60000, max: 10, keyFn: req => `admin-totp:${req.user.id}` }), async (req, res) => {
   // Refuse while enforcement is ON: disabling would violate the enforced policy.
   if (getBool(req.settings, 'admin_totp_required', false)) {
-    await req.setFlash('error', 'Cannot disable: admin TOTP is required on this site. Turn off admin_totp_required in Settings first.');
+    await req.setFlash('error', 'Cannot disable: two-factor authentication is required for admins on this site. Turn off "Admin TOTP required" in Settings first.');
     return res.redirect(R(req, '/security'));
   }
   const u = await req.db.get('SELECT * FROM users WHERE id = ?', [req.user.id]);

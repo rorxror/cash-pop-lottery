@@ -4,8 +4,9 @@
     <% /* SCAN fix (A-07): the heading matches the situation — a clean
           4xx is not "something went wrong", and a blocked action can
           offer its way forward (cta) instead of a dead end. */ %>
-    <h1><%= status === 404 ? 'Page not found' : (status === 403 ? 'Not available' : (status === 400 ? 'Check your request' : 'Something went wrong')) %></h1>
+    <h1><%= status === 404 ? 'Page not found' : (status === 403 ? 'Not available' : (status === 400 ? 'Check your request' : (status === 413 ? 'Submission too large' : 'Something went wrong'))) %></h1>
     <p class="muted"><%= message %></p>
+    <% if (typeof ref !== 'undefined' && ref) { %><p class="muted">Reference: <span class="code"><%= ref %></span></p><% } %>
     <div class="hero-cta">
       <% if (typeof cta !== 'undefined' && cta) { %><a href="<%= cta.href %>" class="btn btn-p"><%= cta.label %></a><% } %>
       <a href="/" class="btn <%= (typeof cta !== 'undefined' && cta) ? 'btn-g' : 'btn-p' %>">Back to Home</a>

@@ -119,7 +119,11 @@ async function boot() {
   }
 
   const app = express();
-  app.set('trust proxy', 1);
+  // v20 U-04b: trust X-Forwarded-For only from local/platform proxy hops.
+  // 'trust proxy = 1' resolved req.ip to Render's internal 10.26.x.x hop;
+  // this list returns the true client IP for the platform chain and ignores
+  // client-spoofed XFF prefixes (measured in adj-backend.md).
+  app.set('trust proxy', ['loopback', 'linklocal', 'uniquelocal']);
   app.disable('x-powered-by');
   app.set('view engine', 'ejs');
   app.set('views', path.join(__dirname, 'views'));
@@ -129,7 +133,7 @@ async function boot() {
   // serve stale JS/CSS after a deploy.
   try {
     const h = require('node:crypto').createHash('sha1');
-    for (const f of ['public/app.js', 'public/style.css']) {
+    for (const f of ['public/app.js', 'public/style.css', 'public/admin.css']) {
       h.update(fs.readFileSync(path.join(__dirname, f)));
     }
     app.locals.assetV = h.digest('hex').slice(0, 8);
@@ -242,6 +246,13 @@ async function boot() {
         captchaHtml: '', recaptchaHtml: '',
         googleOn: getBool(req.settings, 'google_oauth_enabled', false) && !!process.env.GOOGLE_CLIENT_ID,
       };
+      /* U-28.10 (v20): the console path is owner-only information. It used
+         to sit in res.locals on EVERY request, so one stray <%= adminPath %>
+         in a player template would have published it site-wide. No player
+         or agent view reads this local (admin pages receive the path
+         explicitly as ui.layout's adminPath argument, from req.adminPath),
+         so the local is now deleted for every non-console request. */
+      if (!(req.path === ADMIN_PATH || req.path.startsWith(ADMIN_PATH + '/'))) delete res.locals.adminPath;
       // live getter: routes (e.g. anon captcha sessions) may create the session after this middleware
       Object.defineProperty(res.locals, 'csrf', { enumerable: true, configurable: true, get: () => req.csrfToken || '' });
       next();
@@ -309,7 +320,14 @@ async function boot() {
     if (req.path.startsWith('/webhooks/')) return next();
     if (!req.sess) {
       const authPaths = ['/login', '/forgot', '/register', '/login/otp/request', '/login/otp/verify', '/contact']; // SCAN fix (A-10): /contact joins the session-required set
-      if (authPaths.includes(req.path)) return res.status(403).render('error', { status: 403, message: 'Security token mismatch. Please open the form first and try again.' });
+      /* D2-C7 (v20): the exact-match list never matched the PARAMETERIZED
+         reset path (/reset/<token>), so the most sensitive auth POST of
+         all ran with no session and no CSRF token — token secrecy was
+         the only barrier. The genuine flow is unaffected: GET
+         /reset/:token now creates the anon session + CSRF cookie first
+         (routes/auth.js), so an emailed-link visitor POSTs with a
+         session and the standard check below applies. */
+      if (authPaths.includes(req.path) || req.path.startsWith('/reset/')) return res.status(403).render('error', { status: 403, message: 'Security token mismatch. Please open the form first and try again.' });
       return next(); // e.g. /setup — nothing to forge against
     }
     if (!checkCsrf(req)) return res.status(403).render('error', { status: 403, message: 'Security token mismatch. Please go back and try again.' });
@@ -474,8 +492,29 @@ async function boot() {
   app.use((req, res) => res.status(404).render('error', { status: 404, message: 'Page not found.' }));
   // eslint-disable-next-line no-unused-vars
   app.use((err, req, res, next) => {
-    console.error('[error]', err);
-    res.status(500).render('error', { status: 500, message: 'Something went wrong. The team has been notified.' });
+    if (res.headersSent) return next(err);
+    /* D4-C4 (v20): body-parser's PayloadTooLargeError used to fall into
+       the generic 500. An oversized submission is the CLIENT's error —
+       answer 413 with the true reason, in the same friendly family. */
+    if (err && (err.type === 'entity.too.large' || err.status === 413)) {
+      return res.status(413).render('error', { status: 413, message: 'That submission was too large to process. Please go back and try again with less data.' });
+    }
+    /* A body the parsers could not read at all is likewise a 400, not a
+       server fault — friendly wording, no parser internals. */
+    if (err && (err.type === 'entity.parse.failed' || (err instanceof SyntaxError && err.status === 400))) {
+      return res.status(400).render('error', { status: 400, message: 'That submission could not be read. Please go back and try again.' });
+    }
+    /* U-24 (v20): an unexpected error shows the player a SHORT REFERENCE
+       CODE only — no message, class, stack or SQL ever reaches the page.
+       The full detail goes to the server log AND the audit trail under
+       that same code, so support can find the exact failure from the
+       code the user quotes. */
+    const ref = 'E' + Date.now().toString(36).toUpperCase() + require('node:crypto').randomBytes(2).toString('hex').toUpperCase();
+    console.error(`[error] ref=${ref}`, err);
+    try {
+      require('./lib/audit').log(db, { actorId: req.user ? req.user.id : null, actorRole: 'system', action: 'error.unhandled', entity: 'http', entityId: ref, detail: { method: req.method, path: req.path, error: String(err && err.message || err).slice(0, 500) }, ip: req.ip || '' }).catch(() => {});
+    } catch {}
+    res.status(500).render('error', { status: 500, message: 'Something went wrong. The team has been notified.', ref });
   });
 
   const port = parseInt(process.env.PORT || '3000', 10);

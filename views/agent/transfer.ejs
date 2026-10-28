@@ -1,9 +1,20 @@
+<section class="wrap section">
+  <div class="agent-nav card">
+    <a href="/agent">Dashboard</a>
+    <a href="/agent/players">Players</a>
+    <a href="/agent/players/new">Add Player</a>
+    <a href="/agent/transfer" class="active">Transfer</a>
+    <a href="/agent/commissions">Commissions</a>
+    <a href="/agent/support">Support</a>
+  </div>
+</section>
 <section class="wrap section narrow">
   <div class="form-card">
     <h1>Transfer to Player</h1>
     <p class="muted">Move funds from your agent float to a player's wallet.</p>
     <form action="/agent/transfer" method="POST">
       <input type="hidden" name="_csrf" value="<%= csrf %>">
+      <input type="hidden" name="transfer_token" value="<%= typeof transferToken !== 'undefined' ? transferToken : '' %>">
       <div class="field">
         <label for="to_user_id">Player</label>
         <select id="to_user_id" name="to_user_id" required>

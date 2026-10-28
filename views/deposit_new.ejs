@@ -25,6 +25,20 @@
         <% }) %>
       </div>
       <% } %>
+      <% /* U-21 §5.3 chain leg (v20, U-24 wave): the gateway's PUBLIC,
+            non-secret configuration for this method (e.g. the card
+            processor's publishable key) — getPublicConfig hard-skips
+            secret/password fields and, post U-28.9, the sandbox/live
+            mode. Each value renders with its plain-word label, like
+            the receiving details above. */ %>
+      <% if (typeof gatewayPublic !== 'undefined' && gatewayPublic && gatewayPublic.length) { %>
+      <div class="instruction">
+        <p><strong>Payment gateway details:</strong></p>
+        <% gatewayPublic.forEach(function(g){ %>
+        <p class="muted"><%= g.label %>: <strong class="code"><%= g.value %></strong></p>
+        <% }) %>
+      </div>
+      <% } %>
       <form action="/deposit/new" method="POST" id="depositForm">
         <input type="hidden" name="_csrf" value="<%= csrf %>">
         <input type="hidden" name="method_id" value="<%= method.id %>">

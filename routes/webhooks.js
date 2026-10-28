@@ -13,7 +13,7 @@ const { now, sha256 } = require('../lib/util');
 const { getRail, verifyWebhookSignature } = require('../lib/rails');
 const { rateLimit } = require('../lib/auth');
 const { decideDeposit, releaseReferralCredits } = require('../lib/money');
-const { decryptField } = require('../lib/credentials');
+const { loadCredentials } = require('../lib/credentials');
 const { getSettings } = require('../lib/settings');
 const audit = require('../lib/audit');
 
@@ -37,6 +37,10 @@ function classifyStatus(typeRaw) {
 }
 // R-005: one unit convention per rail family. Stripe-style rails send
 // minor units; PayPal-style rails send major units. Never both.
+// U-21 note: qr_pay is listed although its rail declares webhook:false —
+// this route accepts webhooks for every rail key, and qr PSPs that do
+// send callbacks use minor units; the convention is retained deliberately
+// (documented in adj-payments.md, no behaviour change).
 const MINOR_UNIT_RAILS = new Set(['cards', 'crypto', 'apple_pay', 'google_pay', 'samsung_pay', 'qr_pay']);
 function parseEvent(body) {
   let j = {};
@@ -62,15 +66,11 @@ router.post('/:rail', rateLimit({ windowMs: 60000, max: 60, keyFn: r => 'webhook
   // credentials by default, and never on header presence alone).
   const methods = await req.db.query('SELECT * FROM payment_methods WHERE rail = ? AND enabled = 1', [rail.key]);
   for (const m of methods) {
-    const creds = {};
-    for (const c of await req.db.query('SELECT field_key, field_value, field_enc FROM gateway_credentials WHERE method_id = ?', [m.id])) {
-      try { creds[c.field_key] = decryptField(c.field_value, c.field_enc); }
-      catch (e) {
-        // R-084: a decrypt failure is AUDITED, never silently substituted.
-        await audit.log(req.db, { actorId: null, actorRole: 'webhook', action: 'webhook.credential_decrypt_failed', entity: 'method', entityId: m.id, detail: { field: c.field_key, error: String(e.message).slice(0, 200) }, ip: req.ip });
-        creds[c.field_key] = '';
-      }
-    }
+    // U-21: shared loader (lib/credentials.loadCredentials).
+    const creds = await loadCredentials(req.db, m.id, async (field, e) => {
+      // R-084: a decrypt failure is AUDITED, never silently substituted.
+      await audit.log(req.db, { actorId: null, actorRole: 'webhook', action: 'webhook.credential_decrypt_failed', entity: 'method', entityId: m.id, detail: { field, error: String(e.message).slice(0, 200) }, ip: req.ip });
+    });
     m.webhook_secret = creds.webhook_secret || '';
   }
   const check = verifyWebhookSignature(rail.key, req, methods);

@@ -3,6 +3,10 @@
     <h1>Profile</h1>
     <div class="verify-badges">
       <span class="badge <%= user.status === 'active' ? 'b-ok' : 'b-warn' %>"><%= user.status %></span>
+      <% /* U-15: verified badge flips purely off the profileVerified local
+            (routes/player.js: email OR phone verified). Not verified uses
+            b-warn — the design system's warning-badge treatment. */ %>
+      <% if (typeof profileVerified !== 'undefined' && profileVerified) { %><span class="badge b-ok">Profile verified</span><% } else { %><span class="badge b-warn">Profile not verified</span><% } %>
     </div>
     <form action="/profile" method="POST">
       <input type="hidden" name="_csrf" value="<%= csrf %>">
@@ -25,55 +29,82 @@
       </div>
       <button type="submit" class="btn btn-p btn-lg btn-block">Save Changes</button>
     </form>
-    <div class="card mt">
-      <div class="card-h"><h2>Contact verification</h2></div>
-      <p class="muted">A verified email or phone is required before depositing or withdrawing. If you cannot receive a code, contact support for help.</p>
-      <p>Email: <%= user.email_verified ? '<span class="badge b-ok">&#10003; verified</span>' : '<span class="badge b-warn">not verified</span>' %>
-        <% if (!user.email_verified) { %><form method="POST" action="/profile/verify-email" style="display:inline"><input type="hidden" name="_csrf" value="<%= csrf %>"><button class="btn btn-sm" type="submit">Send verification link</button></form><% } %></p>
-      <p>Phone: <%= user.mobile_verified ? '<span class="badge b-ok">&#10003; verified</span>' : '<span class="badge b-warn">not verified</span>' %>
-        <% if (!user.mobile_verified && user.phone) { %><form method="POST" action="/profile/verify-phone" style="display:inline"><input type="hidden" name="_csrf" value="<%= csrf %>"><button class="btn btn-sm" type="submit">Send code</button></form><% } else if (!user.mobile_verified) { %><span class="muted">Add a phone number above first.</span><% } %></p>
-      <% if (typeof verifyPhone !== 'undefined' && verifyPhone) { %>
-      <form method="POST" action="/profile/verify-phone/confirm">
-        <input type="hidden" name="_csrf" value="<%= csrf %>">
-        <div class="field"><label for="phoneCode">Phone code</label><input type="text" id="phoneCode" name="code" required autocomplete="off"></div>
-        <button class="btn btn-p" type="submit">Confirm phone</button>
-      </form>
+    <% /* U-14: the sections below are .v20-accordion groups (details/summary,
+         no JS needed), collapsed by default. Every save POST redirects back
+         to /profile, so a saved section lands collapsed again under the
+         auto-dismiss success flash — that reload is the auto-collapse. */ %>
+    <div class="v20-accordion mt">
+      <details class="v20-accordion-item">
+        <summary class="v20-accordion-summary"><span>Contact verification <span class="muted sm">&middot; Email <%= user.email_verified ? 'verified' : 'not verified' %> &middot; Phone <%= user.mobile_verified ? 'verified' : 'not verified' %></span></span><span class="v20-accordion-chevron" aria-hidden="true">&#9662;</span></summary>
+        <div class="v20-accordion-body">
+          <p class="muted">A verified email or phone is required before depositing or withdrawing. If you cannot receive a code, contact support for help.</p>
+          <% /* U-01: real badge markup — the old view printed the span HTML
+                as escaped text through the escaped-output tag. */ %>
+          <p>Email: <% if (user.email_verified) { %><span class="badge b-ok">&#10003; verified</span><% } else { %><span class="badge b-warn">not verified</span><% } %>
+            <% if (!user.email_verified) { %><form method="POST" action="/profile/verify-email" style="display:inline"><input type="hidden" name="_csrf" value="<%= csrf %>"><button class="btn btn-sm" type="submit">Send verification link</button></form><% } %></p>
+          <p>Phone: <% if (user.mobile_verified) { %><span class="badge b-ok">&#10003; verified</span><% } else { %><span class="badge b-warn">not verified</span><% } %>
+            <% if (!user.mobile_verified && user.phone) { %><form method="POST" action="/profile/verify-phone" style="display:inline"><input type="hidden" name="_csrf" value="<%= csrf %>"><button class="btn btn-sm" type="submit">Send code</button></form><% } else if (!user.mobile_verified) { %><span class="muted">Add a phone number above first.</span><% } %></p>
+          <% if (typeof verifyPhone !== 'undefined' && verifyPhone) { %>
+          <form method="POST" action="/profile/verify-phone/confirm">
+            <input type="hidden" name="_csrf" value="<%= csrf %>">
+            <div class="field"><label for="phoneCode">Phone code</label><input type="text" id="phoneCode" name="code" required autocomplete="off"></div>
+            <button class="btn btn-p" type="submit">Confirm phone</button>
+          </form>
+          <% } %>
+        </div>
+      </details>
+      <% if (typeof kycCard !== 'undefined' && kycCard) { %>
+      <details class="v20-accordion-item">
+        <summary class="v20-accordion-summary"><span>Identity verification (KYC) <span class="muted sm">&middot; <%= kycCard.statusLabel %></span></span><span class="v20-accordion-chevron" aria-hidden="true">&#9662;</span></summary>
+        <div class="v20-accordion-body">
+          <p class="muted">Status: <strong><%= kycCard.statusLabel %></strong><% if (kycCard.status === 'rejected' && kycCard.note) { %> — <%= kycCard.note %><% } %></p>
+          <p><a class="btn btn-sm" href="/kyc">Open the KYC page</a></p>
+        </div>
+      </details>
+      <% } %>
+      <% /* Notification toggle states computed ONCE so the summary count and
+            the switches below can never disagree. Same expressions the old
+            checkboxes used for `checked`. */ %>
+      <% var notifyWinOn = (user.notify_win_email === undefined || user.notify_win_email === null || Number(user.notify_win_email) !== 0);
+         var notifySupportOn = (user.notify_support_email === undefined || user.notify_support_email === null || Number(user.notify_support_email) !== 0);
+         var notifyOnCount = (notifyWinOn ? 1 : 0) + (notifySupportOn ? 1 : 0); %>
+      <details class="v20-accordion-item">
+        <summary class="v20-accordion-summary"><span>Email notifications <span class="muted sm">&middot; <%= notifyOnCount %> of 2 on</span></span><span class="v20-accordion-chevron" aria-hidden="true">&#9662;</span></summary>
+        <div class="v20-accordion-body">
+          <p class="muted">Choose which emails we send you. Announcements are always shown in the app under Announcements — there is no announcement email.</p>
+          <form method="POST" action="/profile/notifications">
+            <input type="hidden" name="_csrf" value="<%= csrf %>">
+            <% /* U-17: .v20-switch controls. Names/values are IDENTICAL to the
+                 old checkboxes (notify_win_email / notify_support_email = 1);
+                 the BP-13 POST contract is unchanged. */ %>
+            <label class="v20-switch"><input type="checkbox" class="v20-switch-input" name="notify_win_email" value="1" <%= notifyWinOn ? 'checked' : '' %>><span>Email me when I win a prize</span></label>
+            <label class="v20-switch"><input type="checkbox" class="v20-switch-input" name="notify_support_email" value="1" <%= notifySupportOn ? 'checked' : '' %>><span>Email me when support replies to my ticket</span></label>
+            <button type="submit" class="btn btn-p">Save notification preferences</button>
+          </form>
+        </div>
+      </details>
+      <% if (user.referral_code) { %>
+      <details class="v20-accordion-item">
+        <summary class="v20-accordion-summary"><span>&#128279; Your referral link <span class="muted sm">&middot; Code <%= user.referral_code %></span></span><span class="v20-accordion-chevron" aria-hidden="true">&#9662;</span></summary>
+        <div class="v20-accordion-body">
+          <p class="muted sm">Share this link — when friends register with it and play, you earn referral commission on their ticket purchases.</p>
+          <% /* U-16: full absolute URL (referralUrl local) in a read-only
+                input + Copy button (data-copy-target handled in app.js). */ %>
+          <div class="field">
+            <label for="refLink">Referral link</label>
+            <input type="text" id="refLink" readonly value="<%= (typeof referralUrl !== 'undefined' && referralUrl) ? referralUrl : ((typeof baseUrl !== 'undefined' && baseUrl ? baseUrl : '') + '/register?ref=' + user.referral_code) %>">
+          </div>
+          <p><button type="button" class="btn btn-sm" data-copy-target="refLink">Copy</button></p>
+          <% if (typeof refSummary !== 'undefined' && refSummary && refSummary.length) { %>
+          <p class="muted sm"><strong>Your referral earnings</strong></p>
+          <% refSummary.forEach(function(r){ %>
+          <p class="muted sm"><%= r.currency %>: pending <%= fmt(r.pending, r.currency) %> &middot; released <%= fmt(r.released, r.currency) %><% if (r.capped > 0) { %> &middot; capped <%= fmt(r.capped, r.currency) %><% } %></p>
+          <% }) %>
+          <p class="muted sm">Pending commission releases after your friend's first approved deposit and play.</p>
+          <% } %>
+        </div>
+      </details>
       <% } %>
     </div>
-    <% if (typeof kycCard !== 'undefined' && kycCard) { %>
-    <div class="card mt">
-      <div class="card-h"><h2>Identity verification (KYC)</h2></div>
-      <p class="muted">Status: <strong><%= kycCard.statusLabel %></strong><% if (kycCard.status === 'rejected' && kycCard.note) { %> — <%= kycCard.note %><% } %></p>
-      <p><a class="btn btn-sm" href="/kyc">Open the KYC page</a></p>
-    </div>
-    <% } %>
-    <div class="card mt">
-      <div class="card-h"><h2>Email notifications</h2></div>
-      <p class="muted">Choose which emails we send you. Announcements are always shown in the app under Announcements — there is no announcement email.</p>
-      <form method="POST" action="/profile/notifications">
-        <input type="hidden" name="_csrf" value="<%= csrf %>">
-        <div class="field check">
-          <label><input type="checkbox" name="notify_win_email" value="1" <%= (user.notify_win_email === undefined || user.notify_win_email === null || Number(user.notify_win_email) !== 0) ? 'checked' : '' %>> Email me when I win a prize</label>
-        </div>
-        <div class="field check">
-          <label><input type="checkbox" name="notify_support_email" value="1" <%= (user.notify_support_email === undefined || user.notify_support_email === null || Number(user.notify_support_email) !== 0) ? 'checked' : '' %>> Email me when support replies to my ticket</label>
-        </div>
-        <button type="submit" class="btn btn-p">Save notification preferences</button>
-      </form>
-    </div>
-    <% if (user.referral_code) { %>
-    <div class="login-branding">
-      <div class="login-jackpot">🔗 Your referral link</div>
-      <p class="muted sm">Share this link — when friends register with it and play, you earn referral commission on their ticket purchases.</p>
-      <p><span class="code" id="refLink"><%= (typeof baseUrl !== 'undefined' && baseUrl ? baseUrl : '') %>/register?ref=<%= user.referral_code %></span></p>
-      <% if (typeof refSummary !== 'undefined' && refSummary && refSummary.length) { %>
-      <p class="muted sm"><strong>Your referral earnings</strong></p>
-      <% refSummary.forEach(function(r){ %>
-      <p class="muted sm"><%= r.currency %>: pending <%= fmt(r.pending, r.currency) %> &middot; released <%= fmt(r.released, r.currency) %><% if (r.capped > 0) { %> &middot; capped <%= fmt(r.capped, r.currency) %><% } %></p>
-      <% }) %>
-      <p class="muted sm">Pending commission releases after your friend's first approved deposit and play.</p>
-      <% } %>
-    </div>
-    <% } %>
   </div>
 </section>

@@ -43,5 +43,10 @@
     <% } else { %>
     <p class="muted mt">This ticket is closed.</p>
     <% } %>
+    <form action="/agent/support/<%= ticket.public_id %>/delete" method="POST" class="mt">
+      <input type="hidden" name="_csrf" value="<%= csrf %>">
+      <button type="submit" class="btn btn-d">Delete ticket</button>
+      <p class="muted">Soft delete: the ticket is hidden from queues, not erased — operators keep it as dispute evidence.</p>
+    </form>
   </div>
 </section>

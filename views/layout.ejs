@@ -43,7 +43,7 @@ gtag('config', '<%= extCfg('google_analytics').tracking_id %>');
     </nav>
     <div class="head-right">
       <details class="cur-picker">
-        <summary class="cur-pill" aria-label="Display currency">
+        <summary class="cur-pill" aria-label="<%= user ? 'Wallet balance and display currency' : 'Display currency' %>">
           <span class="cur-code"><%= cur %></span>
           <% if (user) { %><span class="cur-bal"><%= fmt(walletBal(cur), cur) %></span><% } %>
           <span class="cur-caret">&#9662;</span>
@@ -65,8 +65,7 @@ gtag('config', '<%= extCfg('google_analytics').tracking_id %>');
       </details>
       <% if (user) { %>
       <div class="user-menu" id="userMenu">
-        <button class="balance-pill" id="userMenuBtn" aria-haspopup="true" aria-expanded="false">
-          <span class="ubal"><%= fmt(walletBal(cur), cur) %></span>
+        <button class="user-pill" id="userMenuBtn" aria-haspopup="true" aria-expanded="false" aria-label="Account menu for <%= user.name %>">
           <span class="uname"><%= user.name %></span>
           <span class="caret">&#9662;</span>
         </button>
@@ -93,8 +92,8 @@ gtag('config', '<%= extCfg('google_analytics').tracking_id %>');
 
 <% if (typeof flash !== 'undefined' && flash && (flash.error || flash.success)) { %>
 <div class="wrap flash-wrap">
-  <% if (flash.error) { %><div class="flash f-err" role="alert"><%= flash.error %></div><% } %>
-  <% if (flash.success) { %><div class="flash f-ok" role="alert"><%= flash.success %></div><% } %>
+  <% if (flash.error) { %><div class="flash f-err" role="alert" data-flash="error"><%= flash.error %><button type="button" class="flash-close" data-flash-close aria-label="Dismiss message">&times;</button></div><% } %>
+  <% if (flash.success) { %><div class="flash f-ok" role="alert" data-flash="success" data-auto-dismiss="4000"><%= flash.success %><button type="button" class="flash-close" data-flash-close aria-label="Dismiss message">&times;</button></div><% } %>
 </div>
 <% } %>
 

@@ -6,6 +6,7 @@
     <p class="muted"><a href="/login">Back to login</a></p>
     <% } else { %>
     <p class="muted">Enter your account email and we'll send you a password reset link.</p>
+    <% if (typeof formError !== 'undefined' && formError) { %><div class="flash f-err"><%= formError %></div><% } %>
     <form action="/forgot" method="POST">
       <input type="hidden" name="_csrf" value="<%= csrf %>">
       <div class="field">

@@ -10,8 +10,8 @@ const { requireLogin, rateLimit } = require('../lib/auth');
 const { getBalances, postLedger, depositPolicy, withdrawalPolicy, chargeFor, createDeposit, createWithdrawal, checkWithdrawalRules, notePayoutDetails, notePendingPayoutChange, promotePayoutDetails, releaseReferralCredits, maybeAutoApproveWithdrawal } = require('../lib/money');
 const kycLib = require('../lib/kyc');
 const uploadLib = require('../lib/upload');
-const { getRail, getReceivingDetails } = require('../lib/rails');
-const { newTotpSecret, totpUri, verifyTotp, verifyTotpStep, newBackupCodes, hashBackupCodes, useBackupCode, destroyUserSessions } = require('../lib/auth');
+const { getRail, getReceivingDetails, getPublicConfig, validateUserProof } = require('../lib/rails');
+const { newTotpSecret, totpUri, verifyTotp, verifyTotpStep, newBackupCodes, hashBackupCodes, useBackupCode, destroyUserSessions, parseUA } = require('../lib/auth');
 const notify = require('../lib/notify');
 const audit = require('../lib/audit');
 
@@ -34,20 +34,65 @@ async function tryAutoApprove(req, publicId) {
   } catch { return false; }
 }
 
+/* U-02 (v20): map a createWithdrawal throw to its TRUE reason. The
+   engine re-checks the v14 rules inside its transaction, so rule
+   failures arrive here as the rule's own message — pass those through
+   verbatim. The hold posts through postLedger, whose only money
+   failure is 'Insufficient balance' — enrich it with amounts. Anything
+   else rolled the hold back, so "no money was held" is the true fact. */
+async function withdrawFailureMessage(req, e, method, amount) {
+  if (e.message === 'Invalid withdrawal amount') return 'Enter a valid amount.';
+  if (e.message === 'Insufficient balance' && method) {
+    const wallets = await getBalances(req.db, req.user.id);
+    const bal = Number((wallets.find(w => w.currency === method.currency) || { balance: 0 }).balance);
+    return `Not enough balance: you asked to withdraw ${req.fmt(amount, method.currency)}, but your ${method.currency} wallet has ${req.fmt(bal, method.currency)} — you are ${req.fmt(amount - bal, method.currency)} short.`;
+  }
+  if (/Wagering requirement|bonus wagering|Daily withdrawal limit|Monthly withdrawal limit|Payout details|payment method you have deposited/.test(e.message)) return e.message;
+  return 'Your withdrawal could not be submitted and no money was held. Please contact support if this keeps happening.';
+}
+
 /* ---------------- playslip ---------------- */
-router.get('/play', requireLogin, async (req, res) => {
+/* U-02 (v20): one view-model builder for GET /play AND for the failed-buy
+   re-render, so a rejection can hand the player their playslip back with
+   every local the view needs — never the bare error page. forceCurrency
+   (the currency the buy actually attempted) wins over the funded-wallet
+   heuristic so the re-rendered balance matches the wallet that was
+   charged against. */
+async function playViewModel(req, forceCurrency) {
   const wagerOptions = req.wagerOptions;
   const prizeTable = await req.db.query('SELECT pops_count, multiplier FROM prize_table ORDER BY pops_count');
   const wallets = await getBalances(req.db, req.user.id);
   // R-071: the playslip offers every FUNDED wallet, not only the base
   // wallet — a EUR-funded player used to see $0.00 and could not play.
   const funded = wallets.filter(w => Number(w.balance) > 0).map(w => w.currency);
-  const sel = funded.includes(String(req.query.currency || '').toUpperCase()) ? String(req.query.currency).toUpperCase() : (funded[0] || baseCurrency(req));
+  const forced = String(forceCurrency || '').toUpperCase();
+  const sel = (forced && getCurrencies(req.settings).some(c => c.code === forced)) ? forced
+    : funded.includes(String(req.query.currency || '').toUpperCase()) ? String(req.query.currency).toUpperCase() : (funded[0] || baseCurrency(req));
   const bal = (wallets.find(w => w.currency === sel) || { balance: 0 }).balance;
-  res.render('play', {
-    metaTitle: 'Play', metaDesc: 'Pick your pops and buy a Cash Pop ticket.',
+  return {
     wagerOptions, prizeTable, maxDraws: parseInt(getS(req.settings, 'max_draws', '7'), 10) || 7, balance: bal,
     wallets, playCurrency: sel,
+  };
+}
+/* U-02: a failed buy re-renders the playslip (HTTP 400, the standing
+   rejection contract) with the TRUE reason in the flash local — the
+   layout prints flash.error at the top of the slip — and the player's
+   selections in `slip` so the view can restore them. slip shape:
+   { pops: number[], wager: number (minor), drawType, numDraws, currency }. */
+async function renderPlayError(req, res, message, slip) {
+  const vm = await playViewModel(req, slip && slip.currency);
+  return res.status(400).render('play', {
+    metaTitle: 'Play', metaDesc: 'Pick your pops and buy a Cash Pop ticket.',
+    ...vm, slip: slip || null,
+    flash: { error: message, success: '' },
+  });
+}
+
+router.get('/play', requireLogin, async (req, res) => {
+  const vm = await playViewModel(req);
+  res.render('play', {
+    metaTitle: 'Play', metaDesc: 'Pick your pops and buy a Cash Pop ticket.',
+    ...vm, slip: null,
   });
 });
 
@@ -61,11 +106,14 @@ router.post('/play/buy', requireLogin, rateLimit({ windowMs: 60000, max: 10, key
   const wager = parseInt(req.body.wager, 10);
   const drawType = String(req.body.draw_type || 'DAY').toUpperCase();
   const numDraws = Math.max(1, Math.min(maxDraws, parseInt(req.body.num_draws, 10) || 1));
-  const fail = (msg) => res.status(400).render('error', { status: 400, message: msg });
+  // U-02: the selections the player just made, handed back on every
+  // rejection so the re-rendered slip restores them (see renderPlayError).
+  const slip = { pops, wager, drawType, numDraws, currency: String(req.body.currency || '').toUpperCase() || baseCurrency(req) };
+  const fail = (msg) => renderPlayError(req, res, msg, slip);
 
   if (!pops.length || pops.length > maxPops) return fail(`Pick between 1 and ${maxPops} pops.`);
-  if (!req.wagerOptions.includes(wager)) return fail('Invalid wager amount.');
-  if (!['DAY', 'EVE', 'BOTH'].includes(drawType)) return fail('Invalid draw type.');
+  if (!req.wagerOptions.includes(wager)) return fail('That wager is not available. Pick one of the wager amounts shown on the slip.');
+  if (!['DAY', 'EVE', 'BOTH'].includes(drawType)) return fail('That draw choice is not available. Pick Day, Evening or Both.');
 
   // Responsible play: self-exclusion / cooling-off blocks the lottery too,
   // not just scratch (previously only scratch checked this).
@@ -176,7 +224,11 @@ router.post('/play/buy', requireLogin, rateLimit({ windowMs: 60000, max: 10, key
           const ag = await tx.get('SELECT status FROM users WHERE id = ?', [req.user.agent_id]);
           if (ag && ag.status === 'active') {
             const amt = Math.round(total * rate / 100);
-            await tx.run('INSERT INTO commissions (agent_id, user_id, ticket_id, currency, amount, rate, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            /* D1-C2 (v20): the referral accrual above guards comm > 0;
+               this insert did not — a sub-10-minor ticket at 5% created
+               a ZERO commission row that later wedged the agent's whole
+               settlement (postLedger refuses 0). No row for no money. */
+            if (amt > 0) await tx.run('INSERT INTO commissions (agent_id, user_id, ticket_id, currency, amount, rate, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
               [req.user.agent_id, req.user.id, r.id, currency, amt, rate, now()]);
           } else if (ag && ag.status !== 'active') await audit.log(tx, { actorId: req.user.id, actorRole: 'player', action: 'commission.skipped_inactive', entity: 'user', entityId: req.user.agent_id, detail: { status: ag.status }, ip: req.ip });
         }
@@ -196,16 +248,34 @@ router.post('/play/buy', requireLogin, rateLimit({ windowMs: 60000, max: 10, key
     try { await require('../lib/draws').checkThresholdDraws(req.db, req.settings); } catch (e) { console.error('threshold check failed:', e.message); }
     res.redirect('/ticket/' + publicId);
   } catch (e) {
-    console.error('[play/buy] failed:', e.message); res.status(400).render('error', { status: 400, message: 'Purchase failed. Please try again or contact support.' });
+    // U-02: never a generic "Purchase failed" again. Each rejection maps
+    // to the check that actually threw (see audits/owner-fix-round/
+    // adj-backend.md for the traced map); the unknown case states the
+    // one true fact left — the buy is a single transaction, so a throw
+    // means it rolled back and no money was taken.
+    console.error('[play/buy] failed:', e.message);
+    let msg;
+    if (e.message === 'Insufficient balance') {
+      const wallets = await getBalances(req.db, req.user.id);
+      const bal = Number((wallets.find(w => w.currency === currency) || { balance: 0 }).balance);
+      msg = `Not enough balance: this ticket costs ${req.fmt(total, currency)}, but your ${currency} wallet has ${req.fmt(bal, currency)} — you are ${req.fmt(total - bal, currency)} short. Add funds, or lower your wager or number of pops.`;
+    } else if (/just closed|per-draw stake cap|daily loss limit/.test(e.message)) {
+      msg = e.message;
+    } else if (/TICKET_HMAC_SECRET/.test(e.message)) {
+      msg = 'Ticket purchases are temporarily unavailable. Please contact support.';
+    } else {
+      msg = 'Your purchase could not be completed and no money was taken. Please contact support if this keeps happening.';
+    }
+    return renderPlayError(req, res, msg, slip);
   }
 });
 
 /* ---------------- tickets ---------------- */
 router.get('/tickets', requireLogin, async (req, res) => {
   // DS-058: paginated (was a hard LIMIT 100 with no way to reach older tickets).
-  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
   const totalRow = await req.db.get('SELECT COUNT(*) AS c FROM tickets WHERE user_id = ?', [req.user.id]);
   const totalPages = Math.max(1, Math.ceil(Number(totalRow.c) / 25));
+  const page = Math.min(Math.max(1, parseInt(req.query.page, 10) || 1), totalPages); // D4-C2 clamp
   const tickets = await req.db.query('SELECT * FROM tickets WHERE user_id = ? ORDER BY created_at DESC LIMIT 25 OFFSET ?', [req.user.id, (page - 1) * 25]);
   for (const t of tickets) {
     // CASE WHEN, not SUM(status = ?): SQLite/MySQL treat a comparison as
@@ -251,19 +321,37 @@ router.get('/wallet', requireLogin, async (req, res) => {
     ...deps.map(d => ({ ...d, kind: 'deposit' })),
     ...wds.map(d => ({ ...d, kind: 'withdrawal' })),
   ].sort((a, b) => b.created_at - a.created_at);
+  /* D4-C1 (v20): a REJECTED deposit used to vanish from the player's
+     world entirely (it never reaches the ledger, so /transactions
+     cannot show it, and the pending card drops decided items). The
+     wallet now also carries a recent REQUEST history — deposits and
+     withdrawals in every status, with the admin's stored reason
+     (decision_reason) when one exists — so a decided request is always
+     visible in-app even when the notification email fails. */
+  const histDeps = await req.db.query("SELECT public_id, amount, currency, status, created_at, decision_reason FROM deposits WHERE user_id = ? ORDER BY created_at DESC LIMIT 10", [req.user.id]);
+  const histWds = await req.db.query("SELECT public_id, amount, currency, status, created_at, decision_reason FROM withdrawals WHERE user_id = ? ORDER BY created_at DESC LIMIT 10", [req.user.id]);
+  const requests = [
+    ...histDeps.map(d => ({ ...d, kind: 'deposit', reason: d.decision_reason || '' })),
+    ...histWds.map(d => ({ ...d, kind: 'withdrawal', reason: d.decision_reason || '' })),
+  ].sort((a, b) => b.created_at - a.created_at).slice(0, 15);
   const kycW = kycLib.kycBlock(req.settings, req.user, 'withdraw');
   const kycD = kycLib.kycBlock(req.settings, req.user, 'deposit');
   const kycSt = kycLib.kycStatusOf(req.user);
   const kycNotice = (kycW.required || kycD.required || kycSt !== 'none')
     ? { status: kycSt, statusLabel: kycLib.STATUS_LABELS[kycSt], withdrawBlocked: kycW.blocked, depositBlocked: kycD.blocked, note: req.user.kyc_note || '' } : null;
-  res.render('wallet', { metaTitle: 'Wallet', metaDesc: 'Your balances, deposits and withdrawals.', wallets, depositMethods, withdrawMethods, pending, kycNotice });
+  res.render('wallet', { metaTitle: 'Wallet', metaDesc: 'Your balances, deposits and withdrawals.', wallets, depositMethods, withdrawMethods, pending, requests, kycNotice });
 });
 
-function methodCustomFields(method) {
+/* U-21 §5.3: the rail field set depends on the flow — deposits ask for
+   payment PROOF (rail.userFields: tx hash, UTR, transfer reference),
+   withdrawals ask for the player's OWN payout destination
+   (rail.withdrawUserFields: their wallet address, their bank account).
+   Operator-defined method custom_fields apply to both, as before. */
+function methodCustomFields(method, kind) {
   let custom = [];
   try { custom = JSON.parse(method.custom_fields || '[]'); } catch {}
   const rail = getRail(method.rail);
-  const railFields = rail ? (rail.userFields || []) : [];
+  const railFields = rail ? ((kind === 'withdrawal' ? rail.withdrawUserFields : rail.userFields) || []) : [];
   return [...custom, ...railFields];
 }
 
@@ -281,29 +369,39 @@ router.get('/deposit/new', requireLogin, async (req, res) => {
   // DS-005: show the player WHERE to pay (receiving details from the
   // method's stored credentials - public payment addresses, never secrets).
   const receiving = await getReceivingDetails(req.db, method);
+  /* U-21 §5.3: non-secret gateway public config (e.g. the cards
+     publishable key, Google Pay gateway parameters) for the view to
+     render — getPublicConfig hard-skips secret/password fields. */
+  const gatewayPublic = await getPublicConfig(req.db, method);
   res.render('deposit_new', {
-    metaTitle: 'Deposit', metaDesc: '', methods, receiving,
+    metaTitle: 'Deposit', metaDesc: '', methods, receiving, gatewayPublic,
     method: { ...method, custom_fields: methodCustomFields(method) },
     methodDec: decimalsFor(method.currency, req.currencies),
   });
 });
 
 router.post('/deposit/new', requireLogin, rateLimit({ windowMs: 60000, max: 10, keyFn: req => `deposit:${req.user.id}` }), async (req, res) => { // DS-050: pending-deposit spam cap
+  // U-02: submission failures return the player to the form (or the
+  // wallet, when the form itself is gated) with the TRUE reason in the
+  // flash — the reason texts below are unchanged, only the bare error
+  // page is gone.
+  const backToForm = async (msg, methodId) => { await req.setFlash('error', msg); return res.redirect('/deposit/new' + (methodId ? '?m=' + methodId : '')); };
+  const backToWallet = async (msg) => { await req.setFlash('error', msg); return res.redirect('/wallet'); };
   const policy = depositPolicy(req.settings, req.user);
-  if (!policy.allowed) return res.status(403).render('error', { status: 403, message: policy.reason });
+  if (!policy.allowed) return backToWallet(policy.reason);
   // DS-008: self-exclusion/cooling-off blocks funding too, not just play.
   try { const { enforceAccountPlayable } = require('../lib/scratch'); await enforceAccountPlayable(req.db, req.user.id); }
-  catch (e) { return res.status(403).render('error', { status: 403, message: 'Deposits are unavailable during your self-exclusion or cooling-off period.' }); }
+  catch (e) { return backToWallet('Deposits are unavailable during your self-exclusion or cooling-off period.'); }
   // BP-21: KYC gate (only bites when the operator's gate scope covers deposits).
-  if (kycLib.kycBlock(req.settings, req.user, 'deposit').blocked) return res.status(403).render('error', { status: 403, message: kycLib.KYC_MESSAGES.deposit, cta: { href: '/kyc', label: 'Go to the KYC page' } });
+  if (kycLib.kycBlock(req.settings, req.user, 'deposit').blocked) return backToWallet(kycLib.KYC_MESSAGES.deposit);
   const methodId = parseInt(req.body.method_id, 10);
-  if (!methodId) return res.status(400).render('error', { status: 400, message: 'Invalid deposit method.' });
+  if (!methodId) return backToForm('Invalid deposit method.');
   const method = await req.db.get("SELECT * FROM payment_methods WHERE id = ? AND enabled = 1 AND kind IN ('deposit','both')", [methodId]);
-  if (!method) return res.status(400).render('error', { status: 400, message: 'Invalid deposit method.' });
+  if (!method) return backToForm('That deposit method is not available. Pick another method.', methodId);
   const amount = toMinor(req.body.amount, decimalsFor(method.currency, getCurrencies(req.settings)));
-  if (amount === null || amount <= 0) return res.status(400).render('error', { status: 400, message: 'Enter a valid amount.' });
-  if (method.min_amount && amount < method.min_amount) return res.status(400).render('error', { status: 400, message: 'Amount is below the minimum for this method.' });
-  if (method.max_amount && amount > method.max_amount) return res.status(400).render('error', { status: 400, message: 'Amount exceeds the maximum for this method.' });
+  if (amount === null || amount <= 0) return backToForm('Enter a valid amount.', methodId);
+  if (method.min_amount && amount < method.min_amount) return backToForm(`Amount is below the minimum for this method (${req.fmt(method.min_amount, method.currency)}).`, methodId);
+  if (method.max_amount && amount > method.max_amount) return backToForm(`Amount exceeds the maximum for this method (${req.fmt(method.max_amount, method.currency)}).`, methodId);
   // DS-018: player-set daily deposit limit (per currency, UTC day; pending
   // and approved requests both count, so it cannot be split around).
   const rpRow = await req.db.get('SELECT daily_deposit_limit FROM responsible_play WHERE user_id = ?', [req.user.id]);
@@ -311,13 +409,13 @@ router.post('/deposit/new', requireLogin, rateLimit({ windowMs: 60000, max: 10, 
   if (depLimit > 0) {
     const dayStart = new Date(); dayStart.setUTCHours(0, 0, 0, 0);
     const depRow = await req.db.get(`SELECT COALESCE(SUM(amount),0) AS s FROM deposits WHERE user_id = ? AND currency = ? AND status IN ('pending','approved') AND created_at >= ?`, [req.user.id, method.currency, dayStart.getTime()]);
-    if (Number(depRow.s) + amount > depLimit) return res.status(400).render('error', { status: 400, message: 'That deposit would exceed your daily deposit limit.' });
+    if (Number(depRow.s) + amount > depLimit) return backToForm('That deposit would exceed your daily deposit limit.', methodId);
   }
   const userData = {};
   for (const f of methodCustomFields(method)) {
     // R-116: per-field length cap (was unbounded up to the 2MB body limit).
     const v = String(req.body['custom_' + f.key] || '').trim().slice(0, 2000);
-    if (f.required && !v) return res.status(400).render('error', { status: 400, message: `Field "${f.label}" is required.` });
+    if (f.required && !v) return backToForm(`Field "${f.label}" is required.`, methodId);
     userData[f.key] = v;
   }
   try {
@@ -330,7 +428,10 @@ router.post('/deposit/new', requireLogin, rateLimit({ windowMs: 60000, max: 10, 
     await req.setFlash('success', 'Deposit request submitted. It will be credited after review.');
     res.redirect('/wallet');
   } catch (e) {
-    console.error('[deposit] failed:', e.message); res.status(400).render('error', { status: 400, message: 'Deposit failed. Please try again or contact support.' });
+    console.error('[deposit] failed:', e.message);
+    const msg = e.message === 'Invalid deposit amount' ? 'Enter a valid amount.'
+      : 'Your deposit request could not be submitted and no money was taken. Please contact support if this keeps happening.';
+    return backToForm(msg, methodId);
   }
 });
 
@@ -357,31 +458,39 @@ router.get('/withdraw/new', requireLogin, async (req, res) => {
   const balance = (wallets.find(w => w.currency === method.currency) || { balance: 0 }).balance;
   res.render('withdraw_new', {
     metaTitle: 'Withdraw', metaDesc: '', methods,
-    method: { ...method, custom_fields: methodCustomFields(method) }, balance,
+    method: { ...method, custom_fields: methodCustomFields(method, 'withdrawal') }, balance,
     methodDec: decimalsFor(method.currency, req.currencies),
   });
 });
 
-router.post('/withdraw/new', requireLogin, async (req, res) => {
+router.post('/withdraw/new', requireLogin, rateLimit({ windowMs: 60000, max: 10, keyFn: req => `withdraw:${req.user.id}` }), async (req, res) => { // D2 rate gap: mirrors the deposit limiter (10/min per user)
+  // U-02: same true-reason rule as deposits — failures return to the
+  // form (or wallet, when gated) with the reason in the flash.
+  const backToForm = async (msg, mId) => { await req.setFlash('error', msg); return res.redirect('/withdraw/new' + (mId ? '?m=' + mId : '')); };
+  const backToWallet = async (msg) => { await req.setFlash('error', msg); return res.redirect('/wallet'); };
   const policy = withdrawalPolicy(req.settings, req.user);
-  if (!policy.allowed) return res.status(403).render('error', { status: 403, message: policy.reason });
+  if (!policy.allowed) return backToWallet(policy.reason);
   // BP-21: KYC gate — honest, specific message, never a generic error.
-  if (kycLib.kycBlock(req.settings, req.user, 'withdraw').blocked) return res.status(403).render('error', { status: 403, message: kycLib.KYC_MESSAGES.withdraw, cta: { href: '/kyc', label: 'Go to the KYC page' } });
+  if (kycLib.kycBlock(req.settings, req.user, 'withdraw').blocked) return backToWallet(kycLib.KYC_MESSAGES.withdraw);
   const methodId = parseInt(req.body.method_id, 10);
-  if (!methodId) return res.status(400).render('error', { status: 400, message: 'Invalid withdrawal method.' });
+  if (!methodId) return backToForm('Invalid withdrawal method.');
   const method = await req.db.get("SELECT * FROM payment_methods WHERE id = ? AND enabled = 1 AND kind IN ('withdrawal','both')", [methodId]);
-  if (!method) return res.status(400).render('error', { status: 400, message: 'Invalid withdrawal method.' });
+  if (!method) return backToForm('That withdrawal method is not available. Pick another method.', methodId);
   const amount = toMinor(req.body.amount, decimalsFor(method.currency, getCurrencies(req.settings)));
-  if (amount === null || amount <= 0) return res.status(400).render('error', { status: 400, message: 'Enter a valid amount.' });
-  if (method.min_amount && amount < method.min_amount) return res.status(400).render('error', { status: 400, message: 'Amount is below the minimum for this method.' });
-  if (method.max_amount && amount > method.max_amount) return res.status(400).render('error', { status: 400, message: 'Amount exceeds the maximum for this method.' });
+  if (amount === null || amount <= 0) return backToForm('Enter a valid amount.', methodId);
+  if (method.min_amount && amount < method.min_amount) return backToForm(`Amount is below the minimum for this method (${req.fmt(method.min_amount, method.currency)}).`, methodId);
+  if (method.max_amount && amount > method.max_amount) return backToForm(`Amount exceeds the maximum for this method (${req.fmt(method.max_amount, method.currency)}).`, methodId);
   const userData = {};
-  for (const f of methodCustomFields(method)) {
+  for (const f of methodCustomFields(method, 'withdrawal')) {
     // R-116: per-field length cap (was unbounded up to the 2MB body limit).
     const v = String(req.body['custom_' + f.key] || '').trim().slice(0, 2000);
-    if (f.required && !v) return res.status(400).render('error', { status: 400, message: `Field "${f.label}" is required.` });
+    if (f.required && !v) return backToForm(`Field "${f.label}" is required.`, methodId);
     userData[f.key] = v;
   }
+  /* U-21 §5.3: format-check the submitted payout details with the
+     rail's true-reason validator before any rule/OTP step runs. */
+  const proofErr = validateUserProof(method.rail, userData);
+  if (proofErr) return backToForm(proofErr, methodId);
   // v14 withdrawal rules (turnover, caps, payout lock, same-method) — checked
   // BEFORE the OTP step so a blocked withdrawal never sends a code.
   // R-114: balance check also happens BEFORE the OTP step, so a player
@@ -389,7 +498,7 @@ router.post('/withdraw/new', requireLogin, async (req, res) => {
   {
     const wallets0 = await getBalances(req.db, req.user.id);
     const bal0 = (wallets0.find(w => w.currency === method.currency) || { balance: 0 }).balance;
-    if (Number(bal0) < amount) return res.status(400).render('error', { status: 400, message: 'Insufficient balance for this withdrawal.' });
+    if (Number(bal0) < amount) return backToForm(`Not enough balance: you asked to withdraw ${req.fmt(amount, method.currency)}, but your ${method.currency} wallet has ${req.fmt(bal0, method.currency)} — you are ${req.fmt(amount - Number(bal0), method.currency)} short.`, methodId);
   }
   const ruleCheck = await checkWithdrawalRules(req.db, req.settings, req.user, method, amount, userData);
   if (!ruleCheck.ok) {
@@ -397,7 +506,7 @@ router.post('/withdraw/new', requireLogin, async (req, res) => {
     // never replace the active payout fingerprint or lock the original
     // details (the old code did both via notePayoutDetails(..., true)).
     if (ruleCheck.changeDetected) await notePendingPayoutChange(req.db, req.user.id, ruleCheck.fingerprint);
-    return res.status(400).render('error', { status: 400, message: ruleCheck.reason });
+    return backToForm(ruleCheck.reason, methodId);
   }
   // Withdrawal OTP (admin toggle `withdrawal_otp_enabled`, ON by default):
   // OTP is used ONLY here — never on login/register. When ON, the withdrawal is
@@ -407,17 +516,17 @@ router.post('/withdraw/new', requireLogin, async (req, res) => {
     const realEmail = req.user.email && !String(req.user.email).endsWith('@phone.local') ? req.user.email : null;
     const channel = realEmail ? 'email' : 'phone';
     const identifier = channel === 'email' ? realEmail : req.user.phone;
-    if (!identifier) return res.status(400).render('error', { status: 400, message: 'Add an email or phone to your profile before withdrawing.' });
+    if (!identifier) return backToForm('Add an email or phone to your profile before withdrawing.', methodId);
     let code;
     try {
       code = await otpLib.createOtp(req.db, identifier, channel);
     } catch (e) {
-      return res.status(429).render('error', { status: 429, message: e.message });
+      return backToForm(e.message, methodId);
     }
     const sent = await otpLib.sendOtp(req.db, req.settings, identifier, channel, code);
     // Fail closed: if the code could not be delivered, do NOT park the user
     // on a verify screen for a code that will never arrive.
-    if (!sent.sent) return res.status(503).render('error', { status: 503, message: 'Could not send the verification code. Please try again later or contact support.' });
+    if (!sent.sent) return backToForm('Could not send the verification code, so this withdrawal was not started. Please contact support if this keeps happening.', methodId);
     const { touchSession } = require('../lib/auth');
     await touchSession(req.db, req.sess.id, { pending_withdrawal: { method_id: method.id, amount, userData } });
     return res.render('withdraw_verify', {
@@ -436,7 +545,8 @@ router.post('/withdraw/new', requireLogin, async (req, res) => {
       : 'Withdrawal request submitted and amount held. It will be processed after review.');
     res.redirect('/wallet');
   } catch (e) {
-    console.error('[withdraw] failed:', e.message); res.status(400).render('error', { status: 400, message: 'Withdrawal failed. Please try again or contact support.' });
+    console.error('[withdraw] failed:', e.message);
+    return backToForm(await withdrawFailureMessage(req, e, method, amount), methodId);
   }
 });
 
@@ -522,7 +632,12 @@ router.post('/withdraw/verify', requireLogin, async (req, res) => {
       : 'Withdrawal verified and submitted. Amount held — it will be processed after review.');
     res.redirect('/wallet');
   } catch (e) {
-    console.error('[withdraw] failed:', e.message); res.status(400).render('error', { status: 400, message: 'Withdrawal failed. Please try again or contact support.' });
+    // U-02: mapped true reason (see withdrawFailureMessage); the
+    // no-pending and bad-code branches above keep their 400 true-reason
+    // renders (a standing tamper-suite contract).
+    console.error('[withdraw] failed:', e.message);
+    await req.setFlash('error', await withdrawFailureMessage(req, e, method, pending.amount));
+    return res.redirect('/wallet');
   }
 });
 
@@ -586,13 +701,14 @@ router.get('/transactions', requireLogin, async (req, res) => {
   /* SCAN fix (A-17): paginate like /tickets — the old silent LIMIT 200
      made older ledger entries (incl. old wins) unreachable in the UI. */
   const PER = 50;
-  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  let page = Math.max(1, parseInt(req.query.page, 10) || 1);
   let where = ' WHERE user_id = ?';
   const params = [req.user.id];
   if (type === 'credit') where += ' AND amount > 0';
   else if (type === 'debit') where += ' AND amount < 0';
   const total = (await req.db.get('SELECT COUNT(*) AS c FROM transactions' + where, params)).c;
   const totalPages = Math.max(1, Math.ceil(total / PER));
+  page = Math.min(page, totalPages); // D4-C2: an out-of-range page renders the LAST page, never a false "No transactions yet"
   const txs = await req.db.query('SELECT * FROM transactions' + where + ' ORDER BY created_at DESC LIMIT ? OFFSET ?', params.concat([PER, (page - 1) * PER]));
   res.render('transactions', { metaTitle: 'Transactions', metaDesc: '', txs, filterType: type, page, totalPages, total });
 });
@@ -611,7 +727,21 @@ router.get('/profile', requireLogin, async (req, res) => {
   const kycD = kycLib.kycBlock(req.settings, req.user, 'deposit');
   const kycCard = (kycW.required || kycD.required || kycSt !== 'none')
     ? { status: kycSt, statusLabel: kycLib.STATUS_LABELS[kycSt], blocked: kycW.blocked || kycD.blocked, note: req.user.kyc_note || '' } : null;
-  res.render('profile', { metaTitle: 'Profile', metaDesc: '', verifyPhone: req.query.verify_phone === '1', refSummary: refRows, kycCard });
+  /* U-15: profileVerified — the verified-badge boolean. The rule is the
+     deposit gate's own rule (lib/money.js verifiedContactOk): email OR
+     phone verified. It states a fact about the contacts, so it does NOT
+     consult the verified_contact_required toggle (the toggle decides
+     whether the fact gates money movement, not whether it is true).
+     U-16: baseUrl / referralUrl — absolute links built with the app's
+     existing pattern (same expression as the verify-email link below
+     and the password-reset link in routes/auth.js):
+     BASE_URL env, else the request's own protocol + host. baseUrl also
+     repairs the profile view's existing referral expression, which
+     silently degraded to a relative path while no route passed it. */
+  const baseUrl = (process.env.BASE_URL || (req.protocol + '://' + req.get('host'))).replace(/\/+$/, '');
+  const profileVerified = !!(req.user.email_verified || req.user.mobile_verified);
+  const referralUrl = req.user.referral_code ? baseUrl + '/register?ref=' + encodeURIComponent(req.user.referral_code) : '';
+  res.render('profile', { metaTitle: 'Profile', metaDesc: '', verifyPhone: req.query.verify_phone === '1', refSummary: refRows, kycCard, baseUrl, referralUrl, profileVerified });
 });
 router.post('/profile', requireLogin, async (req, res) => {
   const name = typeof req.body.name === 'string' ? req.body.name : ''; // B-08: type-confusion guards
@@ -625,6 +755,12 @@ router.post('/profile', requireLogin, async (req, res) => {
   const newPhone = rawPhone ? normalizePhone(rawPhone).slice(0, 32) : '';
   if (rawPhone && !newPhone) { await req.setFlash('error', 'Enter a valid phone number or leave it blank.'); return res.redirect('/profile'); }
   if (newPhone) {
+    /* D2-C5 (v20): the blocked-country rule was enforced only at
+       registration — the same number was accepted here afterwards.
+       Same check, same true reason; the stored phone is left
+       untouched because this returns before the UPDATE. */
+    const { isBlockedPhone } = require('../lib/phone-countries');
+    if (isBlockedPhone(req.settings, newPhone)) { await req.setFlash('error', 'Phone numbers from this country are not accepted on this platform.'); return res.redirect('/profile'); }
     const others = await req.db.query("SELECT phone FROM users WHERE id != ? AND phone IS NOT NULL AND phone != ''", [req.user.id]);
     if (others.some(u => normalizePhone(u.phone) === newPhone)) { await req.setFlash('error', 'This phone number is already used by another account.'); return res.redirect('/profile'); }
   }
@@ -656,9 +792,13 @@ router.post('/profile/notifications', requireLogin, async (req, res) => {
 // Email link + phone OTP verification mark email_verified / mobile_verified,
 // which the deposit/withdrawal gate reads. Admins can also mark a contact
 // verified from the user page (audited) when no provider is configured.
-router.post('/profile/verify-email', requireLogin, async (req, res) => {
+router.post('/profile/verify-email', requireLogin, rateLimit({ windowMs: 3600000, max: 5, keyFn: req => 'verify-email:' + req.user.id }), async (req, res) => {
   const email = req.user.email;
   if (!email || email.endsWith('@phone.local')) { await req.setFlash('error', 'Add a real email to your profile first.'); return res.redirect('/profile'); }
+  /* D2-C6 (v20): one live link at a time — invalidate prior unconsumed
+     tokens BEFORE issuing the new one (the R-014/R-030 pattern the
+     admin path and password reset already follow). */
+  await req.db.run('UPDATE email_verifications SET used = 1 WHERE user_id = ? AND used = 0', [req.user.id]);
   const token = randHex(24);
   await req.db.run('INSERT INTO email_verifications (user_id, new_email, token_hash, expires_at, used, created_at) VALUES (?, ?, ?, ?, 0, ?)',
     [req.user.id, email, sha256('verify:' + token), now() + 24 * 3600 * 1000, now()]);
@@ -698,7 +838,8 @@ router.get('/force-reset', requireLogin, async (req, res) => {
   if (!u || !u.force_password_reset) return res.redirect('/');
   res.render('force_reset', { metaTitle: 'Set Your Password', metaDesc: '' });
 });
-router.post('/force-reset', requireLogin, async (req, res) => {
+const playerSecurityLimiter = rateLimit({ windowMs: 15 * 60000, max: 10, keyFn: req => `player-security:${req.user.id}` }); // D2 rate gap: mirrors the admin TOTP twins (10/15min)
+router.post('/force-reset', requireLogin, playerSecurityLimiter, async (req, res) => {
   const u = await req.db.get('SELECT * FROM users WHERE id = ?', [req.user.id]);
   if (!u || !u.force_password_reset) return res.redirect('/');
   const { passwordError } = require('../lib/validate');
@@ -727,9 +868,23 @@ router.post('/force-reset', requireLogin, async (req, res) => {
    shown a "Change password" form they can never pass. */
 async function securityViewModel(req, extra = {}) {
   const u = await req.db.get('SELECT password_hash, totp_secret FROM users WHERE id = ?', [req.user.id]);
-  const sessions = await req.db.query(
+  const rawSessions = await req.db.query(
     'SELECT id, ip, user_agent, created_at, expires_at FROM sessions WHERE user_id = ? AND expires_at > ? ORDER BY created_at DESC',
     [req.user.id, now()]);
+  /* U-04(a): the view receives HUMAN session fields only — the raw
+     user-agent never leaves the server. Each item: { id, ip,
+     created_at, expires_at, device, browser, os, deviceLabel } with
+     deviceLabel = "Device · Browser" and the fallbacks
+     "Unknown device · Unknown browser" for an unrecognised UA. */
+  const sessions = rawSessions.map(s => {
+    const p = parseUA(s.user_agent);
+    const browser = p.browser === 'Unknown' ? 'Unknown browser' : p.browser;
+    return {
+      id: s.id, ip: s.ip, created_at: s.created_at, expires_at: s.expires_at,
+      device: p.device, browser, os: p.os,
+      deviceLabel: p.device + ' · ' + browser,
+    };
+  });
   return Object.assign({
     metaTitle: 'Security', metaDesc: '',
     hasPassword: !!(u && u.password_hash),
@@ -743,7 +898,7 @@ router.get('/security', requireLogin, async (req, res) => {
   // "Set a password" variant; sessions is the BP-14 list.
   res.render('security', await securityViewModel(req));
 });
-router.post('/security/password', requireLogin, async (req, res) => {
+router.post('/security/password', requireLogin, playerSecurityLimiter, async (req, res) => {
   // R-122: logged-in password change (was only possible logged-out).
   const u = await req.db.get('SELECT * FROM users WHERE id = ?', [req.user.id]);
   if (!u) { await req.setFlash('error', 'Account not found.'); return res.redirect('/security'); }
@@ -762,7 +917,17 @@ router.post('/security/password', requireLogin, async (req, res) => {
   await req.setFlash('success', isSet ? 'Password set. You can now also sign in with your password.' : 'Password changed. Other sessions were signed out.');
   res.redirect('/security');
 });
-router.post('/security/totp/start', requireLogin, async (req, res) => {
+router.post('/security/totp/start', requireLogin, playerSecurityLimiter, async (req, res) => {
+  /* D2-C3 (v20): enrolling a second factor must prove the first —
+     the disable/backup handlers in this file already require the
+     current password; start/confirm did not, so a bare session could
+     enrol an attacker's authenticator. Passwordless accounts (OAuth /
+     OTP signups, password_hash NULL) must set a password first — the
+     Set-a-password path exists on this very page (securityViewModel
+     hasPassword) — so they get that true reason instead. */
+  const u0 = await req.db.get('SELECT password_hash FROM users WHERE id = ?', [req.user.id]);
+  if (!u0 || !u0.password_hash) { await req.setFlash('error', 'Set a password on your account before enabling two-factor authentication.'); return res.redirect('/security'); }
+  if (!verifyPassword(req.body.password || '', u0.password_hash)) { await req.setFlash('error', 'Wrong password.'); return res.redirect('/security'); }
   const secret = newTotpSecret();
   const { touchSession } = require('../lib/auth');
   await touchSession(req.db, req.sess.id, { totp_pending: secret });
@@ -770,7 +935,12 @@ router.post('/security/totp/start', requireLogin, async (req, res) => {
   const qrDataUrl = await QRCode.toDataURL(uri);
   res.render('security', await securityViewModel(req, { totpEnabled: false, showSetup: true, setup: { qrDataUrl, secret } }));
 });
-router.post('/security/totp/confirm', requireLogin, async (req, res) => {
+router.post('/security/totp/confirm', requireLogin, playerSecurityLimiter, async (req, res) => {
+  // D2-C3: the password is required AGAIN at confirm, so a session
+  // stolen mid-enrolment cannot finish it.
+  const u0 = await req.db.get('SELECT password_hash FROM users WHERE id = ?', [req.user.id]);
+  if (!u0 || !u0.password_hash) { await req.setFlash('error', 'Set a password on your account before enabling two-factor authentication.'); return res.redirect('/security'); }
+  if (!verifyPassword(req.body.password || '', u0.password_hash)) { await req.setFlash('error', 'Wrong password.'); return res.redirect('/security'); }
   const secret = req.sessionData.totp_pending;
   if (!secret) { await req.setFlash('error', 'Setup session expired. Start again.'); return res.redirect('/security'); }
   if (!verifyTotp(secret, req.body.totp_code)) {
@@ -787,7 +957,7 @@ router.post('/security/totp/confirm', requireLogin, async (req, res) => {
   await audit.log(req.db, { actorId: req.user.id, actorRole: req.user.role, action: 'user.totp_enable', entity: 'user', entityId: req.user.id, detail: {}, ip: req.ip });
   res.render('security', await securityViewModel(req, { totpEnabled: true, showBackup: true, backupCodes: codes }));
 });
-router.post('/security/totp/disable', requireLogin, async (req, res) => {
+router.post('/security/totp/disable', requireLogin, playerSecurityLimiter, async (req, res) => {
   const u = await req.db.get('SELECT * FROM users WHERE id = ?', [req.user.id]);
   if (!verifyPassword(req.body.password || '', u.password_hash || '')) { await req.setFlash('error', 'Wrong password.'); return res.redirect('/security'); }
   // A password alone must not defeat the second factor: require a current
@@ -803,7 +973,7 @@ router.post('/security/totp/disable', requireLogin, async (req, res) => {
   await req.setFlash('success', 'Two-factor authentication disabled.');
   res.redirect('/security');
 });
-router.post('/security/totp/backup', requireLogin, async (req, res) => {
+router.post('/security/totp/backup', requireLogin, playerSecurityLimiter, async (req, res) => {
   const u = await req.db.get('SELECT * FROM users WHERE id = ?', [req.user.id]);
   // Regenerating recovery codes previously required neither password nor a
   // second factor and wrote no audit entry: anyone holding a session could
@@ -819,7 +989,7 @@ router.post('/security/totp/backup', requireLogin, async (req, res) => {
   await audit.log(req.db, { actorId: req.user.id, actorRole: req.user.role, action: 'user.totp_backup_regen', entity: 'user', entityId: req.user.id, detail: { other_sessions_revoked: true }, ip: req.ip });
   res.render('security', await securityViewModel(req, { totpEnabled: true, showBackup: true, backupCodes: codes }));
 });
-router.post('/security/sessions/revoke', requireLogin, async (req, res) => {
+router.post('/security/sessions/revoke', requireLogin, playerSecurityLimiter, async (req, res) => {
   const others = await req.db.get('SELECT COUNT(*) AS c FROM sessions WHERE user_id = ? AND id != ?', [req.user.id, req.sess.id]);
   await destroyUserSessions(req.db, req.user.id, req.sess.id);
   // BP-14: the revoke used to leave no audit trace; log it like the other
@@ -830,14 +1000,67 @@ router.post('/security/sessions/revoke', requireLogin, async (req, res) => {
 });
 
 /* ---------------- support tickets ---------------- */
+/* U-19 (v20): settings-driven creation limits. Keys (the admin Settings
+   form wires to these exact names): support_max_open_tickets (default
+   2) and support_max_new_tickets_24h (default 3); 0 = unlimited. The
+   settings store is a generic key/value table read through getS, so no
+   schema change is needed. A stored value that does not parse, or is
+   negative, falls back to the default — never to a silent lockout.
+   U-25 interplay, implemented exactly: the 24h count includes tickets
+   later soft-deleted (deleting never refunds quota — no deleted_at
+   filter), while the open count covers only LIVE tickets (status not
+   closed AND deleted_at IS NULL), so deleting an open ticket frees
+   its slot. 'answered' counts as open: the ticket is still live and
+   unresolved, it is merely waiting on the player. */
+function supportLimit(settings, key, fallback) {
+  const n = parseInt(getS(settings, key, ''), 10);
+  return Number.isNaN(n) || n < 0 ? fallback : n;
+}
+/* U-18 (v20): turn-taking state for one ticket. The alternation keys
+   off the messages table's author_role: staff/agent replies are
+   written by routes/admin.js and routes/agent.js with a role that is
+   never 'player' ('agent', or the admin's normalised staff role), so
+   "the latest message is not the player's" is exactly "support spoke
+   last" — and staff replies through their existing routes unlock the
+   player with no change on their side. Latest = highest id (true
+   insertion order; created_at alone can tie within one millisecond).
+   Returns { canReply, lockReason } — lockReason is '' when canReply. */
+async function supportReplyState(db, ticket) {
+  if (ticket.status === 'closed') return { canReply: false, lockReason: 'This ticket is closed. Reopen it if you need more help.' };
+  const last = await db.get('SELECT author_role FROM support_messages WHERE ticket_id = ? ORDER BY id DESC LIMIT 1', [ticket.id]);
+  if (last && last.author_role !== 'player') return { canReply: true, lockReason: '' };
+  return { canReply: false, lockReason: 'You can reply again as soon as our support team has responded to your last message.' };
+}
+
 router.get('/support', requireLogin, async (req, res) => {
-  const stickets = await req.db.query('SELECT * FROM support_tickets WHERE user_id = ? ORDER BY updated_at DESC', [req.user.id]);
+  // U-25: soft-deleted tickets are gone from the player's list.
+  const stickets = await req.db.query('SELECT * FROM support_tickets WHERE user_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC', [req.user.id]);
   res.render('support', { metaTitle: 'Support', metaDesc: 'Contact support.', stickets });
 });
 router.post('/support/new', requireLogin, async (req, res) => {
   const subject = typeof req.body.subject === 'string' ? req.body.subject : ''; // B-08: type-confusion guard
   const message = typeof req.body.message === 'string' ? req.body.message : '';
   if (!subject || !message) { await req.setFlash('error', 'Subject and message are required.'); return res.redirect('/support'); }
+  // U-19: creation limits (see supportLimit note above for the exact
+  // counting rules, incl. the U-25 soft-delete interplay).
+  const maxOpen = supportLimit(req.settings, 'support_max_open_tickets', 2);
+  if (maxOpen > 0) {
+    const openRow = await req.db.get("SELECT COUNT(*) AS c FROM support_tickets WHERE user_id = ? AND status != 'closed' AND deleted_at IS NULL", [req.user.id]);
+    const openCount = Number(openRow.c);
+    if (openCount >= maxOpen) {
+      await req.setFlash('error', `You already have ${openCount} open support ticket${openCount === 1 ? '' : 's'} — the limit is ${maxOpen} at a time. Please wait for a reply on an open ticket, or close or delete one, before opening another.`);
+      return res.redirect('/support');
+    }
+  }
+  const maxNew24h = supportLimit(req.settings, 'support_max_new_tickets_24h', 3);
+  if (maxNew24h > 0) {
+    const dayRow = await req.db.get('SELECT COUNT(*) AS c FROM support_tickets WHERE user_id = ? AND created_at >= ?', [req.user.id, now() - 24 * 3600 * 1000]);
+    const dayCount = Number(dayRow.c);
+    if (dayCount >= maxNew24h) {
+      await req.setFlash('error', `You have opened ${dayCount} support tickets in the last 24 hours — the limit is ${maxNew24h} per 24 hours. Deleted tickets still count toward this limit.`);
+      return res.redirect('/support');
+    }
+  }
   const publicId = 'S' + now().toString(36).toUpperCase() + randHex(3).toUpperCase();
   const t = now();
   const prio = ['low', 'medium', 'high'].includes(String(req.body.priority || '')) ? String(req.body.priority) : 'medium';
@@ -853,19 +1076,35 @@ router.post('/support/new', requireLogin, async (req, res) => {
   res.redirect('/support/' + publicId);
 });
 router.get('/support/:publicId', requireLogin, async (req, res) => {
-  const ticket = await req.db.get('SELECT * FROM support_tickets WHERE public_id = ? AND user_id = ?', [req.params.publicId, req.user.id]);
+  // U-25: a soft-deleted ticket's URL is a plain not-found, like a
+  // missing or foreign ticket — no content leaks.
+  const ticket = await req.db.get('SELECT * FROM support_tickets WHERE public_id = ? AND user_id = ? AND deleted_at IS NULL', [req.params.publicId, req.user.id]);
   if (!ticket) return res.status(404).render('error', { status: 404, message: 'Ticket not found.' });
   const messages = await req.db.query('SELECT * FROM support_messages WHERE ticket_id = ? ORDER BY created_at', [ticket.id]);
+  // U-18 locals for the view: canReply (boolean) + lockReason (string,
+  // '' when the player may reply) — the view shows the reason in place
+  // of the reply form when locked.
+  const replyState = await supportReplyState(req.db, ticket);
   res.render('support_view', {
     metaTitle: 'Support', metaDesc: '', ticket,
     messages: messages.map(m => ({ ...m, mine: m.author_id === req.user.id })),
+    canReply: replyState.canReply, lockReason: replyState.lockReason,
   });
 });
 router.post('/support/:publicId/reply', requireLogin, async (req, res) => {
+  // U-25: the lookup is scoped to the OWNER but not filtered on
+  // deleted_at, so an own deleted ticket earns its own true reason
+  // while a foreign ticket keeps the indistinguishable plain redirect.
   const ticket = await req.db.get('SELECT * FROM support_tickets WHERE public_id = ? AND user_id = ?', [req.params.publicId, req.user.id]);
-  if (!ticket || ticket.status === 'closed') return res.redirect('/support');
+  if (!ticket) return res.redirect('/support');
+  if (ticket.deleted_at) { await req.setFlash('error', 'This ticket has been deleted and can no longer be replied to.'); return res.redirect('/support'); }
+  // U-18: server-enforced turn-taking (the view hiding the form is not
+  // the enforcement). Every refusal redirects back with the true
+  // reason in the flash — never a bare 400/500.
+  const replyState = await supportReplyState(req.db, ticket);
+  if (!replyState.canReply) { await req.setFlash('error', replyState.lockReason); return res.redirect('/support/' + ticket.public_id); }
   const body = String(req.body.message || '').trim().slice(0, 5000);
-  if (!body) return res.redirect('/support/' + ticket.public_id);
+  if (!body) { await req.setFlash('error', 'Write a message before sending your reply.'); return res.redirect('/support/' + ticket.public_id); }
   await req.db.run('INSERT INTO support_messages (ticket_id, author_id, author_role, body, created_at) VALUES (?, ?, ?, ?, ?)',
     [ticket.id, req.user.id, req.user.role, body, now()]);
   await req.db.run("UPDATE support_tickets SET status = 'open', updated_at = ? WHERE id = ?", [now(), ticket.id]);
@@ -875,9 +1114,24 @@ router.post('/support/:publicId/reply', requireLogin, async (req, res) => {
   if (notifyTo2) { try { await notify.sendRaw(req.db, req.settings, 'email', notifyTo2, 'New reply on ticket ' + ticket.public_id, 'A player replied to support ticket "' + ticket.subject + '". Sign in to the admin panel to read it.'); } catch {} }
   res.redirect('/support/' + ticket.public_id);
 });
+/* U-25 (v20): player soft-deletes their OWN ticket (migration v19
+   columns deleted_at / deleted_by). Deleting an open ticket withdraws
+   it. Same POST + flash/redirect pattern as close/reopen below — no
+   new confirm pattern. Foreign, missing and already-deleted tickets
+   all get the identical 'Ticket not found.' flash, so the endpoint
+   leaks nothing about existence. Deleting sends NO notification
+   email — this handler never calls notify. */
+router.post('/support/:publicId/delete', requireLogin, async (req, res) => {
+  const ticket = await req.db.get('SELECT * FROM support_tickets WHERE public_id = ? AND user_id = ? AND deleted_at IS NULL', [req.params.publicId, req.user.id]);
+  if (!ticket) { await req.setFlash('error', 'Ticket not found.'); return res.redirect('/support'); }
+  await req.db.run('UPDATE support_tickets SET deleted_at = ?, deleted_by = ? WHERE id = ?', [now(), req.user.id, ticket.id]);
+  try { await audit.log(req.db, { actorId: req.user.id, actorRole: req.user.role, action: 'support.delete', entity: 'support_ticket', entityId: ticket.id, detail: { public_id: ticket.public_id }, ip: req.ip }); } catch {}
+  await req.setFlash('success', 'Ticket deleted.');
+  res.redirect('/support');
+});
 // DS-061: players can close and reopen their own tickets.
 router.post('/support/:publicId/close', requireLogin, async (req, res) => {
-  const ticket = await req.db.get('SELECT * FROM support_tickets WHERE public_id = ? AND user_id = ?', [req.params.publicId, req.user.id]);
+  const ticket = await req.db.get('SELECT * FROM support_tickets WHERE public_id = ? AND user_id = ? AND deleted_at IS NULL', [req.params.publicId, req.user.id]);
   if (!ticket) return res.redirect('/support');
   if (ticket.status !== 'closed') {
     await req.db.run("UPDATE support_tickets SET status = 'closed', updated_at = ? WHERE id = ? AND status != 'closed'", [now(), ticket.id]);
@@ -886,7 +1140,7 @@ router.post('/support/:publicId/close', requireLogin, async (req, res) => {
   res.redirect('/support/' + ticket.public_id);
 });
 router.post('/support/:publicId/reopen', requireLogin, async (req, res) => {
-  const ticket = await req.db.get('SELECT * FROM support_tickets WHERE public_id = ? AND user_id = ?', [req.params.publicId, req.user.id]);
+  const ticket = await req.db.get('SELECT * FROM support_tickets WHERE public_id = ? AND user_id = ? AND deleted_at IS NULL', [req.params.publicId, req.user.id]);
   if (!ticket) return res.redirect('/support');
   if (ticket.status === 'closed') {
     await req.db.run("UPDATE support_tickets SET status = 'open', updated_at = ? WHERE id = ? AND status = 'closed'", [now(), ticket.id]);

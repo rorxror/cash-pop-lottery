@@ -12,7 +12,12 @@
       </div>
       <% }) %>
     </div>
-    <% if (ticket.status !== 'closed') { %>
+    <% /* U-18: turn-taking. canReply / lockReason come from the server
+         (routes/player.js supportReplyState). Locked → the form is
+         REPLACED by the server's reason; open → the form as before.
+         A missing local falls back to the pre-v20 behaviour. */ %>
+    <% var replyAllowed = (typeof canReply !== 'undefined') ? !!canReply : (ticket.status !== 'closed'); %>
+    <% if (replyAllowed) { %>
     <form action="/support/<%= ticket.public_id %>/reply" method="POST" class="mt">
       <input type="hidden" name="_csrf" value="<%= csrf %>">
       <div class="field">
@@ -22,7 +27,9 @@
       <button type="submit" class="btn btn-p">Send Reply</button>
     </form>
     <% } else { %>
-    <p class="muted mt">This ticket is closed. You can reopen it below if you need more help.</p>
+    <div class="alert mt" role="note">
+      <p><%= (typeof lockReason !== 'undefined' && lockReason) ? lockReason : 'You can reply again as soon as our support team has responded to your last message.' %></p>
+    </div>
     <% } %>
     <div class="mt">
       <% if (ticket.status !== 'closed') { %>
@@ -36,6 +43,13 @@
         <button type="submit" class="btn">Reopen ticket</button>
       </form>
       <% } %>
+      <% /* U-25: player deletes their OWN ticket. Same pattern as
+            close/reopen above: a plain POST form, no confirm — that is
+            the app's existing player-side pattern for these actions. */ %>
+      <form action="/support/<%= ticket.public_id %>/delete" method="POST" style="margin-top:8px">
+        <input type="hidden" name="_csrf" value="<%= csrf %>">
+        <button type="submit" class="btn btn-d">Delete ticket</button>
+      </form>
     </div>
   </div>
   <p class="mt"><a href="/support">&larr; Back to support</a></p>

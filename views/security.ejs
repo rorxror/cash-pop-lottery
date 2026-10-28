@@ -56,14 +56,24 @@
     <form action="/security/totp/confirm" method="POST">
       <input type="hidden" name="_csrf" value="<%= csrf %>">
       <div class="field">
+        <label for="confirm_password">Confirm your password</label>
+        <input type="password" id="confirm_password" name="password" required autocomplete="current-password">
+      </div>
+      <div class="field">
         <label for="totp_code">Confirmation code</label>
         <input type="text" id="totp_code" name="totp_code" inputmode="numeric" autocomplete="one-time-code" required>
       </div>
       <button type="submit" class="btn btn-p">Confirm &amp; Enable</button>
     </form>
+    <% } else if (typeof hasPassword !== 'undefined' && !hasPassword) { %>
+    <p class="muted">Set a password on your account first (use the Set a password form below), then enable two-factor authentication.</p>
     <% } else { %>
     <form action="/security/totp/start" method="POST">
       <input type="hidden" name="_csrf" value="<%= csrf %>">
+      <div class="field">
+        <label for="enroll_password">Confirm your password</label>
+        <input type="password" id="enroll_password" name="password" required autocomplete="current-password">
+      </div>
       <button type="submit" class="btn btn-p btn-lg btn-block">Set up 2FA</button>
     </form>
     <% } %>
@@ -72,7 +82,7 @@
 </section>
 
 <section class="wrap section narrow">
-<!-- R-122: logged-in password change -->
+<% /* R-122: logged-in password change */ %>
 <div class="card" style="margin-top:16px">
   <h2><%= (typeof hasPassword !== 'undefined' && !hasPassword) ? 'Set a password' : 'Change password' %></h2>
   <% if (typeof hasPassword !== 'undefined' && !hasPassword) { %><p class="muted sm">You signed in with a social account or a one-time code, so your account has no password yet. Set one to unlock every security option (including two-factor settings) and to be able to sign in with a password.</p><% } %>
@@ -86,30 +96,34 @@
   <p class="muted sm">Changing your password signs out all other sessions.</p>
 </div>
 
-<!-- BP-14 (v19): own sessions from the DB session store. Only fields the
-     store really records are shown (sign-in time, IP, browser, expiry);
-     there is no last-activity tracking, so none is claimed. -->
+<% /* BP-14 (v19) + U-04c (v20): own sessions from the DB session store,
+     rebuilt as stacked .v20-session cards (no wide table). The view model
+     (routes/player.js securityViewModel) supplies HUMAN fields only —
+     deviceLabel / device / browser / os — the raw user-agent never
+     reaches this view. Only fields the store really records are shown
+     (sign-in time, IP, expiry); there is no last-activity tracking, so
+     none is claimed. Current session: s.id === currentSessionId, the
+     field the view model provides (same comparison the v19 table used). */ %>
 <% if (typeof sessions !== 'undefined' && sessions) { %>
 <div class="card" style="margin-top:16px">
   <h2>Active sessions</h2>
-  <p class="muted sm">These are the browsers currently signed in to your account, exactly as recorded when each sign-in happened.</p>
-  <div class="tbl-wrap">
-    <table class="tbl">
-      <thead><tr><th>Signed in</th><th>IP address</th><th>Browser / device</th><th>Expires</th><th></th></tr></thead>
-      <tbody>
-        <% sessions.forEach(function(s){ %>
-        <tr>
-          <td><%= new Date(s.created_at).toLocaleString() %></td>
-          <td><%= s.ip || '—' %></td>
-          <td><%= s.user_agent || '—' %></td>
-          <td><%= new Date(s.expires_at).toLocaleString() %></td>
-          <td><% if (s.id === currentSessionId) { %><span class="badge b-ok">This session</span><% } %></td>
-        </tr>
-        <% }) %>
-        <% if (!sessions.length) { %><tr><td colspan="5" class="muted">No active sessions.</td></tr><% } %>
-      </tbody>
-    </table>
+  <p class="muted sm">These are the devices currently signed in to your account, exactly as recorded when each sign-in happened.</p>
+  <% if (sessions.length) { %>
+  <div class="v20-session-list">
+    <% sessions.forEach(function(s){ var isCurrent = (typeof currentSessionId !== 'undefined' && s.id === currentSessionId); %>
+    <div class="v20-session-card<%= isCurrent ? ' v20-session-card--current' : '' %>">
+      <div><strong><%= s.deviceLabel %></strong></div>
+      <% if (isCurrent) { %><span class="v20-session-badge">This session</span><% } %>
+      <p class="v20-session-meta"><strong>Device:</strong> <%= s.device %><% if (s.os) { %> &middot; <strong>System:</strong> <%= s.os %><% } %> &middot; <strong>Browser:</strong> <%= s.browser %></p>
+      <p class="v20-session-meta"><strong>IP address:</strong> <%= s.ip || '—' %></p>
+      <p class="v20-session-meta"><strong>Signed in:</strong> <%= new Date(s.created_at).toLocaleString() %></p>
+      <p class="v20-session-meta"><strong>Expires:</strong> <%= new Date(s.expires_at).toLocaleString() %></p>
+    </div>
+    <% }) %>
   </div>
+  <% } else { %>
+  <p class="muted">No active sessions.</p>
+  <% } %>
   <% if (sessions.length > 1) { %>
   <form method="POST" action="/security/sessions/revoke" style="margin-top:12px">
     <input type="hidden" name="_csrf" value="<%= csrf %>">
