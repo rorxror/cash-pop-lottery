@@ -35,6 +35,7 @@
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
   --fs-xs: 12px;
   --fs-sm: 14px;
+  --fs-md: 15px; /* SCAN fix (D-10): was used in 4 places but never defined — those font-sizes silently dropped */
   --fs-base: 16px;
   --fs-lg: 20px;
   --fs-xl: 28px;
@@ -150,7 +151,7 @@ img, video, svg { max-width: 100%; }
 .btn-p:hover { box-shadow: var(--glow-gold), var(--sh-md); }
 .btn-g { background: transparent; color: var(--white); border-color: var(--line-dark); }
 .btn-g:hover { border-color: var(--gold-border); }
-.btn-d { background: var(--danger); color: var(--white); }
+.btn-d { background: #d92d20; color: #ffffff; } /* DS-032: was dark-navy on #ef4444 (4.28:1) */
 .btn-sm { font-size: var(--fs-xs); padding: var(--sp-2) var(--sp-4); }
 .btn-lg { font-size: var(--fs-base); padding: var(--sp-4) var(--sp-7); }
 .btn-block { display: block; width: 100%; }
@@ -168,9 +169,9 @@ img, video, svg { max-width: 100%; }
   white-space: nowrap;
 }
 .b-ok { background: var(--success); color: var(--white); }
-.b-err { background: var(--danger); color: var(--white); }
+.b-err { background: #d92d20; color: #ffffff; } /* DS-032 */
 .b-warn { background: var(--gold); color: var(--navy-900); }
-.b-info { background: var(--navy-800); color: var(--gold-2); border: 1px solid var(--gold-border); }
+.b-info { background: #17203a; color: #f7c948; border: 1px solid var(--gold-border); } /* DS-062: was gold-2 on white (3.61:1) */
 .b-muted { background: var(--line-dark); color: var(--muted); }
 .alert, .flash { border-radius: var(--r-md); padding: var(--sp-4) var(--sp-5); margin: var(--sp-4) 0; font-size: var(--fs-sm); line-height: var(--lh-body); }
 .a-ok, .f-ok { background: var(--gold-soft); border: 1px solid var(--gold-border); color: var(--white); }
@@ -535,7 +536,7 @@ img, video, svg { max-width: 100%; }
 
 /* ---------- Pagination ---------- */
 .pagination { display: flex; gap: var(--sp-2); flex-wrap: wrap; margin-top: var(--sp-5); }
-.pagination a, .pagination span { padding: var(--sp-2) var(--sp-4); border: 1px solid var(--line-dark); border-radius: var(--r-sm); font-size: var(--fs-sm); }
+.pagination a, .pagination span { display: inline-flex; align-items: center; min-height: 48px; padding: var(--sp-2) var(--sp-4); /* SCAN fix (D-14) */ border: 1px solid var(--line-dark); border-radius: var(--r-sm); font-size: var(--fs-sm); }
 .pagination a:hover { border-color: var(--gold-border); text-decoration: none; }
 .pagination .current { background: var(--gold); color: var(--navy-900); font-weight: 800; border-color: var(--gold); }
 
@@ -575,7 +576,7 @@ img, video, svg { max-width: 100%; }
 .adm .tbl td { border-bottom-color: var(--line-light); color: var(--ink); }
 .adm .tbl tbody tr:nth-child(even) { background: var(--row-alt-light); }
 .adm .tbl tbody tr:hover { background: var(--row-hover-light); }
-.adm .tbl a { color: var(--navy-800); font-weight: 600; }
+.adm .tbl a { color: #0057b8; font-weight: 600; } /* DS-003: was var(--navy-800)=#fff on white rows (1.00:1, invisible) */
 .adm .field input[type="text"], .adm .field input[type="email"], .adm .field input[type="password"],
 .adm .field input[type="number"], .adm .field input[type="tel"], .adm .field select, .adm .field textarea {
   background: var(--white); border-color: var(--line-light); color: var(--ink);
@@ -643,7 +644,7 @@ img, video, svg { max-width: 100%; }
   --sys-bg2: #ffffff;
   --sys-bg3: #f5f5f7;
   --sys-label: #1d1d1f;
-  --sys-label2: #86868b;
+  --sys-label2: #5f6368; /* SCAN fix (D-19): #86868b is 3.62:1 at caption sizes — the value this file already chose for table headers (DS-063) */
   --sys-label3: #aeaeb2;
   --sys-separator: rgba(60, 60, 67, 0.12);
   --sys-blue: #0071e3;
@@ -990,7 +991,7 @@ body {
   transition: background 0.15s;
 }
 .adm-side nav a:hover { background: rgba(0,0,0,0.05); }
-.adm-side nav a.active { background: rgba(0,113,227,0.1); color: #0071e3; font-weight: 600; }
+.adm-side nav a.active { background: rgba(0,113,227,0.12); color: #0057b8; font-weight: 600; } /* DS-064: was 3.78:1 */
 .adm-main { padding: 32px; }
 /* NOTE: the base theme's --white variable is actually dark navy (#17203a)
    and --navy-900 is light — so the base .adm-top (background: var(--white))
@@ -1011,7 +1012,7 @@ body {
 .adm .card-h h3 { font-size: 17px; font-weight: 600; letter-spacing: -0.2px; }
 .adm .card-b { padding: 20px 24px 24px; }
 .adm table { width: 100%; border-collapse: collapse; font-size: 15px; }
-.adm table th { text-align: left; font-size: 13px; font-weight: 600; color: #86868b; text-transform: uppercase; letter-spacing: 0.3px; padding: 10px 12px; border-bottom: 1px solid rgba(60,60,67,0.12); }
+.adm table th { text-align: left; font-size: 13px; font-weight: 600; color: #5f6368; text-transform: uppercase; letter-spacing: 0.3px; padding: 10px 12px; border-bottom: 1px solid rgba(60,60,67,0.12); } /* DS-063: was #86868b (3.62:1) */
 .adm table td { padding: 12px; border-bottom: 1px solid rgba(60,60,67,0.06); }
 .adm table tr:last-child td { border-bottom: none; }
 /* iOS-style toggle switches in admin */
@@ -1022,7 +1023,7 @@ body {
 /* Apple KPI cards: white, dark numbers, gold only as hover accent */
 .adm .kpi { background: #fff; border-radius: 20px; box-shadow: 0 4px 16px rgba(0,0,0,0.08), 0 1px 4px rgba(0,0,0,0.04); border: 1px solid rgba(60,60,67,0.08); padding: 20px 24px; }
 .adm .kpi .n { color: #1d1d1f; font-size: 28px; font-weight: 700; letter-spacing: -0.5px; }
-.adm .kpi .l { color: #86868b; }
+.adm .kpi .l { color: #5f6368; } /* DS-063 */
 .adm .kpi-link { text-decoration: none; color: inherit; }
 .adm .kpi-link:hover { text-decoration: none; box-shadow: 0 8px 24px rgba(0,0,0,0.12); }
 .adm .kpi-link:hover .n { color: #0071e3; }
@@ -1156,7 +1157,7 @@ h1, h2 { font-weight: 800; }
 }
 .btn:active { transform: translateY(1px) scale(.99); }
 .btn-p {
-  background: linear-gradient(135deg, #f7c948 0%, var(--gold) 48%, var(--gold-deep) 100%);
+  background: linear-gradient(135deg, #f7c948 0%, var(--gold) 48%, #cf8a00 100%); /* DS-065: deep stop was #a86e00 (3.60:1 under navy-ink text) */
   border: 1px solid rgba(168,110,0,.4);
   box-shadow: 0 6px 18px rgba(217,148,13,.38), inset 0 1px 0 rgba(255,255,255,.6), inset 0 -2px 5px rgba(120,70,0,.28);
 }
@@ -1488,12 +1489,12 @@ h1, h2 { font-weight: 800; }
 .btn-row { display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: center; }
 /* tabs with live count badges */
 .tabs { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin-bottom: var(--sp-4); }
-.tab { display: inline-flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) var(--sp-4); border-radius: var(--r-pill); background: var(--white); border: 1px solid var(--line-light); color: var(--ink-soft); font-size: var(--fs-sm); font-weight: 600; text-decoration: none; }
-.tab .count { background: var(--ink-soft-bg); border-radius: var(--r-pill); padding: 2px var(--sp-2); font-size: var(--fs-xs); }
-.tab.active { background: var(--navy-800); color: var(--white); border-color: var(--navy-800); }
-.tab.active .count { background: var(--gold-soft); color: var(--gold-2); }
+.tab { display: inline-flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) var(--sp-4); min-height: 48px; /* SCAN fix (D-14) */ border-radius: var(--r-pill); background: #eef1f6; border: 1px solid #c9d2e0; color: #34405c; font-size: var(--fs-sm); font-weight: 600; text-decoration: none; } /* DS-030: was grey-on-dark-navy (2.77:1) */
+.tab .count { background: #dbe2ec; color: #1b2340; border-radius: var(--r-pill); padding: 2px var(--sp-2); font-size: var(--fs-xs); }
+.tab.active { background: #17203a; color: #ffffff; border-color: #17203a; } /* DS-030: active = dark pill, white text (15:1) */
+.tab.active .count { background: #f7c948; color: #1b2340; } /* DS-030: was 3.07:1 */
 /* small draw-number chip */
-.ball-sm { display: inline-flex; align-items: center; justify-content: center; min-width: 30px; height: 30px; padding: 0 var(--sp-2); border-radius: var(--r-pill); background: var(--navy-800); color: var(--gold-2); font-weight: 800; font-size: var(--fs-sm); }
+.ball-sm { display: inline-flex; align-items: center; justify-content: center; min-width: 30px; height: 30px; padding: 0 var(--sp-2); border-radius: var(--r-pill); background: #17203a; color: #f7c948; font-weight: 800; font-size: var(--fs-sm); } /* DS-062 */
 /* exposure heat map */
 .heat { display: grid; grid-template-columns: repeat(15, 1fr); gap: var(--sp-1); margin: var(--sp-4) 0; }
 .heat-cell { position: relative; aspect-ratio: 1; border-radius: var(--r-sm); background: var(--ink-soft-bg); overflow: hidden; display: flex; align-items: center; justify-content: center; }
@@ -1524,13 +1525,13 @@ h1, h2 { font-weight: 800; }
 .scratch-card.type-bonus,.scratch-play.type-bonus{border-color:rgba(244,114,182,.55)}
 .status-dot,.badge{display:inline-flex;align-items:center;gap:6px;border-radius:var(--r-pill);padding:4px 10px;background:var(--success-soft);color:var(--success);font-size:var(--fs-xs);font-weight:800;text-transform:uppercase;letter-spacing:.05em}
 .scratch-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:var(--sp-3);margin:var(--sp-5) 0}
-.scratch-metrics>div{padding:var(--sp-3);border-radius:var(--r-sm);background:rgba(255,255,255,.055)}
+.scratch-metrics>div{padding:var(--sp-3);border-radius:var(--r-sm);background:rgba(23,32,58,.055)} /* SCAN fix (D-16): was white-on-white inside the light scratch card */
 .scratch-metrics small{display:block;color:var(--muted);font-size:var(--fs-xs)}
 .scratch-metrics strong{display:block;margin-top:3px;font-size:var(--fs-base);overflow-wrap:anywhere}
 .btn-block{display:block;width:100%;text-align:center}
 .back-link{display:inline-block;margin-bottom:var(--sp-4)}
 .ticket-tabs{display:flex;gap:var(--sp-2);margin-bottom:var(--sp-5);flex-wrap:wrap}
-.ticket-tabs a{padding:10px 14px;border:1px solid var(--line-dark);border-radius:var(--r-pill);color:var(--muted);font-weight:700}
+.ticket-tabs a{display:inline-flex;align-items:center;min-height:48px;padding:10px 14px; /* SCAN fix (D-14) */border:1px solid var(--line-dark);border-radius:var(--r-pill);color:var(--muted);font-weight:700}
 .ticket-tabs a.active{color:var(--navy-900);background:var(--gold);border-color:var(--gold)}
 .ticket-tabs span{margin-left:5px;font-size:var(--fs-xs)}
 .ticket-list,.series-stack,.verify-stack{display:grid;gap:var(--sp-4)}
@@ -1543,7 +1544,7 @@ h1, h2 { font-weight: 800; }
 .window-grid{display:grid;grid-template-columns:repeat(3,minmax(70px,1fr));gap:10px;width:min(100%,520px)}
 .bonus-grid{display:grid;grid-template-columns:2fr 1fr;gap:12px;width:min(100%,520px)}
 .scratch-progress{display:grid;grid-template-columns:auto 1fr;align-items:center;gap:var(--sp-3)}
-.progress-track{height:10px;border-radius:var(--r-pill);overflow:hidden;background:rgba(255,255,255,.1)}.progress-track span{display:block;height:100%;width:0;background:var(--gold);transition:width .15s}
+.progress-track{height:10px;border-radius:var(--r-pill);overflow:hidden;background:rgba(23,32,58,.14)} /* SCAN fix (D-16): unfilled track was invisible on the white card */.progress-track span{display:block;height:100%;width:0;background:var(--gold);transition:width .15s}
 .scratch-result{display:grid;place-items:center;min-height:300px;text-align:center;border-radius:var(--r-md);padding:var(--sp-6);margin:var(--sp-5) 0;background:#0d1538}.scratch-result span{font-size:var(--fs-sm);text-transform:uppercase;letter-spacing:.14em}.scratch-result strong{font-size:clamp(30px,8vw,64px);color:var(--gold)}.scratch-result.win{box-shadow:inset 0 0 0 2px var(--success)}
 .admin-scratch-grid{display:grid;grid-template-columns:minmax(300px,.8fr) minmax(0,1.2fr);gap:var(--sp-5);align-items:start}
 .form-stack{display:grid;gap:var(--sp-4)}.form-stack label{display:grid;gap:6px;font-weight:700}.form-stack input,.form-stack select,.form-stack textarea{width:100%}
@@ -1562,7 +1563,7 @@ body.has-cookie { padding-bottom: 150px; }
 .cur-picker summary::-webkit-details-marker { display: none; }
 .cur-pill {
   display: inline-flex; align-items: center; gap: 6px;
-  height: 40px; padding: 0 14px; border-radius: 999px;
+  height: 48px; padding: 0 14px; border-radius: 999px; /* SCAN fix (D-14): 48px touch target */
   background: rgba(255,255,255,0.72); backdrop-filter: saturate(180%) blur(20px);
   border: 1px solid rgba(60,60,67,0.12);
   box-shadow: 0 2px 12px rgba(0,0,0,0.06);
@@ -1669,3 +1670,25 @@ body.has-cookie { padding-bottom: 150px; }
 .form-card .field.check label input[type="checkbox"] { flex-shrink: 0; width: 20px; height: 20px; min-width: 0; min-height: 0; margin: 2px 0 0 0; accent-color: #0071e3; cursor: pointer; }
 /* Guard: the 48px min-height for text fields must never stretch checkboxes/radios */
 .field input[type="checkbox"], .field input[type="radio"] { min-height: 0; }
+
+/* ---------- DS admin/public contrast repair (DeepSeek round) ----------
+   Appended last so it wins the cascade deterministically. */
+/* DS-031: plain .btn had transparent background AND border - most admin
+   action buttons rendered as bare bold text. Give the base button a
+   visible fill + border; variants (.btn-p/.btn-g/.btn-d) still override. */
+.btn { border: 1px solid rgba(23,32,58,.25); background: rgba(23,32,58,.06); }
+/* DS-033: money amounts - #22c55e was 2.28:1, #ef4444 was 3.76:1 on white. */
+.pos { color: #12805c; }
+.neg { color: #d92d20; }
+/* DS-062: admin inline links outside tables share the table-link fix. */
+.adm a { color: #0057b8; }
+.adm .btn-p, .adm a.btn-p { color: var(--navy-ink); }
+
+/* DS-066: admin list filter bars */
+.filter-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 12px 0; }
+.filter-form input, .filter-form select { min-height: 40px; padding: 6px 10px; border: 1px solid rgba(23,32,58,.25); border-radius: 10px; background: #fff; color: #1b2340; font: inherit; font-size: 14px; }
+
+/* DS-062 residual (audit-E E-08, found by adversarial verify-4): the global
+   public link colour var(--gold-2) #b87a00 on white was 3.61:1. Darkened for
+   plain links only; class-styled links/buttons keep their own colours. */
+a { color: #8a5c00; }

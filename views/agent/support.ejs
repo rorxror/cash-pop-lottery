@@ -1,0 +1,33 @@
+<section class="wrap section">
+  <h1 class="sec-title">Support Tickets</h1>
+  <div class="agent-nav card">
+    <a href="/agent">Dashboard</a>
+    <a href="/agent/players">Players</a>
+    <a href="/agent/players/new">Add Player</a>
+    <a href="/agent/transfer">Transfer</a>
+    <a href="/agent/commissions">Commissions</a>
+    <a href="/agent/support" class="active">Support</a>
+  </div>
+  <div class="card mt">
+    <div class="card-h"><h2>Tickets from your players</h2></div>
+    <% if (tickets && tickets.length) { %>
+    <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr><th>Ticket</th><th>Player</th><th>Subject</th><th>Status</th><th>Updated</th><th></th></tr></thead>
+      <tbody>
+        <% tickets.forEach(function(t){ %>
+        <tr>
+          <td><%= t.public_id %></td>
+          <td><%= t.player_name %> (<%= t.player_email %>)</td>
+          <td><%= t.subject %></td>
+          <td><span class="badge <%= t.status === 'open' ? 'b-info' : 'b-muted' %>"><%= t.status %></span></td>
+          <td><%= new Date(t.updated_at).toLocaleString() %></td>
+          <td><a class="btn btn-sm" href="/agent/support/<%= t.public_id %>">Open</a></td>
+        </tr>
+        <% }) %>
+      </tbody>
+    </table>
+    </div>
+    <% } else { %><p class="muted">No tickets from your players yet.</p><% } %>
+  </div>
+</section>

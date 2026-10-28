@@ -5,15 +5,15 @@
       <% (messages || []).forEach(function(m){ %>
       <div class="msg <%= m.mine ? 'mine' : '' %>">
         <div class="msg-head">
-          <strong><%= m.mine ? 'You' : m.author_role %></strong>
+          <strong><%= m.mine ? 'You' : 'Support team' %></strong>
           <small class="muted"><%= new Date(m.created_at).toLocaleString() %></small>
         </div>
         <div class="msg-body"><%= m.body %></div>
       </div>
       <% }) %>
     </div>
-    <% if (ticket.status === 'open') { %>
-    <form action="/support/<%= ticket.public_id %>" method="POST" class="mt">
+    <% if (ticket.status !== 'closed') { %>
+    <form action="/support/<%= ticket.public_id %>/reply" method="POST" class="mt">
       <input type="hidden" name="_csrf" value="<%= csrf %>">
       <div class="field">
         <label for="message">Reply</label>
@@ -22,8 +22,21 @@
       <button type="submit" class="btn btn-p">Send Reply</button>
     </form>
     <% } else { %>
-    <p class="muted mt">This ticket is closed. <a href="/support">Open a new ticket</a> if you need more help.</p>
+    <p class="muted mt">This ticket is closed. You can reopen it below if you need more help.</p>
     <% } %>
+    <div class="mt">
+      <% if (ticket.status !== 'closed') { %>
+      <form action="/support/<%= ticket.public_id %>/close" method="POST">
+        <input type="hidden" name="_csrf" value="<%= csrf %>">
+        <button type="submit" class="btn">Close ticket</button>
+      </form>
+      <% } else { %>
+      <form action="/support/<%= ticket.public_id %>/reopen" method="POST">
+        <input type="hidden" name="_csrf" value="<%= csrf %>">
+        <button type="submit" class="btn">Reopen ticket</button>
+      </form>
+      <% } %>
+    </div>
   </div>
   <p class="mt"><a href="/support">&larr; Back to support</a></p>
 </section>

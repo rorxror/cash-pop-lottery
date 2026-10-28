@@ -71,15 +71,51 @@
   </div>
 </section>
 
+<section class="wrap section narrow">
 <!-- R-122: logged-in password change -->
 <div class="card" style="margin-top:16px">
-  <h2>Change password</h2>
+  <h2><%= (typeof hasPassword !== 'undefined' && !hasPassword) ? 'Set a password' : 'Change password' %></h2>
+  <% if (typeof hasPassword !== 'undefined' && !hasPassword) { %><p class="muted sm">You signed in with a social account or a one-time code, so your account has no password yet. Set one to unlock every security option (including two-factor settings) and to be able to sign in with a password.</p><% } %>
   <form method="POST" action="/security/password">
     <input type="hidden" name="_csrf" value="<%= csrf %>">
-    <div class="field"><label>Current password</label><input type="password" name="current_password" required></div>
-    <div class="field"><label>New password</label><input type="password" name="password" required></div>
-    <div class="field"><label>Confirm new password</label><input type="password" name="password2" required></div>
-    <button type="submit" class="btn btn-p">Change password</button>
+    <% if (typeof hasPassword === 'undefined' || hasPassword) { %><div class="field"><label for="curPw">Current password</label><input type="password" id="curPw" name="current_password" required></div><% } %>
+    <div class="field"><label for="newPw">New password</label><input type="password" id="newPw" name="password" required></div>
+    <div class="field"><label for="newPw2">Confirm new password</label><input type="password" id="newPw2" name="password2" required></div>
+    <button type="submit" class="btn btn-p"><%= (typeof hasPassword !== 'undefined' && !hasPassword) ? 'Set password' : 'Change password' %></button>
   </form>
   <p class="muted sm">Changing your password signs out all other sessions.</p>
 </div>
+
+<!-- BP-14 (v19): own sessions from the DB session store. Only fields the
+     store really records are shown (sign-in time, IP, browser, expiry);
+     there is no last-activity tracking, so none is claimed. -->
+<% if (typeof sessions !== 'undefined' && sessions) { %>
+<div class="card" style="margin-top:16px">
+  <h2>Active sessions</h2>
+  <p class="muted sm">These are the browsers currently signed in to your account, exactly as recorded when each sign-in happened.</p>
+  <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr><th>Signed in</th><th>IP address</th><th>Browser / device</th><th>Expires</th><th></th></tr></thead>
+      <tbody>
+        <% sessions.forEach(function(s){ %>
+        <tr>
+          <td><%= new Date(s.created_at).toLocaleString() %></td>
+          <td><%= s.ip || '—' %></td>
+          <td><%= s.user_agent || '—' %></td>
+          <td><%= new Date(s.expires_at).toLocaleString() %></td>
+          <td><% if (s.id === currentSessionId) { %><span class="badge b-ok">This session</span><% } %></td>
+        </tr>
+        <% }) %>
+        <% if (!sessions.length) { %><tr><td colspan="5" class="muted">No active sessions.</td></tr><% } %>
+      </tbody>
+    </table>
+  </div>
+  <% if (sessions.length > 1) { %>
+  <form method="POST" action="/security/sessions/revoke" style="margin-top:12px">
+    <input type="hidden" name="_csrf" value="<%= csrf %>">
+    <button type="submit" class="btn btn-d">Sign out all other sessions</button>
+  </form>
+  <% } %>
+</div>
+<% } %>
+</section>

@@ -8,9 +8,8 @@
       <div class="card-h"><h2>Ticket details</h2></div>
       <div class="slip-lines">
         <div class="slip-line"><span>Status</span><span>
-          <% if (ticket.status === 'won') { %><span class="badge b-ok">WON</span>
-          <% } else if (ticket.status === 'lost') { %><span class="badge b-muted">LOST</span>
-          <% } else if (ticket.status === 'cancelled') { %><span class="badge b-err">CANCELLED</span>
+          <% if (ticket.status === 'cancelled') { %><span class="badge b-err">CANCELLED</span>
+          <% } else if (ticket.status === 'settled') { %><%- (entries || []).some(function(e){ return e.status === 'won'; }) ? '<span class="badge b-ok">WON</span>' : '<span class="badge b-muted">LOST</span>' %>
           <% } else { %><span class="badge b-info">ACTIVE</span><% } %>
         </span></div>
         <div class="slip-line"><span>Purchased</span><span><%= new Date(ticket.created_at).toLocaleString() %></span></div>

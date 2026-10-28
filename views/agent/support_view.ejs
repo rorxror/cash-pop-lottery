@@ -1,0 +1,47 @@
+<section class="wrap section narrow-wide">
+  <h1 class="sec-title"><%= ticket.subject %> <span class="badge <%= ticket.status === 'open' ? 'b-info' : 'b-muted' %>"><%= ticket.status %></span></h1>
+  <div class="agent-nav card">
+    <a href="/agent">Dashboard</a>
+    <a href="/agent/players">Players</a>
+    <a href="/agent/players/new">Add Player</a>
+    <a href="/agent/transfer">Transfer</a>
+    <a href="/agent/commissions">Commissions</a>
+    <a href="/agent/support" class="active">Support</a>
+  </div>
+  <div class="card mt">
+    <p class="muted">Player: <%= ticket.player_name %> (<%= ticket.player_email %>) · Ticket <%= ticket.public_id %></p>
+    <div class="messages">
+      <% (messages || []).forEach(function(m){ %>
+      <div class="msg <%= m.mine ? 'mine' : '' %>">
+        <div class="msg-head">
+          <strong><%= m.mine ? 'You' : m.author_role %></strong>
+          <small class="muted"><%= new Date(m.created_at).toLocaleString() %></small>
+        </div>
+        <div class="msg-body"><%= m.body %></div>
+      </div>
+      <% }) %>
+    </div>
+    <% if (ticket.status !== 'closed') { %>
+    <form action="/agent/support/<%= ticket.public_id %>/reply" method="POST" class="mt">
+      <input type="hidden" name="_csrf" value="<%= csrf %>">
+      <% if (typeof canned !== 'undefined' && canned && canned.length) { %>
+      <div class="field">
+        <label for="cannedPicker">Insert a canned reply</label>
+        <select id="cannedPicker" data-canned-picker data-source="cannedData">
+          <option value="">Choose a canned reply…</option>
+          <% canned.forEach(function(c){ %><option value="<%= c.id %>"><%= c.title %></option><% }) %>
+        </select>
+      </div>
+      <script type="application/json" id="cannedData"><%- JSON.stringify(canned.map(function(c){ return { id: c.id, body: c.body }; })).replace(/</g, '\\u003c') %></script>
+      <% } %>
+      <div class="field">
+        <label for="message">Reply</label>
+        <textarea id="message" name="message" rows="4" required></textarea>
+      </div>
+      <button type="submit" class="btn btn-p">Send Reply</button>
+    </form>
+    <% } else { %>
+    <p class="muted mt">This ticket is closed.</p>
+    <% } %>
+  </div>
+</section>

@@ -6,7 +6,7 @@
 const express = require('express');
 const router = express.Router();
 const QRCode = require('qrcode');
-const { now, randHex, sha256, hashPassword, validEmail, toMinor, esc, fromMinor } = require('../lib/util');
+const { now, randHex, sha256, hashPassword, validEmail, toMinor, esc, fromMinor, fmtMoney, decimalsFor } = require('../lib/util');
 const { getS, getBool, setSetting, getCurrencies, getSettings, keyCol } = require('../lib/settings');
 const { requireLogin, requireRole, createSession, destroySession, destroyUserSessions, verifyTotp, rateLimit } = require('../lib/auth');
 const { decideDeposit, decideWithdrawal, getBalances, postLedger, markWithdrawalPaid, settleAgentCommissions, releaseReferralCredits, decodeUserData } = require('../lib/money');
@@ -17,6 +17,9 @@ const { runNow } = require('../lib/cron');
 const notify = require('../lib/notify');
 const audit = require('../lib/audit');
 const ui = require('../lib/admin-ui');
+const kycLib = require('../lib/kyc');
+const uploadLib = require('../lib/upload');
+const engine = require('../lib/prize-engine');
 const { rbacMiddleware } = require('../lib/rbac');
 const { runReconciliation } = require('../lib/reconcile');
 const { encryptField, decryptField, keyConfigured } = require('../lib/credentials');
@@ -83,15 +86,24 @@ async function fundAgentFloat(db, agentId, currency, amount) {
   else await db.run('INSERT INTO agent_floats (agent_id, currency, balance) VALUES (?, ?, ?)', [agentId, currency, amount]);
 }
 /* Per-currency pending stakes for one draw (threshold math for maker-checker
-   on settle/cancel). Refund/stake share = ticket.total / num_draws, the same
-   basis cancelDraw refunds on — NOT wager alone (see lib/draws.js R-025). */
+   on settle/cancel). Refund/stake share = ticket.total / entry count, the
+   same basis cancelDraw refunds on - NOT wager alone, and NOT num_draws:
+   num_draws is the per-type count, so a BOTH ticket (2x entries) would be
+   double-counted (DS-002). */
 async function drawEntrySums(db, drawId) {
   const entries = await db.query(
-    `SELECT t.pops, t.wager, t.total, t.num_draws, t.currency FROM ticket_entries te JOIN tickets t ON t.id = te.ticket_id
+    `SELECT t.pops, t.wager, t.total, t.num_draws, t.currency, te.ticket_id FROM ticket_entries te JOIN tickets t ON t.id = te.ticket_id
      WHERE te.draw_id = ? AND te.status = 'pending'`, [drawId]);
+  const entryCounts = {};
+  for (const e of entries) {
+    if (entryCounts[e.ticket_id] === undefined) {
+      const c = await db.get('SELECT COUNT(*) AS c FROM ticket_entries WHERE ticket_id = ?', [e.ticket_id]);
+      entryCounts[e.ticket_id] = Number(c && c.c) || 0;
+    }
+  }
   const perCur = {};
   for (const e of entries) {
-    const n = Number(e.num_draws) || 0;
+    const n = entryCounts[e.ticket_id] || 0;
     let share;
     if (n > 0) share = Math.round(Number(e.total) / n);
     else share = Number(e.wager) * safeJsonArray(e.pops).length;
@@ -127,7 +139,7 @@ router.get('/', async (req, res) => {
   const t = now(), day = t - 86400000;
   const users = await req.db.get("SELECT COUNT(*) AS c FROM users WHERE role = 'player'");
   const ticketsToday = await req.db.get('SELECT COUNT(*) AS c, COALESCE(SUM(total),0) AS s FROM tickets WHERE created_at > ?', [day]);
-  const winsToday = await req.db.get("SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE type = 'win' AND created_at > ?", [day]);
+  const winsToday = await req.db.get("SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE type IN ('win','scratch_prize') AND created_at > ?", [day]);
   const pendDep = await req.db.get("SELECT COUNT(*) AS c FROM deposits WHERE status = 'pending'");
   const pendWd = await req.db.get("SELECT COUNT(*) AS c FROM withdrawals WHERE status = 'pending'");
   const openSup = await req.db.get("SELECT COUNT(*) AS c FROM support_tickets WHERE status = 'open'");
@@ -185,14 +197,20 @@ router.get('/', async (req, res) => {
 
   // Operator P&L (ViserLab-style): all-time sold vs given prize vs profit/loss
   const soldAll = await req.db.get('SELECT COALESCE(SUM(total),0) AS s FROM tickets');
-  const prizeAll = await req.db.get("SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE type = 'win'");
+  const prizeAll = await req.db.get("SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE type IN ('win','scratch_prize')");
   const overdueDraws = await req.db.get("SELECT COUNT(*) AS c FROM draws WHERE status = 'scheduled' AND close_at < ?", [now()]);
   // Settled-only RTP: never show a projected percentage as if it were real.
   // Until a draw has actually settled with real stakes, the honest value is "—".
-  const settled = await req.db.get(
-    `SELECT COALESCE(SUM(t.wager),0) AS staked, COALESCE(SUM(te.win_amount),0) AS paid
+  /* SCAN fix (C-02): stake per entry is wager × pops count (wager is
+     PER POP) — the old SQL summed wager alone, understating settled
+     stake and inflating RTP. Sum in JS with the same pops parsing the
+     exposure table above already uses. */
+  const settledRows = await req.db.query(
+    `SELECT t.wager AS wager, t.pops AS pops, te.win_amount AS win_amount
      FROM ticket_entries te JOIN tickets t ON t.id = te.ticket_id JOIN draws d ON d.id = te.draw_id
      WHERE d.status = 'settled' AND te.status IN ('won','lost')`);
+  const settled = { staked: 0, paid: 0 };
+  for (const r of settledRows) { settled.staked += safeJsonArray(r.pops).length * Number(r.wager || 0); settled.paid += Number(r.win_amount || 0); }
   const rtpValue = settled.staked > 0 ? (settled.paid / settled.staked * 100).toFixed(1) + '%' : '—';
   // Login breakdown, last 30 days, from real login_history rows. Country is
   // NOT recorded (no geo-IP service is configured), so only browser + OS are
@@ -247,18 +265,33 @@ router.get('/draws', async (req, res) => {
   const pendingCard = overdue.length ? ui.card('⏰ Pending draws — overdue, settle now',
     ui.table(['ID', 'Type', 'Date', 'Closes', 'Overdue by', ''],
       overdue.map(dr => [
-        dr.id, dr.draw_type + (dr.is_test ? ' ' + ui.badge('TEST', 'warn') : ''), esc(dr.draw_date), d(dr.close_at),
+        `<a href="${R(req, '/draws/' + dr.id)}">#${dr.id}</a>`, dr.draw_type + (dr.is_test ? ' ' + ui.badge('TEST', 'warn') : ''), esc(dr.draw_date), d(dr.close_at),
         Math.max(0, Math.round((now() - dr.close_at) / 60000)) + ' min',
-        `<form method="POST" action="${R(req, '/draws/' + dr.id + '/settle')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm btn-p" data-confirm="Settle this draw now?">Draw Now</button></form>`,
+        `<form method="POST" action="${R(req, '/draws/' + dr.id + '/settle')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm btn-g">Draw Now</button></form>`,
       ]))) : '';
+  // BP-23(e): live per-draw exposure (entries, stake, worst-case and
+  // expected liability) from real entries at the current prize table.
+  const pmDraws = await engine.prizeMap(req.db);
+  const drawAlertMinor = toMinor(getS(req.settings, 'draw_liability_alert', '0'), 2) || 0;
+  const expoByDraw = {};
+  for (const dr of upcoming) expoByDraw[dr.id] = await engine.drawExposure(req.db, dr.id, pmDraws);
+  const expoCell = (dr) => {
+    const exps = expoByDraw[dr.id] || [];
+    if (!exps.length) return '<span class="muted">no entries</span>';
+    return exps.map(ex => `${ex.entries} entries · stake ${money(req, ex.stake, ex.currency)} · max ${money(req, ex.maxLiability, ex.currency)}${drawAlertMinor > 0 && ex.maxLiability > drawAlertMinor ? ' ⚠ OVER ALERT' : ''} · expected ${money(req, ex.expectedLiability, ex.currency)}`).join('<br>');
+  };
   const body = `
     ${pendingCard}
-    ${ui.card('Upcoming draws', ui.table(['ID', 'Type', 'Date', 'Closes', 'Status', 'Seed hash', 'Winning #', ''],
+    ${ui.card('Upcoming draws', ui.table(['ID', 'Type', 'Date', 'Closes', 'Status', 'Seed hash', 'Winning #', 'Exposure (BP-23)', ''],
       upcoming.map(dr => [
-        dr.id, dr.draw_type + (dr.is_test ? ' ' + ui.badge('TEST', 'warn') : ''), esc(dr.draw_date), d(dr.close_at),
+        `<a href="${R(req, '/draws/' + dr.id)}">#${dr.id}</a>`, dr.draw_type + (dr.is_test ? ' ' + ui.badge('TEST', 'warn') : ''), esc(dr.draw_date), d(dr.close_at),
         ui.statusBadge(dr.status), `<span class="code">${esc(String(dr.seed_hash).slice(0, 16))}…</span>`, dr.winning_number || '—',
-        `<form method="POST" action="${R(req, '/draws/' + dr.id + '/settle')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm" data-confirm="Settle this draw now?">Settle now</button></form>
-         <form method="POST" action="${R(req, '/draws/' + dr.id + '/cancel')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm btn-d" data-confirm="Cancel this draw? All pending stakes for it are refunded to wallets.">Cancel & refund</button></form>`,
+        expoCell(dr),
+        /* SCAN fix (C-04): "Settle now" renders only when the engine
+           can actually settle (test draw, or close time reached) — on a
+           future draw the button was a guaranteed failure flash. */
+        `${(dr.is_test || dr.close_at <= Date.now()) ? `<form method="POST" action="${R(req, '/draws/' + dr.id + '/settle')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm">Settle now</button></form>` : '<span class="muted">Settles at close</span>'}
+         <form method="POST" action="${R(req, '/draws/' + dr.id + '/cancel')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm btn-d">Cancel & refund</button></form>`,
       ])) + ui.paginate(R(req, '/draws'), page, PER, upcomingTotal))}
     ${ui.card('Create TEST draw', `<p class="muted">Test draws never affect real players' money flow visibility — they are labeled TEST everywhere. A fixed winning number may be set <strong>only</strong> here, and it is audit-logged.</p>` +
       ui.formHtml(R(req, '/draws/test'), [
@@ -268,7 +301,7 @@ router.get('/draws', async (req, res) => {
       ], { csrf: req.csrfToken, submit: 'Create test draw' }))}
     ${ui.card('Recent settled draws', ui.table(['ID', 'Type', 'Date', 'Winning #', 'Test'],
       settled.map(dr => [
-        dr.id, dr.draw_type, esc(dr.draw_date),
+        `<a href="${R(req, '/draws/' + dr.id)}">#${dr.id}</a>`, dr.draw_type, esc(dr.draw_date),
         `<span class="ball-sm">${dr.winning_number}</span>`,
         dr.is_test ? ui.badge('TEST', 'warn') : '—',
       ])) + ui.paginate(R(req, '/draws'), page, PER, settledTotal))}`;
@@ -294,6 +327,7 @@ router.post('/draws/test', async (req, res) => {
   try {
     const id = await createTestDraw(req.db, {
       dateStr, timeStr, overrideNumber, adminId: req.user.id, ip: req.ip,
+      timeZone: getS(req.settings, 'site_timezone', 'UTC'),
     });
     await req.setFlash('success', 'TEST draw #' + id + ' created.');
   } catch (e) { await req.setFlash('error', 'Could not create TEST draw: ' + e.message); }
@@ -304,9 +338,12 @@ router.post('/draws/test', async (req, res) => {
 router.get('/draws/:id', async (req, res) => {
   const dr = await req.db.get('SELECT * FROM draws WHERE id = ?', [req.params.id]);
   if (!dr) return notFound(req, res, 'Draw not found.');
-  const sold = await req.db.get(
-    `SELECT COALESCE(SUM(t.wager),0) AS s, COUNT(DISTINCT te.ticket_id) AS tickets
+  /* SCAN fix (C-02): "Sold amount" is stake = wager × pops per entry,
+     summed in JS (wager alone is per-pop and understated the truth). */
+  const soldRows = await req.db.query(
+    `SELECT t.wager AS wager, t.pops AS pops, te.ticket_id AS ticket_id
      FROM ticket_entries te JOIN tickets t ON t.id = te.ticket_id WHERE te.draw_id = ?`, [dr.id]);
+  const sold = { s: soldRows.reduce((a, r) => a + safeJsonArray(r.pops).length * Number(r.wager || 0), 0), tickets: new Set(soldRows.map(r => r.ticket_id)).size };
   const paid = await req.db.get(
     `SELECT COALESCE(SUM(win_amount),0) AS s, COUNT(*) AS c FROM ticket_entries WHERE draw_id = ? AND status = 'won'`, [dr.id]);
   const winners = await req.db.query(
@@ -422,6 +459,342 @@ router.get('/tickets/:id', async (req, res) => {
   res.send(shell(req, '/tickets', 'Ticket ' + t.public_id, body));
 });
 
+
+/* ================= SMART ADMIN: Automation Console + Bonus Engine =======
+   One page that shows (and really controls) the whole machine: master AUTO
+   switch, per-process switches backed by cron_jobs, draw trigger settings,
+   scratch lifecycle settings, live per-process status, a system-health
+   block and failure alerts (failed runs are also audit-logged by the
+   scheduler - no silent auto failures). Bonuses are promotional credit
+   only: lib/bonus.js posts ledger rows of type 'bonus'; it has no path to
+   game outcomes. */
+const bonusEngine = require('../lib/bonus');
+
+function parseWhenAdmin(v) {
+  const raw = String(v || '').trim();
+  if (!raw) return 0;
+  const t = Date.parse(raw.replace(' ', 'T') + (raw.includes('Z') ? '' : 'Z'));
+  return Number.isFinite(t) ? t : 0;
+}
+
+router.get('/automation', async (req, res) => {
+  const S = req.settings;
+  const master = getBool(S, 'automation_master_enabled', true);
+  const jobs = await req.db.query('SELECT * FROM cron_jobs ORDER BY id');
+  const failed = jobs.filter((j) => j.last_status === 'error');
+  const failAudits = await req.db.query("SELECT * FROM audit_log WHERE action = 'cron.failed' ORDER BY id DESC LIMIT 5");
+  let dbOk = true;
+  try { await req.db.get('SELECT 1 AS x'); } catch { dbOk = false; }
+  const lastBeacon = await req.db.get("SELECT beacon_status FROM draws WHERE status = 'settled' AND is_test = 0 ORDER BY id DESC LIMIT 1");
+  const methodsOn = await req.db.get('SELECT COUNT(*) AS c FROM payment_methods WHERE enabled = 1');
+  const creds = await req.db.get('SELECT COUNT(*) AS c FROM gateway_credentials');
+  const series = await req.db.query('SELECT id, title, status FROM scratch_series ORDER BY id DESC LIMIT 50');
+  const health = [
+    ['Database', dbOk ? 'working' : 'ERROR - not responding'],
+    ['Provably-fair beacon (drand)', getBool(S, 'beacon_enabled', true) ? 'enabled' + (lastBeacon ? ' - last settled draw: ' + (lastBeacon.beacon_status || 'n/a') : ' - no settled draws yet') : 'disabled by operator (seed-only derivation)'],
+    ['Email (SMTP)', process.env.SMTP_HOST ? 'configured via server environment' : 'NOT configured - emails are logged as not-configured, never faked as sent'],
+    ['SMS', 'provider: ' + (getS(S, 'sms_provider', '') || 'not selected') + ' (credentials are set via server environment variables — see .env.example)'],
+    ['Payment gateways', Number(methodsOn.c) + ' method(s) enabled; ' + Number(creds.c) + ' credential record(s) stored'],
+    ['Bonus engine', getBool(S, 'bonus_enabled', true) ? 'on' : 'OFF'],
+  ];
+  const switchForm = (on, action, label) =>
+    `<form method="POST" action="${R(req, action)}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><input type="hidden" name="on" value="${on ? '0' : '1'}"><button class="btn btn-sm ${on ? 'btn-d' : 'btn-p'}">${on ? 'Turn OFF' : 'Turn ON'}</button></form> <span class="muted">${label}</span>`;
+  let body = ui.card('Automation master switch',
+    `<p>The master switch freezes or resumes the ENTIRE in-process scheduler (draws, settlement, scratch lifecycle, bonuses, notifications, cleanups, backups). Manual actions stay available as the backup path.</p><p>Master AUTO is <strong>${master ? 'ON' : 'OFF'}</strong> ${switchForm(master, '/automation/master', '')}</p>`);
+  body += ui.card('Pop draw automation', `<p class="muted">Trigger per draw type: <strong>time</strong> = settle at the scheduled close; <strong>threshold</strong> = settle the moment N entries are sold (time alone never settles; the draw stays open); <strong>both</strong> = whichever comes first. If time wins while the threshold is unmet, the unmet behaviour applies: <strong>settle</strong> anyway, or <strong>roll</strong> the draw +24h with its entries carried over. Outcomes always come from the committed seed + public beacon - triggers change WHEN a draw settles, never WHAT it draws.</p>` +
+    ui.formHtml(R(req, '/automation/draws'), [
+      { key: 'auto_draw_day', label: 'Auto-create/settle DAY draws', type: 'checkbox' },
+      { key: 'auto_draw_eve', label: 'Auto-create/settle EVE draws', type: 'checkbox' },
+      { key: 'draw_trigger_mode_day', label: 'DAY trigger', type: 'select', options: ['time', 'threshold', 'both'] },
+      { key: 'draw_trigger_mode_eve', label: 'EVE trigger', type: 'select', options: ['time', 'threshold', 'both'] },
+      { key: 'draw_threshold_day', label: 'DAY threshold (entries sold)', type: 'number' },
+      { key: 'draw_threshold_eve', label: 'EVE threshold (entries sold)', type: 'number' },
+      { key: 'draw_unmet_day', label: 'DAY unmet-at-time behaviour', type: 'select', options: ['settle', 'roll'] },
+      { key: 'draw_unmet_eve', label: 'EVE unmet-at-time behaviour', type: 'select', options: ['settle', 'roll'] },
+      { key: 'wager_options', label: 'Wager amounts (major units, comma list - drives the playslip AND buy validation)', type: 'text' },
+    ], {
+      csrf: req.csrfToken, submit: 'Save draw automation',
+      values: {
+        auto_draw_day: getBool(S, 'auto_draw_day', true), auto_draw_eve: getBool(S, 'auto_draw_eve', true),
+        draw_trigger_mode_day: getS(S, 'draw_trigger_mode_day', 'time'), draw_trigger_mode_eve: getS(S, 'draw_trigger_mode_eve', 'time'),
+        draw_threshold_day: getS(S, 'draw_threshold_day', '100'), draw_threshold_eve: getS(S, 'draw_threshold_eve', '100'),
+        draw_unmet_day: getS(S, 'draw_unmet_day', 'settle'), draw_unmet_eve: getS(S, 'draw_unmet_eve', 'settle'),
+        wager_options: getS(S, 'wager_options', '1,2,5,10'),
+      },
+    }) + `<p class="muted">Prize multipliers per pop count are edited under Settings → Prize Table and are read by the settle engine on every draw.</p>`);
+  body += ui.card('Scratch automation',
+    `<p class="muted">Series activate at their scheduled launch time, stop at their end date and close automatically when sold out (set the dates on the series create form). Auto-next creates and launches a fresh series from a template whenever a series ends.</p>
+     <form method="POST" action="${R(req, '/automation/scratch')}" class="adm-form"><input type="hidden" name="_csrf" value="${req.csrfToken}">
+       <div class="form-grid">
+         <div class="field"><label class="check"><input type="checkbox" name="scratch_auto_next_enabled" value="1" ${getBool(S, 'scratch_auto_next_enabled', false) ? 'checked' : ''}> Auto-create next series</label></div>
+         <div class="field"><label>Template series</label><select name="scratch_template_series_id"><option value="">— none —</option>${series.map((x) => `<option value="${x.id}" ${String(x.id) === getS(S, 'scratch_template_series_id', '') ? 'selected' : ''}>${esc(x.title)} (#${x.id}, ${esc(x.status)})</option>`).join('')}</select></div>
+       </div>
+       <h4 class="mt">Smart Prize &amp; Profit Engine (BP-23)</h4>
+       <p class="muted">Aggregate-level controls only — pools, RTP targets and exposure. Outcomes stay predetermined/committed (scratch) and beacon-derived (pop); nothing here can change a sold ticket or a single result.</p>
+       <div class="form-grid">
+         <div class="field"><label>Planner target RTP % (also used by smart auto-next)</label><input type="text" name="scratch_planner_target_rtp" value="${esc(getS(S, 'scratch_planner_target_rtp', '75'))}"></div>
+         <div class="field"><label class="check"><input type="checkbox" name="scratch_smart_pool_enabled" value="1" ${getBool(S, 'scratch_smart_pool_enabled', false) ? 'checked' : ''}> Smart auto-next pool (regenerate from the ended series' sell-through + target RTP instead of cloning tiers)</label></div>
+         <div class="field"><label class="check"><input type="checkbox" name="scratch_guardrail_enabled" value="1" ${getBool(S, 'scratch_guardrail_enabled', false) ? 'checked' : ''}> Enable exposure guardrails</label></div>
+         <div class="field"><label>Launch cap — max prize liability, % of full sales value</label><input type="text" name="scratch_liability_cap_pct" value="${esc(getS(S, 'scratch_liability_cap_pct', '100'))}"></div>
+         <div class="field"><label>Alert threshold — unsold-tail RTP above %</label><input type="text" name="scratch_alert_threshold_pct" value="${esc(getS(S, 'scratch_alert_threshold_pct', '90'))}"></div>
+         <div class="field"><label>On threshold breach</label><select name="scratch_guardrail_action">${['alert', 'close_sales', 'stop_auto_next'].map(a => `<option value="${a}" ${getS(S, 'scratch_guardrail_action', 'alert') === a ? 'selected' : ''}>${a}</option>`).join('')}</select></div>
+         <div class="field"><label>Draw liability alert (major units; 0 = off)</label><input type="text" name="draw_liability_alert" value="${esc(getS(S, 'draw_liability_alert', '0'))}"></div>
+       </div>
+       <div class="mt"><button class="btn btn-p" type="submit">Save scratch automation</button></div>
+     </form>`);
+  body += ui.card('Processes (live status)', ui.table(
+    ['Process', 'Every (min)', 'Last run', 'Next run', 'Last result', 'Switch', ''],
+    jobs.map((j) => [esc(j.name), j.interval_minutes, j.last_run_at ? d(j.last_run_at) : 'never', j.next_run_at ? d(j.next_run_at) : '—',
+      (j.last_status ? ui.statusBadge(j.last_status) : '—') + `<br><small class="muted">${esc(j.last_message || '')}</small>`,
+      j.status === 'active' ? ui.badge('active', 'ok') : ui.badge('paused', 'muted'),
+      `<form method="POST" action="${R(req, '/automation/job/' + j.id + '/run')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm">Run now</button></form>
+       <form method="POST" action="${R(req, '/automation/job/' + j.id + '/toggle')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm">${j.status === 'active' ? 'Pause' : 'Resume'}</button></form>`])));
+  body += ui.card('System health', ui.table(['Component', 'State'], health.map((h) => [esc(h[0]), esc(h[1])])));
+  // BP-23(e/b): live exposure alerts — computed from real entries and
+  // outcomes at render time, so what you see is the current truth.
+  {
+    const alerts = [];
+    if (getBool(S, 'scratch_guardrail_enabled')) {
+      const thr = Number(getS(S, 'scratch_alert_threshold_pct', '90')) || 90;
+      const liveSeries = await req.db.query("SELECT * FROM scratch_series WHERE status = 'live'");
+      for (const srow of liveSeries) {
+        const expo = await engine.seriesExposure(req.db, srow);
+        if (expo.remainingTickets > 0 && expo.tailRtpPct > thr) alerts.push([d(now()), 'Scratch guardrail', `Series "${esc(srow.title)}" (#${srow.id}): unsold-tail RTP ${expo.tailRtpPct.toFixed(1)}% > threshold ${thr}% — remaining liability ${money(req, expo.remainingLiability, srow.currency)} over ${expo.remainingTickets} tickets.`]);
+      }
+    }
+    const drawAlertMajor = getS(S, 'draw_liability_alert', '0');
+    if (parseFloat(drawAlertMajor) > 0) {
+      const pm = await engine.prizeMap(req.db);
+      const open = await req.db.query("SELECT * FROM draws WHERE status = 'scheduled' AND is_test = 0 ORDER BY close_at LIMIT 50");
+      for (const dr of open) {
+        const exps = await engine.drawExposure(req.db, dr.id, pm);
+        for (const ex of exps) {
+          /* SCAN fix (B-10): per-currency minor threshold, as in cron. */
+          const drawAlertMinor = toMinor(drawAlertMajor, decimalsFor(ex.currency, 'USD'));
+          if (drawAlertMinor > 0 && ex.maxLiability > drawAlertMinor) alerts.push([d(now()), 'Draw exposure', `Draw #${dr.id} (${esc(dr.draw_type)} ${esc(dr.draw_date)}): max liability ${money(req, ex.maxLiability, ex.currency)} > alert threshold ${money(req, drawAlertMinor, ex.currency)} (expected ${money(req, ex.expectedLiability, ex.currency)}).`]);
+        }
+      }
+    }
+    body += ui.card('Exposure alerts (BP-23)', alerts.length ? ui.table(['When', 'Source', 'Detail'], alerts) : '<p class="muted">No exposure alerts right now. Scratch guardrail and draw-liability alerts appear here live when thresholds are crossed (enable them in Scratch automation above).</p>');
+  }
+  body += ui.card('Failure alerts', failed.length || failAudits.length
+    ? ui.table(['When', 'Process', 'Detail'], [
+        ...failed.map((j) => [j.last_run_at ? d(j.last_run_at) : '—', esc(j.name), esc(j.last_message || 'error')]),
+        ...failAudits.map((a) => [d(a.created_at), 'scheduler', esc(a.detail || a.action)]),
+      ])
+    : '<p class="muted">No failed automation runs recorded. Failures appear here and in the Audit Trail the moment a run errors.</p>');
+  res.send(shell(req, '/automation', 'Automation Console', body));
+});
+
+router.post('/automation/master', async (req, res) => {
+  const on = req.body.on === '1' ? '1' : '0';
+  await setSetting(req.db, req.driver, 'automation_master_enabled', on);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'automation.master', entity: 'settings', entityId: '', detail: { automation_master_enabled: on }, ip: req.ip });
+  await req.setFlash('success', 'Automation master ' + (on === '1' ? 'ON - the scheduler is live.' : 'OFF - the scheduler is frozen.'));
+  res.redirect(R(req, '/automation'));
+});
+
+router.post('/automation/draws', async (req, res) => {
+  const mode = (v) => (['time', 'threshold', 'both'].includes(v) ? v : 'time');
+  const unmet = (v) => (v === 'roll' ? 'roll' : 'settle');
+  const num = (v, dflt) => { const n = parseInt(v, 10); return Number.isInteger(n) && n >= 0 ? String(n) : dflt; };
+  const modeDay = mode(req.body.draw_trigger_mode_day), modeEve = mode(req.body.draw_trigger_mode_eve);
+  const thrDay = num(req.body.draw_threshold_day, '100'), thrEve = num(req.body.draw_threshold_eve, '100');
+  /* SCAN fix (B-11/C-09): threshold mode with threshold 0 can never
+     settle (both engine paths require threshold > 0) and would lock a
+     draw — and its stakes — open forever. Refuse the whole save. */
+  if ((modeDay === 'threshold' && thrDay === '0') || (modeEve === 'threshold' && thrEve === '0')) {
+    await req.setFlash('error', 'Threshold trigger mode needs a ticket threshold of at least 1 — with 0 the draw could never settle. Nothing was saved.');
+    return res.redirect(R(req, '/automation'));
+  }
+  /* SCAN fix (C-08): wager_options gets the SAME validation here as in
+     the Economy settings save — a garbage list must not silently save
+     and change the playslip. */
+  const wagerRaw = String(req.body.wager_options || '1,2,5,10').slice(0, 100);
+  const wagerList = wagerRaw.split(',').map(x => x.trim()).filter(Boolean);
+  if (!wagerList.length || !wagerList.every(x => Number.isFinite(parseFloat(x)) && parseFloat(x) > 0)) {
+    await req.setFlash('error', 'Wager options must be a comma list of positive amounts (e.g. 1,2,5,10). Nothing was saved.');
+    return res.redirect(R(req, '/automation'));
+  }
+  const vals = {
+    auto_draw_day: req.body.auto_draw_day ? '1' : '0',
+    auto_draw_eve: req.body.auto_draw_eve ? '1' : '0',
+    draw_trigger_mode_day: modeDay, draw_trigger_mode_eve: modeEve,
+    draw_threshold_day: thrDay, draw_threshold_eve: thrEve,
+    draw_unmet_day: unmet(req.body.draw_unmet_day), draw_unmet_eve: unmet(req.body.draw_unmet_eve),
+    wager_options: wagerRaw,
+  };
+  for (const [k, v] of Object.entries(vals)) await setSetting(req.db, req.driver, k, v);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'automation.draws', entity: 'settings', entityId: '', detail: vals, ip: req.ip });
+  await req.setFlash('success', 'Draw automation saved.');
+  res.redirect(R(req, '/automation'));
+});
+
+router.post('/automation/scratch', async (req, res) => {
+  // BP-23 fields are validated as a group: a bad number refuses the whole
+  // save (nothing half-written), same discipline as the risk controls.
+  const pct = (v, min, max) => { const n = parseFloat(String(v || '')); return Number.isFinite(n) && n >= min && n <= max ? String(n) : null; };
+  const rtp = pct(req.body.scratch_planner_target_rtp, 1, 100);
+  const cap = pct(req.body.scratch_liability_cap_pct, 1, 200);
+  const thr = pct(req.body.scratch_alert_threshold_pct, 1, 500);
+  const action = ['alert', 'close_sales', 'stop_auto_next'].includes(req.body.scratch_guardrail_action) ? req.body.scratch_guardrail_action : null;
+  const drawAlert = String(req.body.draw_liability_alert || '0').trim();
+  if (rtp === null || cap === null || thr === null || !action || !/^\d+(\.\d{1,2})?$/.test(drawAlert)) {
+    await req.setFlash('error', 'Invalid BP-23 value: RTP 1–100, cap 1–200, threshold 1–500, draw alert an amount like 500 or 500.00. Nothing was saved.');
+    return res.redirect(R(req, '/automation'));
+  }
+  const vals = {
+    scratch_auto_next_enabled: req.body.scratch_auto_next_enabled ? '1' : '0',
+    scratch_template_series_id: String(parseInt(req.body.scratch_template_series_id, 10) || ''),
+    scratch_planner_target_rtp: rtp,
+    scratch_smart_pool_enabled: req.body.scratch_smart_pool_enabled ? '1' : '0',
+    scratch_guardrail_enabled: req.body.scratch_guardrail_enabled ? '1' : '0',
+    scratch_liability_cap_pct: cap,
+    scratch_alert_threshold_pct: thr,
+    scratch_guardrail_action: action,
+    draw_liability_alert: drawAlert,
+  };
+  for (const [k, v] of Object.entries(vals)) await setSetting(req.db, req.driver, k, v);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'automation.scratch', entity: 'settings', entityId: '', detail: vals, ip: req.ip });
+  await req.setFlash('success', 'Scratch automation saved.');
+  res.redirect(R(req, '/automation'));
+});
+
+router.post('/automation/job/:id/toggle', async (req, res) => {
+  const j = await req.db.get('SELECT * FROM cron_jobs WHERE id = ?', [req.params.id]);
+  if (!j) { await req.setFlash('error', 'Process not found.'); return res.redirect(R(req, '/automation')); }
+  await req.db.run("UPDATE cron_jobs SET status = CASE WHEN status='active' THEN 'paused' ELSE 'active' END, next_run_at = ? WHERE id = ?", [now() + j.interval_minutes * 60000, j.id]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'cron.toggle', entity: 'cron', entityId: req.params.id, detail: { old_status: j.status, new_status: j.status === 'active' ? 'paused' : 'active', via: 'automation console' }, ip: req.ip });
+  res.redirect(R(req, '/automation'));
+});
+
+router.post('/automation/job/:id/run', async (req, res) => {
+  /* SCAN fix (C-05): run-now can move money (e.g. settle_agent_commissions
+     credits agent wallets) — it is audit-logged like every other money
+     action. */
+  const job = await req.db.get('SELECT handler_key FROM cron_jobs WHERE id = ?', [req.params.id]);
+  try {
+    const msg = await runNow({ db: req.db, driver: req.driver }, req.params.id);
+    await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'cron.run_now', entity: 'cron', entityId: req.params.id, detail: { handler: job ? job.handler_key : '', result: String(msg).slice(0, 300), via: 'automation console' }, ip: req.ip });
+    await req.setFlash('success', 'Process ran: ' + msg);
+  } catch (e) {
+    await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'cron.run_now_failed', entity: 'cron', entityId: req.params.id, detail: { handler: job ? job.handler_key : '', error: e.message, via: 'automation console' }, ip: req.ip });
+    await req.setFlash('error', 'Process failed: ' + e.message);
+  }
+  res.redirect(R(req, '/automation'));
+});
+
+/* ---------------- Bonus engine (promotional credit only) ---------------- */
+router.get('/bonuses', async (req, res) => {
+  const S = req.settings;
+  const campaigns = await req.db.query('SELECT * FROM bonus_campaigns ORDER BY id DESC');
+  const grants = await req.db.query(
+    `SELECT g.*, c.name AS campaign_name, u.email AS user_email FROM bonus_grants g
+     JOIN bonus_campaigns c ON c.id = g.campaign_id JOIN users u ON u.id = g.user_id ORDER BY g.id DESC LIMIT 50`);
+  const currencies = getCurrencies(S).map((c) => c.code);
+  const money = (minor, cur) => fmtMoney(minor, cur, getCurrencies(S));
+  let body = ui.card('Bonus engine master switch',
+    `<p>Promotional credit only - grants land in player wallets as <strong>bonus</strong> ledger entries (never as game wins) and every grant is logged below. Engine is <strong>${getBool(S, 'bonus_enabled', true) ? 'ON' : 'OFF'}</strong>.</p>
+     <form method="POST" action="${R(req, '/bonuses/master')}"><input type="hidden" name="_csrf" value="${req.csrfToken}"><input type="hidden" name="on" value="${getBool(S, 'bonus_enabled', true) ? '0' : '1'}"><button class="btn ${getBool(S, 'bonus_enabled', true) ? 'btn-d' : 'btn-p'}">${getBool(S, 'bonus_enabled', true) ? 'Turn bonus engine OFF' : 'Turn bonus engine ON'}</button></form>`);
+  body += ui.card('Campaigns', campaigns.length ? ui.table(
+    ['Campaign', 'Audience', 'Amount', 'Trigger', 'Window', 'Granted', 'Caps', 'State', ''],
+    campaigns.map((c) => [esc(c.name), esc(c.audience) + (c.audience_n ? ' (' + c.audience_n + ')' : ''),
+      c.amount_type === 'percent' ? c.amount + '% of deposit' : money(c.amount, c.currency), esc(c.trigger_type),
+      (c.starts_at ? d(c.starts_at) : '—') + ' → ' + (c.ends_at ? d(c.ends_at) : '—'),
+      money(c.granted_total, c.currency),
+      'per-user ' + (c.per_user_cap > 0 ? money(c.per_user_cap, c.currency) : '∞') + ' · budget ' + (c.budget_cap > 0 ? money(c.budget_cap, c.currency) : '∞'),
+      c.active ? ui.badge('active', 'ok') : ui.badge('stopped', 'muted'),
+      `<form method="POST" action="${R(req, '/bonuses/' + c.id + '/run')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm">Run now</button></form>
+       <form method="POST" action="${R(req, '/bonuses/' + c.id + '/toggle')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm">${c.active ? 'Deactivate' : 'Activate'}</button></form>
+       <form method="POST" action="${R(req, '/bonuses/' + c.id + '/delete')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm btn-d">Delete</button></form>`]))
+    : '<p class="muted">No campaigns yet. Create the first one below.</p>');
+  body += ui.card('Create campaign', ui.formHtml(R(req, '/bonuses/save'), [
+    { key: 'name', label: 'Campaign name', type: 'text', required: true },
+    { key: 'audience', label: 'Audience', type: 'select', options: ['all', 'new', 'first_n', 'random_n'] },
+    { key: 'audience_n', label: 'Audience N (for first_n / random_n)', type: 'number', value: '0' },
+    { key: 'amount_type', label: 'Amount type', type: 'select', options: ['fixed', 'percent'] },
+    { key: 'amount', label: 'Amount (fixed: major units e.g. 5.00 · percent: e.g. 10 = 10%)', type: 'text', required: true },
+    { key: 'currency', label: 'Currency', type: 'select', options: currencies.length ? currencies : ['USD'] },
+    { key: 'trigger_type', label: 'Trigger', type: 'select', options: ['manual', 'signup', 'first_deposit', 'scheduled'] },
+    { key: 'starts_at', label: 'Valid from (optional, UTC e.g. 2026-11-01 10:00)', type: 'text' },
+    { key: 'ends_at', label: 'Valid until (optional, UTC)', type: 'text' },
+    { key: 'wagering_x', label: 'Wagering requirement (x grant amount, 0 = none)', type: 'text', value: '0' },
+    { key: 'per_user_cap', label: 'Per-user cap (major units, 0 = unlimited)', type: 'text', value: '0' },
+    { key: 'budget_cap', label: 'Total budget cap (major units, 0 = unlimited; auto-stops when exhausted)', type: 'text', value: '0' },
+  ], { csrf: req.csrfToken, submit: 'Create campaign' }));
+  body += ui.card('Grant log (latest 50)', grants.length ? ui.table(
+    ['When', 'Campaign', 'Player', 'Amount', 'Trigger', 'Wagering progress'],
+    grants.map((g) => [d(g.created_at), esc(g.campaign_name), esc(g.user_email), money(g.amount, g.currency), esc(g.trigger_type || ''),
+      g.wagering_required > 0 ? money(g.wagered, g.currency) + ' / ' + money(g.wagering_required, g.currency) : '—']))
+    : '<p class="muted">No grants yet.</p>');
+  res.send(shell(req, '/bonuses', 'Bonus Campaigns', body));
+});
+
+router.post('/bonuses/master', async (req, res) => {
+  const on = req.body.on === '1' ? '1' : '0';
+  await setSetting(req.db, req.driver, 'bonus_enabled', on);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'bonus.master', entity: 'settings', entityId: '', detail: { bonus_enabled: on }, ip: req.ip });
+  res.redirect(R(req, '/bonuses'));
+});
+
+router.post('/bonuses/save', async (req, res) => {
+  try {
+    const { decimalsFor } = require('../lib/util');
+    const currency = String(req.body.currency || 'USD').toUpperCase().slice(0, 8);
+    const dec = decimalsFor(currency, getCurrencies(req.settings));
+    const amountType = req.body.amount_type === 'percent' ? 'percent' : 'fixed';
+    const amount = amountType === 'percent'
+      ? Math.max(0, Math.floor(parseFloat(req.body.amount) || 0))
+      : toMinor(req.body.amount, dec);
+    if (!String(req.body.name || '').trim()) throw new Error('Campaign name is required.');
+    if (!amount || amount <= 0) throw new Error('Amount must be positive.');
+    const row = {
+      name: String(req.body.name).trim().slice(0, 120),
+      audience: ['all', 'new', 'first_n', 'random_n'].includes(req.body.audience) ? req.body.audience : 'all',
+      audience_n: Math.max(0, parseInt(req.body.audience_n, 10) || 0),
+      amount_type: amountType, amount, currency,
+      trigger_type: ['manual', 'signup', 'first_deposit', 'scheduled'].includes(req.body.trigger_type) ? req.body.trigger_type : 'manual',
+      starts_at: parseWhenAdmin(req.body.starts_at), ends_at: parseWhenAdmin(req.body.ends_at),
+      wagering_x: Math.max(0, parseFloat(req.body.wagering_x) || 0),
+      per_user_cap: toMinor(req.body.per_user_cap || '0', dec) || 0,
+      budget_cap: toMinor(req.body.budget_cap || '0', dec) || 0,
+    };
+    const r = await req.db.run(
+      `INSERT INTO bonus_campaigns (name, audience, audience_n, amount_type, amount, currency, trigger_type, starts_at, ends_at, wagering_x, per_user_cap, budget_cap, granted_total, active, last_drop_at, created_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, 0, ?, ?)`,
+      [row.name, row.audience, row.audience_n, row.amount_type, row.amount, row.currency, row.trigger_type, row.starts_at, row.ends_at, row.wagering_x, row.per_user_cap, row.budget_cap, req.user.id, now()]);
+    await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'bonus.create', entity: 'bonus_campaign', entityId: r.id, detail: row, ip: req.ip });
+    await req.setFlash('success', 'Campaign created and active.');
+  } catch (e) { await req.setFlash('error', e.message); }
+  res.redirect(R(req, '/bonuses'));
+});
+
+router.post('/bonuses/:id/run', async (req, res) => {
+  try {
+    const out = await bonusEngine.runCampaign(req.db, parseInt(req.params.id, 10), 'manual', req.settings, { manual: true, actorId: req.user.id });
+    await req.setFlash(out.skipped ? 'error' : 'success', out.skipped ? 'Run skipped: ' + out.skipped : `Granted ${out.granted} bonus(es), total ${out.total} minor.` + (out.stopped ? ' Budget exhausted - campaign auto-stopped.' : ''));
+  } catch (e) { await req.setFlash('error', e.message); }
+  res.redirect(R(req, '/bonuses'));
+});
+
+router.post('/bonuses/:id/toggle', async (req, res) => {
+  await req.db.run('UPDATE bonus_campaigns SET active = CASE WHEN active = 1 THEN 0 ELSE 1 END WHERE id = ?', [req.params.id]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'bonus.toggle', entity: 'bonus_campaign', entityId: req.params.id, detail: {}, ip: req.ip });
+  res.redirect(R(req, '/bonuses'));
+});
+
+router.post('/bonuses/:id/delete', async (req, res) => {
+  const g = await req.db.get('SELECT COUNT(*) AS c FROM bonus_grants WHERE campaign_id = ?', [req.params.id]);
+  if (g && Number(g.c) > 0) {
+    await req.setFlash('error', 'This campaign already has grants in the audit log - deactivate it instead of deleting.');
+  } else {
+    await req.db.run('DELETE FROM bonus_campaigns WHERE id = ?', [req.params.id]);
+    await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'bonus.delete', entity: 'bonus_campaign', entityId: req.params.id, detail: {}, ip: req.ip });
+    await req.setFlash('success', 'Campaign deleted (it had no grants).');
+  }
+  res.redirect(R(req, '/bonuses'));
+});
+
 module.exports = router;
 
 /* ============================================================ USERS */
@@ -464,7 +837,7 @@ router.get('/users', async (req, res) => {
     `<a class="tab${f === key ? ' active' : ''}" href="${R(req, '/users')}?f=${key}">${esc(label)} <span class="count">${badges[key]}</span></a>`).join('');
   const body = `<div class="tabs">${tabs}</div>` +
     (req.query.agent ? `<p class="muted">Showing players of agent #${esc(req.query.agent)} — <a href="${R(req, '/users')}">clear filter</a></p>` : '') +
-    ui.filtersHtml(R(req, '/users'), [{ key: 'q', label: 'Search name/email/phone' }], { q, f }) +
+    ui.filtersHtml(R(req, '/users'), [{ key: 'q', label: 'Search name/email/phone' }, { key: 'f', type: 'hidden' }, { key: 'agent', type: 'hidden' }], { q, f, agent: req.query.agent || '' }) +
     ui.table(['ID', 'Name', 'Email', 'Status', 'KYC', 'Agent', 'Joined', ''],
       rows.map(u => [
         u.id, esc(u.name), esc(u.email), ui.statusBadge(u.status), ui.statusBadge(u.kyc_status),
@@ -484,6 +857,7 @@ router.get('/users/:id', async (req, res) => {
   const tickets = await req.db.query('SELECT * FROM tickets WHERE user_id = ? ORDER BY created_at DESC LIMIT 10', [u.id]);
   const agents = await req.db.query("SELECT id, name FROM users WHERE role = 'agent' ORDER BY name");
   const flags = await req.db.query('SELECT * FROM account_flags WHERE user_id = ? ORDER BY created_at DESC LIMIT 20', [u.id]);
+  const kycDocs = await req.db.query('SELECT * FROM kyc_documents WHERE user_id = ? ORDER BY id DESC LIMIT 10', [u.id]);
   const refCredits = await req.db.query('SELECT * FROM referral_credits WHERE referrer_id = ? ORDER BY created_at DESC LIMIT 20', [u.id]);
   const referrer = u.referred_by ? await req.db.get('SELECT id, email FROM users WHERE id = ?', [u.referred_by]) : null;
   const body = `
@@ -497,22 +871,27 @@ router.get('/users/:id', async (req, res) => {
         { key: 'state', label: 'State', type: 'text', value: u.state },
         { key: 'zip', label: 'Zip / Postal code', type: 'text', value: u.zip },
         { key: 'country', label: 'Country', type: 'text', value: u.country },
-        { key: 'kyc_status', label: 'KYC', type: 'select', options: ['none', 'pending', 'verified', 'rejected'], value: u.kyc_status },
-        { key: 'agent_id', label: 'Agent (blank = unassigned)', type: 'text', value: u.agent_id || '' },
+        /* SCAN fix (C-06): kyc_status is NOT a biodata field anymore —
+           it changes only through the KYC queue decision or the
+           manual-verify attestation below (which requires a note). The
+           old dropdown let any editor set 'verified' unattested. */
+        { key: 'kyc_override', label: 'KYC requirement for this user (BP-21)', type: 'select', options: ['default', 'required', 'exempt'], value: u.kyc_override || 'default', help: 'default = follows the global KYC switch (Settings → KYC). required = this user must be KYC-approved before gated actions even when the global switch is off. exempt = never gated.' },
+        { key: 'auto_withdrawal_limit', label: 'Auto-withdrawal limit (BP-22)', type: 'text', value: u.auto_withdrawal_limit === null || u.auto_withdrawal_limit === undefined ? '' : String(u.auto_withdrawal_limit), help: 'Blank = follow the global limit in Settings → Withdrawal & risk controls. A value (major units, e.g. 25.50) is this user\'s own ceiling; 0 = never auto-approve for this user. Auto-approval never pays out by itself.' },
+        { key: 'agent_id', label: 'Agent', type: 'select', options: [{ v: '', l: 'Unassigned' }].concat(agents.map(a => ({ v: String(a.id), l: '#' + a.id + ' — ' + a.name }))), value: u.agent_id ? String(u.agent_id) : '' },
         { key: 'notes', label: 'Notes', type: 'textarea', value: u.notes },
-      ], { csrf: req.csrfToken, submit: 'Save biodata' }) +
+      ], { csrf: req.csrfToken, submit: 'Save biodata' }) + `<p class="muted">KYC status: <strong>${esc(u.kyc_status)}</strong> — changes only through the KYC review queue or the manual-verification attestation (see the KYC card).</p>` +
       ui.card('Controls', `
         <div class="btn-row">
           <form method="POST" action="${R(req, '/users/' + u.id + '/block')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}">
-            <button class="btn ${u.status === 'banned' ? 'btn-p' : 'btn-d'}" data-confirm="Are you sure?">${u.status === 'banned' ? 'Unblock' : 'Block'}</button></form>
+            <button class="btn ${u.status === 'banned' ? 'btn-p' : 'btn-d'}">${u.status === 'banned' ? 'Unblock' : 'Block'}</button></form>
           <form method="POST" action="${R(req, '/users/' + u.id + '/reset-password')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}">
-            <button class="btn" data-confirm="Reset this user's password?">Reset password</button></form>
+            <button class="btn">Reset password</button></form>
           <form method="POST" action="${R(req, '/users/' + u.id + '/revoke-sessions')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}">
-            <button class="btn" data-confirm="Sign this user out everywhere?">Revoke sessions</button></form>
+            <button class="btn">Revoke sessions</button></form>
           <form method="POST" action="${R(req, '/users/' + u.id + '/login-as')}" style="display:inline" target="_blank"><input type="hidden" name="_csrf" value="${req.csrfToken}">
-            <button class="btn btn-g" data-confirm="Log in as this user? This is audit-logged.">Login as user</button></form>
+            <button class="btn btn-g">Login as user</button></form>
           <form method="POST" action="${R(req, '/users/' + u.id + '/verify-contact')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}">
-            <button class="btn" data-confirm="Mark this user's contact (email/phone) as verified? Use only when you have attested the contact yourself.">Mark contact verified</button></form>
+            <button class="btn">Mark contact verified</button></form>
         </div>
         <h4 class="mt">Balance adjustment (manual correction, audit-logged)</h4>
         <form method="POST" action="${R(req, '/users/' + u.id + '/adjust')}" class="adm-form" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;">
@@ -520,7 +899,7 @@ router.get('/users/:id', async (req, res) => {
           <div class="field"><label>Direction</label><select name="direction"><option value="add">+ Add balance</option><option value="subtract">− Subtract balance</option></select></div>
           <div class="field"><label>Amount (major units, e.g. 10.00)</label><input type="text" name="amount" required placeholder="10.00"></div>
           <div class="field"><label>Remark (required, shown in audit)</label><input type="text" name="remark" required maxlength="200" placeholder="Why this adjustment?"></div>
-          <div class="mt"><button class="btn btn-p" type="submit" data-confirm="Apply this balance adjustment?">Apply adjustment</button></div>
+          <div class="mt"><button class="btn btn-p" type="submit">Apply adjustment</button></div>
         </form>
         <h4 class="mt">Deposit / withdrawal matrix</h4>
         ${ui.formHtml(R(req, '/users/' + u.id + '/matrix'), [
@@ -543,14 +922,20 @@ router.get('/users/:id', async (req, res) => {
         ['Payout details last changed', u.payout_updated_at ? d(u.payout_updated_at) : 'Never'],
         ['Profile completed', (u.profile_completed === 0) ? '✗ Pending (signed up via OTP, name/terms not yet collected)' : '✓ Yes'],
       ]))}
+      ${ui.card('KYC documents (BP-21)', (kycDocs.length ? ui.table(['#', 'Type', 'File', 'Status', 'Submitted', ''], kycDocs.map(doc => ['#' + doc.id, esc(({ national_id: 'National ID card', passport: 'Passport', driving_licence: 'Driving licence' }[doc.doc_type]) || doc.doc_type), esc(doc.original_name), ui.statusBadge(doc.status === 'approved' ? 'verified' : doc.status), d(doc.created_at), `<a class="btn btn-sm" href="${R(req, '/kyc/' + doc.id)}">Review</a>`])) : '<p class="muted">No documents submitted.</p>') + (u.kyc_status !== 'verified' ? `<h4 class="mt">Mark verified manually (off-platform verification)</h4>
+        <form method="POST" action="${R(req, '/users/' + u.id + '/kyc-verify')}" class="adm-form">
+          <input type="hidden" name="_csrf" value="${req.csrfToken}">
+          <div class="field"><label>Attestation note (required — recorded in the audit log)</label><textarea name="note" required maxlength="500" placeholder="What was verified, where, and by whom"></textarea></div>
+          <div class="mt"><button class="btn btn-p" type="submit">Mark verified manually</button></div>
+        </form>` : '<p class="muted">This user is KYC-verified.</p>'))}
       ${ui.card('Fraud flags', flags.length ? ui.table(['When', 'Flag', 'Detail', 'Reviewed'], flags.map(f => [d(f.created_at), esc(f.flag_type), `<span class="code">${esc(String(f.detail).slice(0, 120))}</span>`, f.reviewed_at ? '✓ ' + d(f.reviewed_at) : `<a class="btn btn-sm" href="${R(req, '/flags')}">Review</a>`])) : '<p class="muted">No flags.</p>')}
       ${ui.card('Referral credits (pending = awaiting referee deposit + wagering)', ui.table(['When', 'Referee', 'Amount', 'Status'], refCredits.map(c => [d(c.created_at), '#' + c.referee_id, money(req, c.amount, c.currency), ui.statusBadge(c.status)])))}
       ${ui.card('Recent tickets', ui.table(['Ticket', 'Total', 'Status', 'When'], tickets.map(t =>
         [`<span class="code">${esc(t.public_id)}</span>`, money(req, t.total, t.currency), ui.statusBadge(t.status), d(t.created_at)]))) + `<p class="mt"><a class="btn btn-sm" href="${R(req, '/tickets')}?q=${encodeURIComponent(u.email)}">View all tickets for this player →</a></p>`}
       ${ui.card('Recent transactions', ui.table(['When', 'Type', 'Amount', 'Balance after'], txs.map(t =>
         [d(t.created_at), esc(t.type), `<span class="${t.amount >= 0 ? 'pos' : 'neg'}">${money(req, t.amount, t.currency)}</span>`, money(req, t.balance_after, t.currency)]))) + `<p class="mt"><a class="btn btn-sm" href="${R(req, '/reports')}?type=transaction&q=${encodeURIComponent(u.email)}">View all transactions for this player →</a></p>`}
-      ${ui.card('Login history', ui.table(['When', 'IP', 'Country', 'Browser', 'OS', 'OK'], logins.map(l =>
-        [d(l.created_at), esc(l.ip), esc(l.country || '—'), esc(l.browser), esc(l.os), l.success ? '✓' : '✗']))) + `<p class="mt"><a class="btn btn-sm" href="${R(req, '/login-history')}?q=${encodeURIComponent(u.email)}">View full login history →</a></p>`}
+      ${ui.card('Login history', ui.table(['When', 'IP', 'Browser', 'OS', 'OK'], logins.map(l =>
+        [d(l.created_at), esc(l.ip), esc(l.browser), esc(l.os), l.success ? '✓' : '✗']))) + `<p class="mt"><a class="btn btn-sm" href="${R(req, '/login-history')}?q=${encodeURIComponent(u.email)}">View full login history →</a></p>`}
       ${ui.card('Activity timeline', ui.table(['When', 'Action', 'Detail'], acts.map(a =>
         [d(a.created_at), esc(a.action), `<span class="code">${esc(String(a.detail).slice(0, 100))}</span>`]))) + `<p class="mt"><a class="btn btn-sm" href="${R(req, '/audit')}?actor=${u.id}">View full audit trail for this user →</a></p>`}
     </div>
@@ -569,22 +954,33 @@ router.post('/users/:id', async (req, res) => {
   // agent_id BEFORE writing anything.
   const b = req.body || {};
   const name = String(b.name || '').trim();
-  const kyc = String(b.kyc_status || 'none');
+  /* SCAN fix (C-06): kyc_status from the request body is IGNORED — the
+     status changes only via the KYC queue / manual-verify attestation. */
+  const kyc = u.kyc_status;
   const agentRaw = String(b.agent_id || '').trim();
   if (!name) { await req.setFlash('error', 'Name is required. Nothing was saved.'); return res.redirect(R(req, '/users/' + u.id)); }
   if (!['none', 'pending', 'verified', 'rejected'].includes(kyc)) { await req.setFlash('error', 'Invalid KYC status. Nothing was saved.'); return res.redirect(R(req, '/users/' + u.id)); }
+  // BP-21/BP-22 per-user controls: validate BEFORE writing anything.
+  const kycOverride = String(b.kyc_override || 'default');
+  if (!['default', 'required', 'exempt'].includes(kycOverride)) { await req.setFlash('error', 'Invalid KYC requirement. Nothing was saved.'); return res.redirect(R(req, '/users/' + u.id)); }
+  const autoRaw = String(b.auto_withdrawal_limit || '').trim();
+  let autoLimit = null;
+  if (autoRaw !== '') {
+    if (!/^\d+(\.\d{1,2})?$/.test(autoRaw)) { await req.setFlash('error', 'Auto-withdrawal limit must be an amount like 25 or 25.50, or blank for the global limit. Nothing was saved.'); return res.redirect(R(req, '/users/' + u.id)); }
+    autoLimit = autoRaw;
+  }
   let agentId = null;
   if (agentRaw !== '') {
     agentId = parseInt(agentRaw, 10);
     const ag = await req.db.get("SELECT id FROM users WHERE id = ? AND role = 'agent'", [agentId]);
     if (!ag) { await req.setFlash('error', 'That agent does not exist. Nothing was saved.'); return res.redirect(R(req, '/users/' + u.id)); }
   }
-  await req.db.run('UPDATE users SET name = ?, phone = ?, address = ?, city = ?, state = ?, zip = ?, country = ?, kyc_status = ?, notes = ?, agent_id = ? WHERE id = ?',
+  await req.db.run('UPDATE users SET name = ?, phone = ?, address = ?, city = ?, state = ?, zip = ?, country = ?, kyc_status = ?, notes = ?, agent_id = ?, kyc_override = ?, auto_withdrawal_limit = ? WHERE id = ?',
     [name, String(b.phone || '').slice(0, 32),
      String(b.address || '').slice(0, 255), String(b.city || '').slice(0, 128),
      String(b.state || '').slice(0, 128), String(b.zip || '').slice(0, 32),
      String(b.country || '').slice(0, 64),
-     kyc, String(b.notes || '').slice(0, 2000), agentId, u.id]);
+     kyc, String(b.notes || '').slice(0, 2000), agentId, kycOverride, autoLimit, u.id]);
   // v14: admin email changes NEVER swap immediately — a verification link
   // goes to the NEW address; the swap happens only when it is clicked.
   let emailChangeMsg = '';
@@ -615,8 +1011,22 @@ router.post('/users/:id', async (req, res) => {
   // R-057: audit the email actually STORED (unchanged until the new
   // address verifies), not the requested one — the old detail logged the
   // requested address even when the change was refused.
-  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'user.update', entity: 'user', entityId: u.id, detail: { by: req.user.id, old: { name: u.name, email: u.email, phone: u.phone, kyc_status: u.kyc_status, agent_id: u.agent_id }, new: { name, email_stored: u.email, email_requested: req.body.email || u.email, email_change_refused: emailChangeRefused, email_change_pending: emailChangePending, phone: req.body.phone, kyc_status: kyc, agent_id: agentId } }, ip: req.ip });
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'user.update', entity: 'user', entityId: u.id, detail: { by: req.user.id, old: { name: u.name, email: u.email, phone: u.phone, kyc_status: u.kyc_status, agent_id: u.agent_id, kyc_override: u.kyc_override || 'default', auto_withdrawal_limit: u.auto_withdrawal_limit }, new: { name, email_stored: u.email, email_requested: req.body.email || u.email, email_change_refused: emailChangeRefused, email_change_pending: emailChangePending, phone: req.body.phone, kyc_status: kyc, agent_id: agentId, kyc_override: kycOverride, auto_withdrawal_limit: autoLimit } }, ip: req.ip });
   await req.setFlash('success', 'User updated.' + emailChangeMsg);
+  res.redirect(R(req, '/users/' + u.id));
+});
+
+/* BP-21: manual KYC verification — the admin attests the player was
+   verified off-platform. A note is REQUIRED and the attestation is
+   audit-logged; without a note nothing changes. */
+router.post('/users/:id/kyc-verify', async (req, res) => {
+  const u = await req.db.get('SELECT * FROM users WHERE id = ?', [req.params.id]);
+  if (!u || u.role === 'admin') return notFound(req, res, 'User not found.');
+  const note = String(req.body.note || '').trim().slice(0, 500);
+  if (!note) { await req.setFlash('error', 'A note is required for manual verification — record what was verified off-platform. Nothing changed.'); return res.redirect(R(req, '/users/' + u.id)); }
+  await req.db.run("UPDATE users SET kyc_status = 'verified', kyc_note = ? WHERE id = ?", [note, u.id]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'kyc.manual_verify', entity: 'user', entityId: u.id, detail: { note, previous_status: u.kyc_status }, ip: req.ip });
+  await req.setFlash('success', 'User marked KYC-verified (manual attestation recorded in the audit log).');
   res.redirect(R(req, '/users/' + u.id));
 });
 
@@ -915,16 +1325,43 @@ router.get('/deposits', async (req, res) => {
   const depStrip = depCurs.length
     ? `<div class="sumstrip">${depCurs.map(c => `<span><strong>${esc(c)}</strong> Successful: <strong>${money(req, depByCur[c].approved || 0, c)}</strong> · Pending: <strong>${money(req, depByCur[c].pending || 0, c)}</strong> · Rejected: <strong>${money(req, depByCur[c].rejected || 0, c)}</strong> · Revoked: <strong>${money(req, depByCur[c].revoked || 0, c)}</strong> · Expired: <strong>${money(req, depByCur[c].expired || 0, c)}</strong></span>`).join('')}</div>`
     : '<div class="sumstrip"><span>No deposits yet.</span></div>';
-  const where = status ? 'WHERE d.status = ?' : '', params = status ? [status] : [];
-  const total = (await req.db.get(`SELECT COUNT(*) AS c FROM deposits d ${where}`, params)).c;
+  // DS-066: the list only filtered by status - staff could not find one
+  // deposit by player, method or date. All filters compose with status.
+  const fQ = String(req.query.q || '').trim();
+  const fMethod = parseInt(req.query.method || '', 10) || 0;
+  const fFrom = /^\d{4}-\d{2}-\d{2}$/.test(req.query.from || '') ? req.query.from : '';
+  const fTo = /^\d{4}-\d{2}-\d{2}$/.test(req.query.to || '') ? req.query.to : '';
+  const dClauses = [], dParams = [];
+  if (status) { dClauses.push('d.status = ?'); dParams.push(status); }
+  if (fQ) { dClauses.push('(u.email LIKE ? OR d.public_id LIKE ?)'); dParams.push('%' + fQ + '%', '%' + fQ + '%'); }
+  if (fMethod) { dClauses.push('d.method_id = ?'); dParams.push(fMethod); }
+  if (fFrom) { dClauses.push('d.created_at >= ?'); dParams.push(Date.parse(fFrom + 'T00:00:00Z')); }
+  if (fTo) { dClauses.push('d.created_at < ?'); dParams.push(Date.parse(fTo + 'T00:00:00Z') + 86400000); }
+  const where = dClauses.length ? 'WHERE ' + dClauses.join(' AND ') : '', params = dParams;
+  const total = (await req.db.get(`SELECT COUNT(*) AS c FROM deposits d JOIN users u ON u.id = d.user_id ${where}`, params)).c;
   const rows = await req.db.query(
     `SELECT d.*, u.email, m.name AS method_name FROM deposits d JOIN users u ON u.id = d.user_id LEFT JOIN payment_methods m ON m.id = d.method_id
      ${where} ORDER BY d.created_at DESC LIMIT ? OFFSET ?`, [...params, PER, (page - 1) * PER]);
-  const body = depStrip + moneyTabs(req, R(req, '/deposits'), counts, status) + ui.table(['ID', 'Player', 'Method', 'Amount', 'Charge', 'Net', 'Status', 'When', ''],
+  const allMethods = await req.db.query('SELECT id, name FROM payment_methods ORDER BY name');
+  const qsParts = [];
+  if (status) qsParts.push('status=' + encodeURIComponent(status));
+  if (fQ) qsParts.push('q=' + encodeURIComponent(fQ));
+  if (fMethod) qsParts.push('method=' + fMethod);
+  if (fFrom) qsParts.push('from=' + fFrom);
+  if (fTo) qsParts.push('to=' + fTo);
+  const dFilterForm = `<form method="GET" action="${R(req, '/deposits')}" class="filter-form">
+    ${status ? `<input type="hidden" name="status" value="${esc(status)}">` : ''}
+    <input type="search" name="q" value="${esc(fQ)}" placeholder="Player email or deposit ID">
+    <select name="method"><option value="">All methods</option>${allMethods.map(m => `<option value="${m.id}"${fMethod === m.id ? ' selected' : ''}>${esc(m.name)}</option>`).join('')}</select>
+    <input type="date" name="from" value="${esc(fFrom)}"><input type="date" name="to" value="${esc(fTo)}">
+    <button class="btn btn-sm" type="submit">Filter</button>
+    ${(fQ || fMethod || fFrom || fTo) ? `<a class="btn btn-sm" href="${R(req, '/deposits')}${status ? '?status=' + esc(status) : ''}">Clear</a>` : ''}
+  </form>`;
+  const body = depStrip + moneyTabs(req, R(req, '/deposits'), counts, status) + dFilterForm + ui.table(['ID', 'Player', 'Method', 'Amount', 'Charge', 'Net', 'Status', 'When', ''],
     rows.map(x => [`<span class="code">${esc(x.public_id)}</span>`, esc(x.email), esc(x.method_name || '—'),
       money(req, x.amount, x.currency), money(req, x.charge, x.currency), money(req, x.net, x.currency),
       ui.statusBadge(x.status), d(x.created_at), `<a class="btn btn-sm" href="${R(req, '/deposits/' + x.id)}">Review</a>`])) +
-    ui.paginate(R(req, '/deposits') + (status ? '?status=' + status : ''), page, PER, total);
+    ui.paginate(R(req, '/deposits') + (qsParts.length ? '?' + qsParts.join('&') : ''), page, PER, total);
   res.send(shell(req, '/deposits', 'Deposits', body));
 });
 
@@ -938,10 +1375,10 @@ router.get('/deposits/:id', async (req, res) => {
   const actions = pendAppr
     ? `<span class="badge b-warn">Awaiting second approval — decide in Approvals</span>`
     : x.status === 'pending'
-    ? `<form method="POST" action="${R(req, '/deposits/' + x.id + '/approve')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-p" data-confirm="Approve and credit this deposit?">Approve & credit</button></form>
-       <form method="POST" action="${R(req, '/deposits/' + x.id + '/reject')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-d" data-confirm="Reject this deposit?">Reject</button></form>`
+    ? `<form method="POST" action="${R(req, '/deposits/' + x.id + '/approve')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-p">Approve & credit</button></form>
+       <form method="POST" action="${R(req, '/deposits/' + x.id + '/reject')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-d">Reject</button></form>`
     : x.status === 'approved'
-    ? `<form method="POST" action="${R(req, '/deposits/' + x.id + '/revoke')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-d" data-confirm="Revoke? The credited amount will be debited.">Revoke</button></form>`
+    ? `<form method="POST" action="${R(req, '/deposits/' + x.id + '/revoke')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-d">Revoke</button></form>`
     : `<span class="muted">No actions available for ${esc(x.status)} deposits.</span>`;
   const body = ui.card('Deposit ' + x.public_id, `
     <div class="grid2"><div>
@@ -998,7 +1435,7 @@ async function decideDep(req, res, decision) {
       await req.setFlash('success', 'This action exceeds the maker-checker threshold and is queued for a second approver (see Approvals).' + (mc.conflictId ? ` Note: approval #${mc.conflictId} for this deposit is already open — decide each in Approvals.` : mc.duplicate ? ' (This decision was already queued.)' : ''));
       return res.redirect(R(req, '/deposits/' + req.params.id));
     }
-    const dep = await decideDeposit(req.db, parseInt(req.params.id, 10), decision, req.user.id);
+    const dep = await decideDeposit(req.db, parseInt(req.params.id, 10), decision, req.user.id, req.settings);
     await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'deposit.' + decision, entity: 'deposit', entityId: dep.public_id, detail: { amount: dep.net, old_status: dep.status, new_status: decision }, ip: req.ip });
     const u = await req.db.get('SELECT email, name FROM users WHERE id = ?', [dep.user_id]);
     if (decision === 'approve') {
@@ -1038,16 +1475,41 @@ router.get('/withdrawals', async (req, res) => {
   const wdStrip = wdCurs.length
     ? `<div class="sumstrip">${wdCurs.map(c => `<span><strong>${esc(c)}</strong> Approved: <strong>${money(req, wdByCur[c].approved || 0, c)}</strong> · Pending: <strong>${money(req, wdByCur[c].pending || 0, c)}</strong> · Rejected: <strong>${money(req, wdByCur[c].rejected || 0, c)}</strong> · Revoked: <strong>${money(req, wdByCur[c].revoked || 0, c)}</strong> · Paid: <strong>${money(req, wdByCur[c].paid || 0, c)}</strong></span>`).join('')}</div>`
     : '<div class="sumstrip"><span>No withdrawals yet.</span></div>';
-  const where = status ? 'WHERE w.status = ?' : '', params = status ? [status] : [];
-  const total = (await req.db.get(`SELECT COUNT(*) AS c FROM withdrawals w ${where}`, params)).c;
+  const fQ = String(req.query.q || '').trim();
+  const fMethod = parseInt(req.query.method || '', 10) || 0;
+  const fFrom = /^\d{4}-\d{2}-\d{2}$/.test(req.query.from || '') ? req.query.from : '';
+  const fTo = /^\d{4}-\d{2}-\d{2}$/.test(req.query.to || '') ? req.query.to : '';
+  const wClauses = [], wParams = [];
+  if (status) { wClauses.push('w.status = ?'); wParams.push(status); }
+  if (fQ) { wClauses.push('(u.email LIKE ? OR w.public_id LIKE ?)'); wParams.push('%' + fQ + '%', '%' + fQ + '%'); }
+  if (fMethod) { wClauses.push('w.method_id = ?'); wParams.push(fMethod); }
+  if (fFrom) { wClauses.push('w.created_at >= ?'); wParams.push(Date.parse(fFrom + 'T00:00:00Z')); }
+  if (fTo) { wClauses.push('w.created_at < ?'); wParams.push(Date.parse(fTo + 'T00:00:00Z') + 86400000); }
+  const where = wClauses.length ? 'WHERE ' + wClauses.join(' AND ') : '', params = wParams;
+  const total = (await req.db.get(`SELECT COUNT(*) AS c FROM withdrawals w JOIN users u ON u.id = w.user_id ${where}`, params)).c;
   const rows = await req.db.query(
     `SELECT w.*, u.email, m.name AS method_name FROM withdrawals w JOIN users u ON u.id = w.user_id LEFT JOIN payment_methods m ON m.id = w.method_id
      ${where} ORDER BY w.created_at DESC LIMIT ? OFFSET ?`, [...params, PER, (page - 1) * PER]);
-  const body = wdStrip + moneyTabs(req, R(req, '/withdrawals'), counts, status, [['paid', 'Paid']]) + ui.table(['ID', 'Player', 'Method', 'Amount', 'Charge', 'Net payout', 'Status', 'When', ''],
+  const allMethodsW = await req.db.query('SELECT id, name FROM payment_methods ORDER BY name');
+  const qsPartsW = [];
+  if (status) qsPartsW.push('status=' + encodeURIComponent(status));
+  if (fQ) qsPartsW.push('q=' + encodeURIComponent(fQ));
+  if (fMethod) qsPartsW.push('method=' + fMethod);
+  if (fFrom) qsPartsW.push('from=' + fFrom);
+  if (fTo) qsPartsW.push('to=' + fTo);
+  const wFilterForm = `<form method="GET" action="${R(req, '/withdrawals')}" class="filter-form">
+    ${status ? `<input type="hidden" name="status" value="${esc(status)}">` : ''}
+    <input type="search" name="q" value="${esc(fQ)}" placeholder="Player email or withdrawal ID">
+    <select name="method"><option value="">All methods</option>${allMethodsW.map(m => `<option value="${m.id}"${fMethod === m.id ? ' selected' : ''}>${esc(m.name)}</option>`).join('')}</select>
+    <input type="date" name="from" value="${esc(fFrom)}"><input type="date" name="to" value="${esc(fTo)}">
+    <button class="btn btn-sm" type="submit">Filter</button>
+    ${(fQ || fMethod || fFrom || fTo) ? `<a class="btn btn-sm" href="${R(req, '/withdrawals')}${status ? '?status=' + esc(status) : ''}">Clear</a>` : ''}
+  </form>`;
+  const body = wdStrip + moneyTabs(req, R(req, '/withdrawals'), counts, status, [['paid', 'Paid']]) + wFilterForm + ui.table(['ID', 'Player', 'Method', 'Amount', 'Charge', 'Net payout', 'Status', 'When', ''],
     rows.map(x => [`<span class="code">${esc(x.public_id)}</span>`, esc(x.email), esc(x.method_name || '—'),
       money(req, x.amount, x.currency), money(req, x.charge, x.currency), money(req, x.net, x.currency),
       ui.statusBadge(x.status), d(x.created_at), `<a class="btn btn-sm" href="${R(req, '/withdrawals/' + x.id)}">Review</a>`])) +
-    ui.paginate(R(req, '/withdrawals') + (status ? '?status=' + status : ''), page, PER, total);
+    ui.paginate(R(req, '/withdrawals') + (qsPartsW.length ? '?' + qsPartsW.join('&') : ''), page, PER, total);
   res.send(shell(req, '/withdrawals', 'Withdrawals', body));
 });
 
@@ -1060,11 +1522,11 @@ router.get('/withdrawals/:id', async (req, res) => {
   const actions = pendAppr
     ? `<span class="badge b-warn">Awaiting second approval — decide in Approvals</span>`
     : x.status === 'pending'
-    ? `<form method="POST" action="${R(req, '/withdrawals/' + x.id + '/approve')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-p" data-confirm="Approve? Pay ${esc(money(req, x.net, x.currency))} to the player.">Approve & pay</button></form>
-       <form method="POST" action="${R(req, '/withdrawals/' + x.id + '/reject')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-d" data-confirm="Reject and release the held amount?">Reject & release</button></form>`
+    ? `<form method="POST" action="${R(req, '/withdrawals/' + x.id + '/approve')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-p">Approve</button></form>
+       <form method="POST" action="${R(req, '/withdrawals/' + x.id + '/reject')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-d">Reject & release</button></form>`
     : x.status === 'approved'
-    ? `<form method="POST" action="${R(req, '/withdrawals/' + x.id + '/mark-paid')}" class="adm-form" style="display:inline-flex;gap:8px;align-items:end;"><input type="hidden" name="_csrf" value="${req.csrfToken}"><div class="field"><label>Provider payout ID (required)</label><input type="text" name="provider_payout_id" required maxlength="255" placeholder="e.g. PSP payout reference"></div><button class="btn btn-p" data-confirm="Mark this withdrawal as PAID? This is final — no revoke after payment.">Mark as paid</button></form>
-       <form method="POST" action="${R(req, '/withdrawals/' + x.id + '/revoke')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-d" data-confirm="Revoke? The payout will be credited back.">Revoke</button></form>`
+    ? `<form method="POST" action="${R(req, '/withdrawals/' + x.id + '/mark-paid')}" class="adm-form" style="display:inline-flex;gap:8px;align-items:end;"><input type="hidden" name="_csrf" value="${req.csrfToken}"><div class="field"><label>Provider payout ID (required)</label><input type="text" name="provider_payout_id" required maxlength="255" placeholder="e.g. PSP payout reference"></div><button class="btn btn-p">Mark as paid</button></form>
+       <form method="POST" action="${R(req, '/withdrawals/' + x.id + '/revoke')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-d">Revoke</button></form>`
     : `<span class="muted">No actions available.</span>`;
   const body = ui.card('Withdrawal ' + x.public_id, `
     <div class="grid2"><div>
@@ -1238,7 +1700,7 @@ router.get('/methods/:id', async (req, res) => {
   if (!m) return notFound(req, res, 'Method not found.');
   res.send(shell(req, '/methods', 'Edit — ' + m.name,
     ui.card('Method', ui.formHtml(R(req, '/methods/' + m.id), METHOD_FIELDS(m), { csrf: req.csrfToken, submit: 'Save' })) +
-    `<form method="POST" action="${R(req, '/methods/' + m.id + '/delete')}" class="mt"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-d" data-confirm="Delete this method?">Delete method</button></form>`));
+    `<form method="POST" action="${R(req, '/methods/' + m.id + '/delete')}" class="mt"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-d">Delete method</button></form>`));
 });
 router.post('/methods/:id', async (req, res) => {
   if (isBlockedRail(req.body.rail, getS(req.settings, 'blocked_rails', ''))) { await req.setFlash('error', 'This rail is blocked by policy.'); return res.redirect(R(req, '/methods/' + req.params.id)); }
@@ -1283,6 +1745,10 @@ router.post('/methods/:id/delete', async (req, res) => {
   res.redirect(R(req, '/methods'));
 });
 router.get('/methods/:id/credentials', async (req, res) => {
+  // DS-011: decrypted gateway credentials are super-admin only. RBAC lets
+  // every staff role read GET pages, so this route gates itself.
+  const { normalizeRole } = require('../lib/rbac');
+  if (normalizeRole(req.user) !== 'super') return res.status(403).render('error', { status: 403, message: 'Only the super admin can view gateway credentials.' });
   const m = await req.db.get('SELECT * FROM payment_methods WHERE id = ?', [req.params.id]);
   if (!m) return notFound(req, res, 'Method not found.');
   const rail = getRail(m.rail);
@@ -1295,7 +1761,7 @@ router.get('/methods/:id/credentials', async (req, res) => {
   }
   const fields = (rail ? rail.credentialFields : []).map(f => ({ ...f, value: saved[f.key] || '' }));
   const body = ui.card(`Gateway credentials — ${m.name} (${rail ? rail.name : m.rail})`,
-    `<p class="muted">Credentials are stored server-side and never shown to players. ${rail && rail.webhook ? 'This rail supports provider webhooks with signature verification.' : 'This rail runs in manual mode: players submit proof, staff approves.'} ${keyConfigured() ? 'Credentials are encrypted at rest (AES-256-GCM).' : 'No encryption key is configured — credentials are stored in plaintext. Set CREDENTIAL_ENCRYPTION_KEY and re-save to encrypt.'}</p>` +
+    `<p class="muted">Credentials are stored server-side. Receiving details (wallet address, UPI ID, bank account, QR code) ARE shown to players on the deposit page so they can pay; secret keys are never shown to players. ${rail && rail.webhook ? 'This rail supports provider webhooks with signature verification.' : 'This rail runs in manual mode: players submit proof, staff approves.'} ${keyConfigured() ? 'Credentials are encrypted at rest (AES-256-GCM).' : 'No encryption key is configured — credentials are stored in plaintext. Set CREDENTIAL_ENCRYPTION_KEY and re-save to encrypt.'}</p>` +
     (fields.length ? ui.formHtml(R(req, '/methods/' + m.id + '/credentials'), fields.map(f =>
       f.type === 'select' ? { key: f.key, label: f.label, type: 'select', options: f.options, value: saved[f.key] || '' }
       : f.type === 'textarea' ? { key: f.key, label: f.label, type: 'textarea', value: saved[f.key] || '' }
@@ -1329,7 +1795,10 @@ router.post('/methods/:id/credentials', async (req, res) => {
     else await req.db.run('INSERT INTO gateway_credentials (method_id, field_key, field_value, field_enc, updated_at) VALUES (?, ?, ?, ?, ?)', [m.id, f.key, stored, enc ? 1 : 0, now()]);
   }
   await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'method.credentials', entity: 'method', entityId: m.id, detail: { encrypted: keyConfigured() }, ip: req.ip });
-  await req.setFlash('success', 'Credentials saved.' + (keyConfigured() ? ' Encrypted at rest.' : ' WARNING: stored unencrypted — set CREDENTIAL_ENCRYPTION_KEY and re-save to encrypt.'));
+  /* SCAN fix (C-16): the encryption key is guaranteed configured here
+     (the handler refuses earlier without it), so the confirmation is
+     stated plainly — the old conditional warning branch was dead. */
+  await req.setFlash('success', 'Credentials saved. Encrypted at rest.');
   res.redirect(R(req, '/methods/' + m.id + '/credentials'));
 });
 
@@ -1361,7 +1830,7 @@ router.get('/reports', async (req, res) => {
     const dayExpr = req.driver === 'mysql' ? 'FLOOR(created_at / 86400000)' : req.driver === 'postgres' ? '(created_at / 86400000)' : 'CAST(created_at / 86400000 AS INTEGER)';
     const dayExprDecided = req.driver === 'mysql' ? 'FLOOR(decided_at / 86400000)' : req.driver === 'postgres' ? '(decided_at / 86400000)' : 'CAST(decided_at / 86400000 AS INTEGER)';
     const salesByDay = await req.db.query(`SELECT ${dayExpr} AS day, COUNT(*) AS c, COALESCE(SUM(total),0) AS s FROM tickets WHERE created_at BETWEEN ? AND ? AND currency = ? GROUP BY day`, [from, to, baseCur]);
-    const winsByDay = await req.db.query(`SELECT ${dayExpr} AS day, COALESCE(SUM(amount),0) AS s FROM transactions WHERE type='win' AND created_at BETWEEN ? AND ? AND currency = ? GROUP BY day`, [from, to, baseCur]);
+    const winsByDay = await req.db.query(`SELECT ${dayExpr} AS day, COALESCE(SUM(amount),0) AS s FROM transactions WHERE type IN ('win','scratch_prize') AND created_at BETWEEN ? AND ? AND currency = ? GROUP BY day`, [from, to, baseCur]);
     const depsByDay = await req.db.query(`SELECT ${dayExprDecided} AS day, COALESCE(SUM(net),0) AS s FROM deposits WHERE status='approved' AND decided_at BETWEEN ? AND ? AND currency = ? GROUP BY day`, [from, to, baseCur]);
     const wdsByDay = await req.db.query(`SELECT ${dayExprDecided} AS day, COALESCE(SUM(net),0) AS s FROM withdrawals WHERE status='approved' AND decided_at BETWEEN ? AND ? AND currency = ? GROUP BY day`, [from, to, baseCur]);
     const usersByDay = await req.db.query(`SELECT ${dayExpr} AS day, COUNT(*) AS c FROM users WHERE role='player' AND created_at BETWEEN ? AND ? GROUP BY day`, [from, to]);
@@ -1388,11 +1857,14 @@ router.get('/reports', async (req, res) => {
     const rows = await req.db.query('SELECT * FROM login_history WHERE created_at BETWEEN ? AND ?' + (qLike ? ' AND LOWER(email) LIKE LOWER(?)' : '') + ' ORDER BY created_at DESC LIMIT ? OFFSET ?', qLike ? [from, to, qLike, PER, (page - 1) * PER] : [from, to, PER, (page - 1) * PER]);
     const grpQ = async (key) => req.db.query(`SELECT ${key} AS k, COUNT(*) AS c FROM login_history WHERE created_at BETWEEN ? AND ? GROUP BY ${key} ORDER BY c DESC`, [from, to]);
     const grp = (rowsG) => rowsG.map(r => [r.k || '—', r.c]);
-    const browsers = await grpQ('browser'), oss = await grpQ('os'), countries = await grpQ('country');
-    body += `<div class="grid2"><div>${ui.card('By country', ui.table(['Country', 'Logins'], grp(countries)))}</div>
-      <div>${ui.card('By browser', ui.table(['Browser', 'Logins'], grp(browsers)))}${ui.card('By OS', ui.table(['OS', 'Logins'], grp(oss)))}</div></div>` +
-      ui.card('Login attempts', ui.table(['When', 'Email', 'IP', 'Country', 'Browser', 'OS', 'Success'], rows.map(l =>
-        [d(l.created_at), esc(l.email), esc(l.ip), esc(l.country || '—'), esc(l.browser), esc(l.os), l.success ? '✓' : '✗']))) +
+    const browsers = await grpQ('browser'), oss = await grpQ('os');
+    /* SCAN fix (C-11): no 'By country' card — login country is never
+       recorded (no geo-IP service), so the card could only ever show a
+       single '—' row. The Dashboard already states this honestly. */
+    body += `<div class="grid2"><div>${ui.card('By browser', ui.table(['Browser', 'Logins'], grp(browsers)))}</div>
+      <div>${ui.card('By OS', ui.table(['OS', 'Logins'], grp(oss)))}</div></div>` +
+      ui.card('Login attempts', ui.table(['When', 'Email', 'IP', 'Browser', 'OS', 'Success'], rows.map(l =>
+        [d(l.created_at), esc(l.email), esc(l.ip), esc(l.browser), esc(l.os), l.success ? '✓' : '✗']))) +
       ui.paginate(repBase, page, PER, total);
   } else if (type === 'ticket') {
     const total = (await req.db.get(`SELECT COUNT(*) AS c FROM tickets t JOIN users u ON u.id=t.user_id WHERE t.created_at BETWEEN ? AND ?` + (qLike ? ' AND LOWER(u.email) LIKE LOWER(?)' : ''), qLike ? [from, to, qLike] : [from, to])).c;
@@ -1460,14 +1932,159 @@ router.get('/support', async (req, res) => {
     ui.paginate(supBase(status, prio), page, PER, total);
   res.send(shell(req, '/support', 'Support Tickets', body));
 });
+/* BP-21 (v19): KYC review queue. Player-uploaded identity documents live
+   in a private store (lib/upload) and are served ONLY through the
+   protected document route below; every view/decision is audit-logged.
+   The module ships dormant — see Settings → KYC (kyc_enabled, kyc_gate)
+   and the per-user override on each user page. */
+const KYC_DOC_LABELS = { national_id: 'National ID card', passport: 'Passport', driving_licence: 'Driving licence' };
+router.get('/kyc', async (req, res) => {
+  const pending = await req.db.query(`SELECT kd.*, u.name AS uname, u.email AS uemail FROM kyc_documents kd JOIN users u ON u.id = kd.user_id WHERE kd.status = 'pending' ORDER BY kd.created_at ASC LIMIT 100`);
+  const decided = await req.db.query(`SELECT kd.*, u.name AS uname, u.email AS uemail FROM kyc_documents kd JOIN users u ON u.id = kd.user_id WHERE kd.status != 'pending' ORDER BY kd.reviewed_at DESC LIMIT 30`);
+  const rowP = (doc) => ['#' + doc.id, `<a href="${R(req, '/users/' + doc.user_id)}">${esc(doc.uname)}</a><br><span class="muted">${esc(doc.uemail)}</span>`, esc(KYC_DOC_LABELS[doc.doc_type] || doc.doc_type), esc(doc.original_name), (doc.size_bytes / 1024).toFixed(1) + ' KB', d(doc.created_at), `<a class="btn btn-sm btn-p" href="${R(req, '/kyc/' + doc.id)}">Review</a>`];
+  const body = `
+  ${ui.card('KYC — pending review (' + pending.length + ')', pending.length ? ui.table(['#', 'Player', 'Document', 'File', 'Size', 'Submitted', ''], pending.map(rowP)) : '<p class="muted">No documents waiting for review.</p>')}
+  ${ui.card('Recently decided', decided.length ? ui.table(['#', 'Player', 'Document', 'Status', 'Reviewed', ''], decided.map(doc => ['#' + doc.id, esc(doc.uname), esc(KYC_DOC_LABELS[doc.doc_type] || doc.doc_type), ui.statusBadge(doc.status === 'approved' ? 'verified' : doc.status), d(doc.reviewed_at), `<a class="btn btn-sm" href="${R(req, '/kyc/' + doc.id)}">Open</a>`])) : '<p class="muted">Nothing decided yet.</p>')}
+  <p class="muted">KYC is a switchable module (Settings → KYC). It ships OFF; per-user requirements live on each user page (KYC requirement: default / required / exempt).</p>`;
+  res.send(shell(req, '/kyc', 'KYC Review', body));
+});
+router.get('/kyc/document/:id', async (req, res) => {
+  const doc = await req.db.get('SELECT * FROM kyc_documents WHERE id = ?', [req.params.id]);
+  if (!doc) return notFound(req, res, 'Document not found.');
+  const data = uploadLib.readStored(doc.stored_name);
+  if (!data) return notFound(req, res, 'Document file not found.');
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'kyc.document_view', entity: 'kyc_document', entityId: doc.id, detail: { user_id: doc.user_id }, ip: req.ip });
+  res.set('Content-Type', doc.content_type || 'application/octet-stream');
+  res.set('Content-Disposition', 'inline; filename="kyc-document"');
+  res.set('Cache-Control', 'private, no-store');
+  res.send(data);
+});
+router.get('/kyc/:id', async (req, res) => {
+  const doc = await req.db.get('SELECT kd.*, u.name AS uname, u.email AS uemail, u.kyc_status AS user_kyc_status, u.kyc_override AS user_kyc_override FROM kyc_documents kd JOIN users u ON u.id = kd.user_id WHERE kd.id = ?', [req.params.id]);
+  if (!doc) return notFound(req, res, 'KYC submission not found.');
+  const isImg = doc.content_type === 'image/jpeg' || doc.content_type === 'image/png';
+  const body = `
+  <div class="grid2">
+    <div>${ui.card('Submission #' + doc.id, ui.table(['Field', 'Value'], [
+        ['Player', `<a href="${R(req, '/users/' + doc.user_id)}">${esc(doc.uname)}</a> — ${esc(doc.uemail)}`],
+        ['Document type', esc(KYC_DOC_LABELS[doc.doc_type] || doc.doc_type)],
+        ['File', esc(doc.original_name) + ' (' + (doc.size_bytes / 1024).toFixed(1) + ' KB)'],
+        ['Submitted', d(doc.created_at)],
+        ['Submission status', ui.statusBadge(doc.status === 'approved' ? 'verified' : doc.status)],
+        ['Player KYC status', ui.statusBadge(doc.user_kyc_status)],
+        ['Player override', esc(doc.user_kyc_override || 'default')],
+        ...(doc.reviewed_at ? [['Reviewed', d(doc.reviewed_at) + (doc.review_note ? ' — reason: ' + esc(doc.review_note) : '')]] : []),
+      ]))}
+      ${doc.status === 'pending' ? ui.card('Decide', `
+        <form method="POST" action="${R(req, '/kyc/' + doc.id + '/approve')}" class="adm-form">
+          <input type="hidden" name="_csrf" value="${req.csrfToken}">
+          <button class="btn btn-p" type="submit">Approve document</button>
+        </form>
+        <form method="POST" action="${R(req, '/kyc/' + doc.id + '/reject')}" class="adm-form mt">
+          <input type="hidden" name="_csrf" value="${req.csrfToken}">
+          <div class="field"><label for="kycRejectReason">Rejection reason (required — the player sees this)</label><textarea id="kycRejectReason" name="reason" required maxlength="500" placeholder="e.g. Photo is blurry — please retake it in good light"></textarea></div>
+          <button class="btn btn-d" type="submit">Reject document</button>
+        </form>`) : '<p class="muted">This submission has already been decided.</p>'}
+    </div>
+    <div>${ui.card('Document', isImg ? `<img src="${R(req, '/kyc/document/' + doc.id)}" alt="KYC document" style="max-width:100%;border-radius:8px">` : `<p><a class="btn btn-p" href="${R(req, '/kyc/document/' + doc.id)}" target="_blank" rel="noopener">Open document (PDF)</a></p>`)}</div>
+  </div>`;
+  res.send(shell(req, '/kyc', 'KYC submission #' + doc.id, body));
+});
+router.post('/kyc/:id/approve', async (req, res) => {
+  const doc = await req.db.get('SELECT * FROM kyc_documents WHERE id = ?', [req.params.id]);
+  if (!doc) return notFound(req, res, 'KYC submission not found.');
+  if (doc.status !== 'pending') { await req.setFlash('error', 'This submission was already decided.'); return res.redirect(R(req, '/kyc/' + doc.id)); }
+  /* SCAN fix (B-02): guarded transition — the UPDATE itself carries the
+     pending precondition and the changes count decides who won, so two
+     staff deciding concurrently cannot both "succeed". */
+  const upd = await req.db.run("UPDATE kyc_documents SET status = 'approved', reviewed_by = ?, reviewed_at = ?, review_note = '' WHERE id = ? AND status = 'pending'", [req.user.id, now(), doc.id]);
+  if (!upd.changes) { await req.setFlash('error', 'This submission was already decided.'); return res.redirect(R(req, '/kyc/' + doc.id)); }
+  await req.db.run("UPDATE users SET kyc_status = 'verified', kyc_note = '' WHERE id = ?", [doc.user_id]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'kyc.approve', entity: 'kyc_document', entityId: doc.id, detail: { user_id: doc.user_id, doc_type: doc.doc_type }, ip: req.ip });
+  await req.setFlash('success', 'Document approved — the player is now KYC-verified.');
+  res.redirect(R(req, '/kyc'));
+});
+router.post('/kyc/:id/reject', async (req, res) => {
+  const doc = await req.db.get('SELECT * FROM kyc_documents WHERE id = ?', [req.params.id]);
+  if (!doc) return notFound(req, res, 'KYC submission not found.');
+  if (doc.status !== 'pending') { await req.setFlash('error', 'This submission was already decided.'); return res.redirect(R(req, '/kyc/' + doc.id)); }
+  const reason = String(req.body.reason || '').trim().slice(0, 500);
+  if (!reason) { await req.setFlash('error', 'A rejection reason is required — the player sees it and resubmits. Nothing changed.'); return res.redirect(R(req, '/kyc/' + doc.id)); }
+  const upd = await req.db.run("UPDATE kyc_documents SET status = 'rejected', reviewed_by = ?, reviewed_at = ?, review_note = ? WHERE id = ? AND status = 'pending'", [req.user.id, now(), reason, doc.id]);
+  if (!upd.changes) { await req.setFlash('error', 'This submission was already decided.'); return res.redirect(R(req, '/kyc/' + doc.id)); }
+  /* A rejection must not strip a verification the player already earned
+     from another approved document (decisions are per-document; status
+     is per-user) — only an unverified user drops to 'rejected'. */
+  await req.db.run("UPDATE users SET kyc_status = 'rejected', kyc_note = ? WHERE id = ? AND kyc_status != 'verified'", [reason, doc.user_id]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'kyc.reject', entity: 'kyc_document', entityId: doc.id, detail: { user_id: doc.user_id, doc_type: doc.doc_type, reason }, ip: req.ip });
+  await req.setFlash('success', 'Document rejected with reason — the player can see it and resubmit.');
+  res.redirect(R(req, '/kyc'));
+});
+
+/* BP-15 (v19): canned replies for support staff. Stored like notification
+   templates (one table, admin CRUD) and inserted into the reply box by a
+   picker (public/app.js, data-canned-picker) — the picker only fills the
+   textarea; a human still presses Send. Routes live under /support/* so
+   the existing staff RBAC rule (POST /support/.+ -> super+support) covers
+   the actions. Registered BEFORE /support/:publicId on purpose. */
+async function listCanned(db) {
+  return db.query('SELECT * FROM canned_replies ORDER BY title, id');
+}
+router.get('/support/canned-replies', async (req, res) => {
+  const rows = await listCanned(req.db);
+  const createForm = ui.card('New canned reply', ui.formHtml(R(req, '/support/canned-replies'), [
+    { key: 'title', label: 'Title', required: true, hint: 'e.g. Deposit under review' },
+    { key: 'body', label: 'Reply text', type: 'textarea', required: true },
+  ], { csrf: req.csrfToken, submit: 'Create canned reply', grid: false }));
+  const list = rows.length ? rows.map(c => ui.card(esc(c.title), `
+    <p class="muted sm">Last updated ${d(c.updated_at)}</p>
+    ${ui.formHtml(R(req, '/support/canned-replies/' + c.id), [
+      { key: 'title', label: 'Title', required: true },
+      { key: 'body', label: 'Reply text', type: 'textarea', required: true },
+    ], { values: c, csrf: req.csrfToken, submit: 'Save changes', grid: false })}
+    <form method="POST" action="${R(req, '/support/canned-replies/' + c.id + '/delete')}" style="margin-top:8px">
+      <input type="hidden" name="_csrf" value="${req.csrfToken}">
+      <button class="btn btn-sm btn-d" type="submit">Delete</button>
+    </form>`)).join('') : ui.card('Canned replies', '<p class="muted">No canned replies yet. Create the first one above — it will appear in the reply picker on every support ticket.</p>');
+  res.send(shell(req, '/support/canned-replies', 'Canned Replies', createForm + list));
+});
+router.post('/support/canned-replies', async (req, res) => {
+  const title = String(req.body.title || '').trim().slice(0, 120);
+  const text = String(req.body.body || '').trim().slice(0, 5000);
+  if (!title || !text) { await req.setFlash('error', 'Title and reply text are required.'); return res.redirect(R(req, '/support/canned-replies')); }
+  const t = now();
+  const r = await req.db.run('INSERT INTO canned_replies (title, body, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?)', [title, text, req.user.id, t, t]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'support.canned_create', entity: 'canned_reply', entityId: r.id, detail: { title }, ip: req.ip });
+  await req.setFlash('success', 'Canned reply created.');
+  res.redirect(R(req, '/support/canned-replies'));
+});
+router.post('/support/canned-replies/:id', async (req, res) => {
+  const title = String(req.body.title || '').trim().slice(0, 120);
+  const text = String(req.body.body || '').trim().slice(0, 5000);
+  if (!title || !text) { await req.setFlash('error', 'Title and reply text are required.'); return res.redirect(R(req, '/support/canned-replies')); }
+  const r = await req.db.run('UPDATE canned_replies SET title = ?, body = ?, updated_at = ? WHERE id = ?', [title, text, now(), req.params.id]);
+  if (r.changes !== 1) { await req.setFlash('error', 'Canned reply not found.'); return res.redirect(R(req, '/support/canned-replies')); }
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'support.canned_update', entity: 'canned_reply', entityId: req.params.id, detail: { title }, ip: req.ip });
+  await req.setFlash('success', 'Canned reply saved.');
+  res.redirect(R(req, '/support/canned-replies'));
+});
+router.post('/support/canned-replies/:id/delete', async (req, res) => {
+  const r = await req.db.run('DELETE FROM canned_replies WHERE id = ?', [req.params.id]);
+  if (r.changes !== 1) { await req.setFlash('error', 'Canned reply not found.'); return res.redirect(R(req, '/support/canned-replies')); }
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'support.canned_delete', entity: 'canned_reply', entityId: req.params.id, detail: {}, ip: req.ip });
+  await req.setFlash('success', 'Canned reply deleted.');
+  res.redirect(R(req, '/support/canned-replies'));
+});
 router.get('/support/:publicId', async (req, res) => {
   const t = await req.db.get('SELECT s.*, u.email FROM support_tickets s JOIN users u ON u.id=s.user_id WHERE s.public_id = ?', [req.params.publicId]);
   if (!t) return notFound(req, res, 'Ticket not found.');
   const msgs = await req.db.query('SELECT * FROM support_messages WHERE ticket_id = ? ORDER BY created_at', [t.id]);
+  const canned = t.status !== 'closed' ? await listCanned(req.db) : [];
+  const picker = canned.length ? `<div class="field"><label>Insert a canned reply</label><select data-canned-picker data-source="cannedData"><option value="">Choose a canned reply…</option>${canned.map(c => `<option value="${c.id}">${esc(c.title)}</option>`).join('')}</select></div><script type="application/json" id="cannedData">${JSON.stringify(canned.map(c => ({ id: c.id, body: c.body }))).replace(/</g, '\\u003c')}</script>` : '';
   const body = ui.card('Ticket ' + t.public_id + ' — ' + t.subject, `
     <p class="muted">From: ${esc(t.email)} · Status: ${ui.statusBadge(t.status)}</p>
     <div class="msgs">${msgs.map(m => `<div class="msg${m.author_role !== 'player' ? ' staff' : ''}"><div class="msg-h">${esc(m.author_role)} · ${d(m.created_at)}</div><div>${esc(m.body)}</div></div>`).join('')}</div>
-    ${t.status !== 'closed' ? ui.formHtml(R(req, '/support/' + t.public_id + '/reply'), [{ key: 'message', label: 'Reply', type: 'textarea' }], { csrf: req.csrfToken, submit: 'Send reply', grid: false }) : '<p class="muted">Ticket closed.</p>'}
+    ${t.status !== 'closed' ? ui.formHtml(R(req, '/support/' + t.public_id + '/reply'), [{ key: 'message', label: 'Reply', type: 'textarea' }], { csrf: req.csrfToken, submit: 'Send reply', grid: false, extra: picker }) : '<p class="muted">Ticket closed.</p>'}
     <div class="btn-row mt">
       ${t.status !== 'closed' ? `<form method="POST" action="${R(req, '/support/' + t.public_id + '/close')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm">Close ticket</button></form>` : `<form method="POST" action="${R(req, '/support/' + t.public_id + '/reopen')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm">Reopen</button></form>`}
     </div>`);
@@ -1479,10 +2096,14 @@ router.post('/support/:publicId/reply', async (req, res) => {
   if (t.status === 'closed') { await req.setFlash('error', 'Ticket is closed. Reopen it before replying.'); return res.redirect(R(req, '/support/' + t.public_id)); }
   const body = String(req.body.message || '').trim().slice(0, 5000);
   if (!body) return res.redirect(R(req, '/support/' + t.public_id));
-  await req.db.run('INSERT INTO support_messages (ticket_id, author_id, author_role, body, created_at) VALUES (?, ?, ?, ?, ?)', [t.id, req.user.id, 'admin', body, now()]);
+  const { normalizeRole: nrS } = require('../lib/rbac');
+  const staffRole = nrS(req.user) === 'super' ? 'admin' : nrS(req.user);
+  await req.db.run('INSERT INTO support_messages (ticket_id, author_id, author_role, body, created_at) VALUES (?, ?, ?, ?, ?)', [t.id, req.user.id, staffRole, body, now()]);
   await req.db.run("UPDATE support_tickets SET status='answered', updated_at=? WHERE id=?", [now(), t.id]);
   const u = await req.db.get('SELECT email, name FROM users WHERE id = ?', [t.user_id]);
-  notify.send(req.db, req.settings, 'email', 'support_reply', u.email, { name: u.name, subject: t.subject }).catch(() => {});
+  // BP-13: support-reply email respects the player's preference.
+  if (await notify.emailPrefEnabled(req.db, t.user_id, 'support_reply'))
+    notify.send(req.db, req.settings, 'email', 'support_reply', u.email, { name: u.name, subject: t.subject }).catch(() => {});
   await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'support.reply', entity: 'support', entityId: t.public_id, detail: {}, ip: req.ip });
   res.redirect(R(req, '/support/' + t.public_id));
 });
@@ -1561,7 +2182,7 @@ router.post('/extensions/:key/toggle', async (req, res) => {
 /* ============================================================ NOTIFICATIONS */
 router.get('/notifications', async (req, res) => {
   const tab = req.query.tab || 'templates';
-  const tabs = [['templates', 'Templates'], ['outbox', 'Outbox'], ['providers', 'Providers'], ['send', 'Send Notification']]
+  const tabs = [['templates', 'Templates'], ['outbox', 'Outbox'], ['providers', 'Providers'], ['send', 'Send Notification'], ['announcements', 'Announcements']]
     .map(([k, l]) => `<a class="tab${tab === k ? ' active' : ''}" href="${R(req, '/notifications')}?tab=${k}">${l}</a>`).join('');
   let body = `<div class="tabs">${tabs}</div>`;
   if (tab === 'templates') {
@@ -1614,6 +2235,19 @@ router.get('/notifications', async (req, res) => {
        esc(l.error || '—'),
        `<a class="btn btn-sm" href="${R(req, '/notifications/log/' + l.id)}">Detail</a>`])) +
     ui.paginate(`${R(req, '/notifications')}?tab=outbox${oq ? '&oq=' + encodeURIComponent(oq) : ''}${ofrom ? '&ofrom=' + ofrom : ''}${oto ? '&oto=' + oto : ''}`, opage, PER, ototal);
+  } else if (tab === 'announcements') {
+    // DS-028: announcements CRUD (players read them at /announcements).
+    const anns = await req.db.query('SELECT * FROM announcements ORDER BY created_at DESC LIMIT 100');
+    body += ui.card('New announcement', ui.formHtml(R(req, '/notifications/announcements'), [
+      { key: 'title', label: 'Title', type: 'text', required: true },
+      { key: 'body', label: 'Message', type: 'textarea', required: true },
+      { key: 'is_active', label: 'Published immediately', type: 'checkbox', value: true },
+    ], { csrf: req.csrfToken, submit: 'Publish announcement', grid: false })) +
+    ui.table(['When', 'Title', 'Status', ''], anns.map(x => [
+      d(x.created_at), esc(x.title), x.active ? ui.badge('published', 'ok') : ui.badge('hidden', 'muted'),
+      `<form method="POST" action="${R(req, '/notifications/announcements/' + x.id + '/toggle')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm">${x.active ? 'Hide' : 'Publish'}</button></form>
+       <form method="POST" action="${R(req, '/notifications/announcements/' + x.id + '/delete')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm btn-d">Delete</button></form>`,
+    ]));
   } else {
     const smtp = !!process.env.SMTP_HOST, sms = !!(process.env.TWILIO_SID && process.env.TWILIO_TOKEN);
     body += ui.card('Email (SMTP)', `<p>${smtp ? ui.badge('configured', 'ok') + ' Host: ' + esc(process.env.SMTP_HOST) : ui.badge('not configured', 'warn') + ' — set SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS/SMTP_FROM in .env (see README).'}</p>`) +
@@ -1702,6 +2336,48 @@ router.post('/notifications/send', async (req, res) => {
   await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'notify.send', entity: 'notification', entityId: '', detail: { to: req.body.to, sent, failed, queued, startFrom, perBatch, cooling, subject }, ip: req.ip });
   await req.setFlash('success', `Notification processed for ${sliced.length} player(s): ${sent} sent, ${failed} failed, ${queued} queued in later batches (see Outbox for reasons).` + (autoBatched ? ' Large send auto-batched (100 per batch, 60s cooling).' : ''));
   res.redirect(R(req, '/notifications?tab=outbox'));
+});
+router.post('/notifications/announcements', async (req, res) => {
+  const title = String(req.body.title || '').trim().slice(0, 255);
+  const bodyText = String(req.body.body || '').trim().slice(0, 5000);
+  if (!title || !bodyText) { await req.setFlash('error', 'Title and message are required.'); return res.redirect(R(req, '/notifications') + '?tab=announcements'); }
+  await req.db.run('INSERT INTO announcements (title, body, active, created_by, created_at) VALUES (?, ?, ?, ?, ?)', [title, bodyText, req.body.is_active ? 1 : 0, req.user.id, now()]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'announcement.create', entity: 'announcement', entityId: '', detail: { title }, ip: req.ip });
+  await req.setFlash('success', 'Announcement saved.');
+  res.redirect(R(req, '/notifications') + '?tab=announcements');
+});
+router.post('/notifications/announcements/:id/toggle', async (req, res) => {
+  const r = await req.db.run('UPDATE announcements SET active = 1 - active WHERE id = ?', [req.params.id]);
+  if (r.changes !== 1) await req.setFlash('error', 'Announcement not found.');
+  else {
+    /* SCAN fix (C-05): create/delete were audited, the visibility
+       toggle was not — now it is. */
+    const ann = await req.db.get('SELECT active, title FROM announcements WHERE id = ?', [req.params.id]);
+    await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'announcement.toggle', entity: 'announcement', entityId: String(req.params.id), detail: { title: ann ? ann.title : '', active: ann ? ann.active : null }, ip: req.ip });
+    await req.setFlash('success', 'Announcement updated.');
+  }
+  res.redirect(R(req, '/notifications') + '?tab=announcements');
+});
+router.post('/notifications/announcements/:id/delete', async (req, res) => {
+  await req.db.run('DELETE FROM announcements WHERE id = ?', [req.params.id]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'announcement.delete', entity: 'announcement', entityId: String(req.params.id), detail: {}, ip: req.ip });
+  await req.setFlash('success', 'Announcement deleted.');
+  res.redirect(R(req, '/notifications') + '?tab=announcements');
+});
+/* DS-029: contact-form inbox (public /contact writes contact_messages). */
+router.get('/contact-messages', async (req, res) => {
+  const rows = await req.db.query('SELECT * FROM contact_messages ORDER BY handled ASC, created_at DESC LIMIT 200');
+  const body = ui.card('Contact messages', ui.table(['When', 'From', 'Subject', 'Message', 'Status', ''],
+    rows.map(x => [d(x.created_at), esc(x.name) + ' &lt;' + esc(x.email) + '&gt;', esc(x.subject || '—'), esc(String(x.message || '').slice(0, 140)),
+      x.handled ? ui.badge('handled', 'ok') : ui.badge('new', 'warn'),
+      `<form method="POST" action="${R(req, '/contact-messages/' + x.id + '/handled')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm">${x.handled ? 'Reopen' : 'Mark handled'}</button></form>`])));
+  res.send(shell(req, '/contact-messages', 'Contact Messages', body));
+});
+router.post('/contact-messages/:id/handled', async (req, res) => {
+  const r = await req.db.run('UPDATE contact_messages SET handled = 1 - handled WHERE id = ?', [req.params.id]);
+  if (r.changes !== 1) await req.setFlash('error', 'Message not found.');
+  else await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'contact.handled_toggle', entity: 'contact_message', entityId: String(req.params.id), detail: {}, ip: req.ip });
+  res.redirect(R(req, '/contact-messages'));
 });
 router.post('/notifications/process-due', async (req, res) => {
   const notify = require('../lib/notify');
@@ -1796,7 +2472,7 @@ router.get('/pages/:id', async (req, res) => {
   if (!p) return notFound(req, res, 'Page not found.');
   res.send(shell(req, '/pages', 'Edit — ' + p.name,
     ui.card('Page', ui.formHtml(R(req, '/pages/' + p.id), PAGE_FIELDS(p), { csrf: req.csrfToken, submit: 'Save page', grid: false })) +
-    `<form method="POST" action="${R(req, '/pages/' + p.id + '/delete')}" class="mt"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-d" data-confirm="Delete this page?">Delete page</button></form>`));
+    `<form method="POST" action="${R(req, '/pages/' + p.id + '/delete')}" class="mt"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-d">Delete page</button></form>`));
 });
 router.post('/pages/:id', async (req, res) => {
   const old = await req.db.get('SELECT * FROM pages WHERE id = ?', [req.params.id]);
@@ -1873,10 +2549,15 @@ router.post('/cron/schedule', async (req, res) => {
   res.redirect(R(req, '/cron'));
 });
 router.post('/cron/:id/run', async (req, res) => {
+  const job = await req.db.get('SELECT handler_key FROM cron_jobs WHERE id = ?', [req.params.id]);
   try {
     const msg = await runNow({ db: req.db, driver: req.driver }, req.params.id);
+    await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'cron.run_now', entity: 'cron', entityId: req.params.id, detail: { handler: job ? job.handler_key : '', result: String(msg).slice(0, 300), via: 'cron page' }, ip: req.ip });
     await req.setFlash('success', 'Job ran: ' + msg);
-  } catch (e) { await req.setFlash('error', 'Job failed: ' + e.message); }
+  } catch (e) {
+    await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'cron.run_now_failed', entity: 'cron', entityId: req.params.id, detail: { handler: job ? job.handler_key : '', error: e.message, via: 'cron page' }, ip: req.ip });
+    await req.setFlash('error', 'Job failed: ' + e.message);
+  }
   res.redirect(R(req, '/cron'));
 });
 router.post('/cron/:id/toggle', async (req, res) => {
@@ -1944,9 +2625,6 @@ const TOGGLES = [
   ['force_ssl', 'Force SSL', 'Mark cookies Secure (enable when serving HTTPS).'],
   ['policy_agreement', 'Policy agreement', 'Require players to accept terms at registration.'],
   ['secure_password', 'Secure password', 'Enforce strong passwords (8+ chars, upper/lower/number).'],
-  ['kyc_required', 'KYC required', 'INFORMATIONAL ONLY — enforces nothing. Money movement is gated by "Verified contact gate" below; this toggle does not block anything by itself.'],
-  ['email_verification', 'Email verification', 'INFORMATIONAL ONLY — enforces nothing on its own. Use "Verified contact gate" to actually require a verified contact before deposit/withdraw.'],
-  ['mobile_verification', 'Mobile verification', 'INFORMATIONAL ONLY — enforces nothing on its own. Use "Verified contact gate" to actually require a verified contact before deposit/withdraw.'],
   ['notifications_enabled', 'Notifications', 'Master switch for email/SMS/push notifications.'],
   ['otp_registration', 'OTP-gated registration', 'Require an operator-issued signup code to register.'],
   ['google_oauth_enabled', 'Google sign-in', 'Show Google sign-in (needs OAuth credentials).'],
@@ -1994,20 +2672,27 @@ router.get('/settings', async (req, res) => {
       { key: 'withdrawal_mode', label: 'Withdrawal mode', type: 'select', options: ['manual'], value: 'manual', help: 'Withdrawals are ALWAYS manually reviewed.' },
       { key: 'upcoming_draw_days', label: 'Upcoming draw days to pre-create (0 = disabled)', type: 'number', value: getS(s, 'upcoming_draw_days', '7'), help: 'How many days of Day/Evening draws the scheduler pre-creates. 0 disables pre-creation.' },
       { key: 'referral_rate', label: 'Referral commission % on referred ticket purchases', type: 'text', value: getS(s, 'referral_rate', '5') },
-      { key: 'multi_draw_discounts', label: 'Multi-draw discounts (draws:percent, comma-separated, e.g. 5:12,8:14,12:20)', type: 'text', value: getS(s, 'multi_draw_discounts', ''), help: 'Exact-match bundles: buying exactly N draws gets N% off the ticket total.' },
+      { key: 'deposit_bonus_percent', label: 'Deposit bonus % (0 = off) — credited on approved deposits', type: 'text', value: getS(s, 'deposit_bonus_percent', '0'), help: 'Bonus = percent of the net credited amount, paid as a separate wallet credit when a deposit is approved; clawed back if the deposit is revoked.' },
+      { key: 'multi_draw_discounts', label: 'Multi-draw discounts (draws:percent, comma-separated, e.g. 5:12,8:14,12:20)', type: 'text', value: getS(s, 'multi_draw_discounts', ''), help: 'Exact-match bundles keyed on the number of draws selected (Both = N Day + N Evening entries, keyed as N).' },
     ], { csrf: req.csrfToken, submit: 'Save economy' }) +
     `<h4 class="mt">Prize table — multiplier per pops count (win = wager × multiplier)</h4>
      <form method="POST" action="${R(req, '/settings/prizes')}" class="adm-form"><input type="hidden" name="_csrf" value="${req.csrfToken}">
      <div class="prize-grid">${prizes.map(p => `<div class="field"><label>${p.pops_count} pop${p.pops_count > 1 ? 's' : ''} → ×</label><input type="number" name="mult_${p.pops_count}" value="${p.multiplier}" min="1"></div>`).join('')}</div>
-     <div class="mt"><button class="btn btn-p" type="submit">Save prize table</button></div></form>`)}
+     <div class="mt"><button class="btn btn-p" type="submit">Save prize table</button>
+     <button class="btn" type="submit" formaction="${R(req, '/settings/prizes/preview')}">Simulate first (BP-23 — no save)</button></div></form>`)}
   ${ui.card('Withdrawal & risk controls', ui.formHtml(R(req, '/settings/risk'), [
       { key: 'withdrawal_turnover_required', label: 'Require 1× wagering before withdrawal', type: 'checkbox', value: getS(s, 'withdrawal_turnover_required', '1') === '1', help: 'Players must wager at least their approved deposits before withdrawing.' },
       { key: 'withdrawal_daily_cap', label: 'Daily withdrawal cap (e.g. 500.00; 0 = unlimited)', type: 'text', value: (parseFloat(getS(s, 'withdrawal_daily_cap', '0')) / 100).toFixed(2) },
       { key: 'withdrawal_monthly_cap', label: 'Monthly withdrawal cap (e.g. 5000.00; 0 = unlimited)', type: 'text', value: (parseFloat(getS(s, 'withdrawal_monthly_cap', '0')) / 100).toFixed(2) },
       { key: 'payout_lock_hours', label: 'Payout-detail change lock (hours, 24–72)', type: 'number', value: getS(s, 'payout_lock_hours', '48') },
       { key: 'maker_checker_threshold', label: 'Maker-checker threshold (e.g. 1000.00; 0 = disabled)', type: 'text', value: (parseFloat(getS(s, 'maker_checker_threshold', '0')) / 100).toFixed(2), help: 'Money actions at or above this amount need a second approver (see Approvals).' },
+      { key: 'auto_withdrawal_limit', label: 'Auto-withdrawal limit (e.g. 50.00; 0 = OFF — everything manual)', type: 'text', value: getS(s, 'auto_withdrawal_limit', '0'), help: 'BP-22 operator pre-authorization: a withdrawal at or under this amount (in the withdrawal\'s own currency) is AUTO-APPROVED by the system once every existing gate passes (wagering, OTP, KYC, payout lock). This deliberately bypasses maker-checker review for small amounts — set it knowingly. Auto-approval NEVER pays out by itself: payout still happens only through the normal mark-paid step with a provider payout ID. Per-user limits on the user page override this value.' },
       { key: 'referral_cap_per_referee', label: 'Referral cap per referee (e.g. 50.00; 0 = unlimited)', type: 'text', value: (parseFloat(getS(s, 'referral_cap_per_referee', '0')) / 100).toFixed(2) },
     ], { csrf: req.csrfToken, submit: 'Save risk controls' }))}
+  ${ui.card('KYC — identity verification (BP-21)', ui.formHtml(R(req, '/settings/kyc'), [
+      { key: 'kyc_enabled', label: 'Enable KYC requirement for all users (master switch)', type: 'checkbox', value: getS(s, 'kyc_enabled', '0') === '1', help: 'Ships OFF: with the switch off, nobody is gated unless their per-user requirement is set to "required" on their user page. Users set to "exempt" are never gated.' },
+      { key: 'kyc_gate', label: 'Gate scope', type: 'select', options: ['withdrawals', 'deposits_and_withdrawals'], value: getS(s, 'kyc_gate', 'withdrawals'), help: 'withdrawals = KYC approval is required before withdrawals only. deposits_and_withdrawals = deposits are gated too. Players submit documents on their /kyc page; review them under KYC in the menu.' },
+    ], { csrf: req.csrfToken, submit: 'Save KYC settings' }))}
   ${ui.card('Phone countries — dial codes & blocks', ui.formHtml(R(req, '/settings/phone-countries'), [
       { key: 'blocked_phone_countries', label: 'Blocked countries (ISO codes, comma-separated)', type: 'text', value: getS(s, 'blocked_phone_countries', ''), help: 'Example: PK,BD — players from these countries will NOT see their dial code in the phone dropdown and cannot register with that country number. Leave empty to allow all countries.' },
     ], { csrf: req.csrfToken, submit: 'Save phone countries' })) + `<p class="muted">The register and OTP phone fields show a country dial-code dropdown with all ${require('../lib/phone-countries').COUNTRIES.length} countries. Blocked countries are hidden from the dropdown and rejected server-side.</p>`}
@@ -2021,7 +2706,12 @@ router.get('/settings', async (req, res) => {
       { key: 'site_name', label: 'Site name', type: 'text', value: getS(s, 'site_name', '') },
       { key: 'cookie_text', label: 'Cookie banner text', type: 'textarea', value: getS(s, 'cookie_text', '') },
       { key: 'custom_css', label: 'Custom CSS', type: 'textarea', value: getS(s, 'custom_css', '') },
-      { key: 'language', label: 'Language', type: 'select', options: ['en'], value: getS(s, 'language', 'en'), help: 'More languages can be added on request.' },
+      /* SCAN fix (C-01): the old 'language' select was a dead switch —
+         saved but read by nothing (single option 'en', layout hardcodes
+         lang="en"). Removed rather than left as decoration. */
+      { key: 'site_timezone', label: 'Site timezone (IANA)', type: 'text', value: getS(s, 'site_timezone', 'UTC'), help: 'Draw dates and daily limits follow this timezone, e.g. America/Chicago. Must be a valid IANA name.' },
+      { key: 'support_notify_email', label: 'Support notification email', type: 'text', value: getS(s, 'support_notify_email', ''), help: 'When set (and email is configured), every new player support ticket is emailed here.' },
+      { key: 'sms_provider', label: 'SMS provider', type: 'select', options: ['', 'twilio', 'textbelt'], value: getS(s, 'sms_provider', ''), help: 'Used for phone OTP codes. Twilio needs TWILIO_* env vars; TextBelt needs TEXTBELT_KEY. The SMS_PROVIDER env var, when set, overrides this.' },
     ], { csrf: req.csrfToken, submit: 'Save appearance', grid: false }))}`;
   res.send(shell(req, '/settings', 'Settings', body));
 });
@@ -2069,6 +2759,8 @@ router.post('/settings/economy', async (req, res) => {
   if (!hhmm(b.day_draw_time) || !hhmm(b.eve_draw_time)) return fail('Draw times must be HH:MM (24h).');
   const commRate = pct(b.commission_rate), refRate = pct(b.referral_rate);
   if (commRate === null || refRate === null) return fail('Commission / referral rates must be numbers 0–100.');
+  const bonusPct = pct(b.deposit_bonus_percent === undefined ? '0' : b.deposit_bonus_percent);
+  if (bonusPct === null) return fail('Deposit bonus must be a number 0–100.');
   if (b.deposit_mode !== 'manual' || b.withdrawal_mode !== 'manual') return fail('Deposit/withdrawal mode must be manual — auto-approval does not exist.');
   const updDays = intIn(b.upcoming_draw_days, 0, 365);
   if (updDays === null) return fail('Upcoming draw days must be an integer 0–365.');
@@ -2080,7 +2772,7 @@ router.post('/settings/economy', async (req, res) => {
     });
     if (!okDisc) return fail('Multi-draw discounts must be draws:percent pairs (e.g. 5:12,8:14) with draws ≥ 2 and percent 0–100.');
   }
-  const keys = { wager_options: wagerList.join(','), max_pops: String(maxPops), max_draws: String(maxDraws), day_draw_time: String(b.day_draw_time).trim(), eve_draw_time: String(b.eve_draw_time).trim(), commission_rate: commRate, deposit_mode: 'manual', withdrawal_mode: 'manual', referral_rate: refRate, multi_draw_discounts: discRaw, upcoming_draw_days: String(updDays) };
+  const keys = { wager_options: wagerList.join(','), max_pops: String(maxPops), max_draws: String(maxDraws), day_draw_time: String(b.day_draw_time).trim(), eve_draw_time: String(b.eve_draw_time).trim(), commission_rate: commRate, deposit_mode: 'manual', withdrawal_mode: 'manual', referral_rate: refRate, deposit_bonus_percent: bonusPct, multi_draw_discounts: discRaw, upcoming_draw_days: String(updDays) };
   const changes = {};
   for (const [k, nv] of Object.entries(keys)) {
     const old = getS(req.settings, k, '');
@@ -2102,6 +2794,12 @@ router.post('/settings/risk', async (req, res) => {
   // Out-of-range or garbage input now rejects the whole save.
   const lockRaw = String(req.body.payout_lock_hours || '').trim();
   const lock = /^-?\d+$/.test(lockRaw) ? parseInt(lockRaw, 10) : null;
+  // BP-22: stored as major units exactly as typed (0 = auto-withdrawal OFF).
+  const autoRaw = String(req.body.auto_withdrawal_limit || '0').trim();
+  if (!/^\d+(\.\d{1,2})?$/.test(autoRaw)) {
+    await req.setFlash('error', 'Auto-withdrawal limit must be an amount like 50 or 50.00 (0 = off). Nothing was saved.');
+    return res.redirect(R(req, '/settings'));
+  }
   if (lock === null || lock < 24 || lock > 72) {
     await req.setFlash('error', 'Payout-detail change lock must be an integer 24–72 hours (as labelled). Nothing was saved.');
     return res.redirect(R(req, '/settings'));
@@ -2110,7 +2808,17 @@ router.post('/settings/risk', async (req, res) => {
     await req.setFlash('error', 'Caps/threshold must be valid amounts (e.g. 500.00). Nothing was saved.');
     return res.redirect(R(req, '/settings'));
   }
-  const keys = { withdrawal_turnover_required: req.body.withdrawal_turnover_required ? '1' : '0', withdrawal_daily_cap: String(daily), withdrawal_monthly_cap: String(monthly), payout_lock_hours: String(lock), maker_checker_threshold: String(threshold), referral_cap_per_referee: String(refCap) };
+  // DS-012: enabling maker-checker with fewer than two approver-capable
+  // staff (super/finance) deadlocks every queued action forever - the only
+  // approver would be barred from approving their own requests.
+  if (threshold > 0) {
+    const approvers = (await req.db.get("SELECT COUNT(*) AS c FROM users WHERE role = 'admin' AND (admin_role IS NULL OR admin_role IN ('super','finance'))")).c;
+    if (approvers < 2) {
+      await req.setFlash('error', 'Maker-checker needs at least TWO staff accounts that can approve money actions (super or finance role). You currently have ' + approvers + ' - add another approver under Staff first. Nothing was saved.');
+      return res.redirect(R(req, '/settings'));
+    }
+  }
+  const keys = { withdrawal_turnover_required: req.body.withdrawal_turnover_required ? '1' : '0', withdrawal_daily_cap: String(daily), withdrawal_monthly_cap: String(monthly), payout_lock_hours: String(lock), maker_checker_threshold: String(threshold), referral_cap_per_referee: String(refCap), auto_withdrawal_limit: autoRaw };
   const changes = {};
   for (const [k, v] of Object.entries(keys)) {
     const old = getS(req.settings, k, '');
@@ -2119,6 +2827,23 @@ router.post('/settings/risk', async (req, res) => {
   }
   await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'settings.risk', entity: 'settings', entityId: '', detail: { changes }, ip: req.ip });
   await req.setFlash('success', 'Risk controls saved.');
+  res.redirect(R(req, '/settings'));
+});
+router.post('/settings/kyc', async (req, res) => {
+  const gate = String(req.body.kyc_gate || 'withdrawals');
+  if (!['withdrawals', 'deposits_and_withdrawals'].includes(gate)) {
+    await req.setFlash('error', 'Invalid KYC gate scope. Nothing was saved.');
+    return res.redirect(R(req, '/settings'));
+  }
+  const keys = { kyc_enabled: req.body.kyc_enabled ? '1' : '0', kyc_gate: gate };
+  const changes = {};
+  for (const [k, v] of Object.entries(keys)) {
+    const old = getS(req.settings, k, '');
+    if (old !== v) changes[k] = { from: old, to: v };
+    await setSetting(req.db, req.driver, k, v);
+  }
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'settings.kyc', entity: 'settings', entityId: '', detail: { changes }, ip: req.ip });
+  await req.setFlash('success', 'KYC settings saved.');
   res.redirect(R(req, '/settings'));
 });
 router.post('/settings/phone-countries', async (req, res) => {
@@ -2130,6 +2855,47 @@ router.post('/settings/phone-countries', async (req, res) => {
   await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'settings.phone_countries', entity: 'settings', entityId: '', detail: { old: old, new: v }, ip: req.ip });
   await req.setFlash('success', 'Phone country settings saved.');
   res.redirect(R(req, '/settings'));
+});
+router.post('/settings/prizes/preview', async (req, res) => {
+  /* BP-23(d): multiplier simulator. Parses the SAME fields as the save
+     route with the same validation, but writes NOTHING — it renders the
+     per-pop RTP table and the projected margin at the CURRENT real
+     sales mix so the operator sees the economics before committing.
+     RTP per pop count = multiplier/15. The save route's 1–15 clamp
+     already makes RTP >100% impossible; the simulator still flags the
+     boundary (multiplier 15 = RTP 100% = zero margin on that count). */
+  const rows = await req.db.query('SELECT pops_count, multiplier FROM prize_table ORDER BY pops_count');
+  const preview = {};
+  for (const r of rows) {
+    const raw = String(req.body['mult_' + r.pops_count] ?? '').trim();
+    if (!/^\d+$/.test(raw) || parseInt(raw, 10) < 1 || parseInt(raw, 10) > 15) {
+      await req.setFlash('error', `Simulator: multiplier for ${r.pops_count} pop(s) must be an integer 1–15. Nothing was saved or simulated.`);
+      return res.redirect(R(req, '/settings'));
+    }
+    preview[r.pops_count] = parseInt(raw, 10);
+  }
+  const mix = await engine.popSalesMix(req.db);
+  const mixByPops = Object.fromEntries(mix.map(m => [m.pops, m]));
+  const projPreview = await engine.projectedMargin(req.db, preview);
+  const current = Object.fromEntries(rows.map(r => [r.pops_count, r.multiplier]));
+  const projCurrent = await engine.projectedMargin(req.db, current);
+  const fmtPct = (x) => (x === null || x === undefined ? '—' : x.toFixed(1) + '%');
+  const body = ui.card('Multiplier simulator (BP-23) — nothing was saved',
+    `<p class="muted">Projected margin uses the REAL sales mix (all non-test entries ever sold, weighted by wager). Per-count RTP = multiplier ÷ 15. Margin at mix = 1 − expected payout ÷ stakes at that mix.</p>` +
+    ui.table(['Pops', 'Current ×', 'Current RTP', 'Simulated ×', 'Simulated RTP', 'Entries sold', 'Stake share', 'Warning'],
+      rows.map(r => {
+        const m = mixByPops[r.pops_count];
+        const rtpP = engine.popRtpPct(preview[r.pops_count]);
+        const totalStake = projPreview.stake || 0;
+        return [r.pops_count, '×' + r.multiplier, fmtPct(engine.popRtpPct(r.multiplier)), '×' + preview[r.pops_count], fmtPct(rtpP),
+          m ? m.entries : 0, m && totalStake ? (m.stake / totalStake * 100).toFixed(1) + '%' : '—',
+          rtpP >= 100 ? '⚠ RTP at 100% — zero margin on this count' : ''];
+      })) +
+    ui.table(['Scenario', 'Total stakes (history)', 'Expected payout', 'Projected margin'],
+      [['Current table', money(req, projCurrent.stake || 0, getS(req.settings, 'base_currency', 'USD')), money(req, projCurrent.expectedPayout || 0, getS(req.settings, 'base_currency', 'USD')), fmtPct(projCurrent.marginPct)],
+       ['Simulated table', money(req, projPreview.stake || 0, getS(req.settings, 'base_currency', 'USD')), money(req, projPreview.expectedPayout || 0, getS(req.settings, 'base_currency', 'USD')), fmtPct(projPreview.marginPct)]]) +
+    `<p class="mt"><a class="btn" href="${R(req, '/settings')}">Back to settings</a> <span class="muted">To apply the simulated values, enter them in the prize table and use Save prize table.</span></p>`);
+  res.send(shell(req, '/settings', 'Multiplier Simulator', body));
 });
 router.post('/settings/prizes', async (req, res) => {
   // Multipliers are RTP: multiplier/15, so 1..15 keeps RTP <= 100%. The old
@@ -2194,10 +2960,12 @@ router.post('/settings/currencies', async (req, res) => {
 });
 router.post('/settings/appearance', async (req, res) => {
   const old = {}, nw = {};
-  for (const k of ['site_name', 'cookie_text', 'custom_css', 'language']) {
+  for (const k of ['site_name', 'cookie_text', 'custom_css', 'site_timezone', 'support_notify_email', 'sms_provider']) {
     old[k] = getS(req.settings, k, '');
     nw[k] = String(req.body[k] || '');
   }
+  if (nw.site_timezone) { try { new Intl.DateTimeFormat('en-US', { timeZone: nw.site_timezone }); } catch { await req.setFlash('error', 'Site timezone is not a valid IANA timezone name. Nothing was saved.'); return res.redirect(R(req, '/settings')); } }
+  if (nw.support_notify_email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(nw.support_notify_email)) { await req.setFlash('error', 'Support notification email is not a valid email address. Nothing was saved.'); return res.redirect(R(req, '/settings')); }
   const changes = {};
   for (const k of Object.keys(nw)) if (old[k] !== nw[k]) changes[k] = { from: String(old[k]).slice(0, 200), to: String(nw[k]).slice(0, 200) };
   for (const k of Object.keys(nw)) await setSetting(req.db, req.driver, k, nw[k]);
@@ -2211,7 +2979,7 @@ router.get('/approvals', async (req, res) => {
   const open = await req.db.query(`SELECT pa.*, u.email AS requester_email FROM pending_approvals pa LEFT JOIN users u ON u.id = pa.requested_by WHERE pa.status = 'open' ORDER BY pa.created_at DESC`);
   const decided = await req.db.query(`SELECT pa.*, u.email AS requester_email FROM pending_approvals pa LEFT JOIN users u ON u.id = pa.requested_by WHERE pa.status != 'open' ORDER BY pa.created_at DESC LIMIT 50`);
   const row = (a, canDecide) => [a.id, esc(a.action), esc(a.entity) + ' #' + a.entity_id, money(req, a.amount, a.currency), esc(a.requester_email || ('#' + a.requested_by)), d(a.created_at), ui.statusBadge(a.status),
-    canDecide ? `<form method="POST" action="${R(req, '/approvals/' + a.id + '/approve')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm btn-p" data-confirm="Approve and execute this action?">Approve</button></form>
+    canDecide ? `<form method="POST" action="${R(req, '/approvals/' + a.id + '/approve')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm btn-g">Approve</button></form>
     <form method="POST" action="${R(req, '/approvals/' + a.id + '/reject')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm btn-d">Reject</button></form>` : ''];
   const body = ui.card('Awaiting second approval', `<p class="muted">Money actions at or above the maker-checker threshold wait here. A DIFFERENT admin must approve — the requester cannot approve their own action. Rejecting leaves the original deposit/withdrawal untouched (still pending).</p>` +
     ui.table(['ID', 'Action', 'Target', 'Amount', 'Requested by', 'Requested', 'Status', ''], open.map(a => row(a, true)))) +
@@ -2222,6 +2990,11 @@ router.post('/approvals/:id/approve', async (req, res) => {
   const a = await req.db.get('SELECT * FROM pending_approvals WHERE id = ?', [req.params.id]);
   if (!a || a.status !== 'open') { await req.setFlash('error', 'Approval not found or already decided.'); return res.redirect(R(req, '/approvals')); }
   if (a.requested_by === req.user.id) { await req.setFlash('error', 'You cannot approve your own request — a different admin must approve.'); return res.redirect(R(req, '/approvals')); }
+  const { normalizeRole: nrA } = require('../lib/rbac');
+  const deciderRole = nrA(req.user);
+  const isDrawApproval = String(a.action || '').startsWith('draw.');
+  const roleOk = isDrawApproval ? (deciderRole === 'super' || deciderRole === 'risk') : (deciderRole === 'super' || deciderRole === 'finance');
+  if (!roleOk) { await req.setFlash('error', 'Your staff role cannot decide this type of approval.'); return res.redirect(R(req, '/approvals')); }
   try {
     // R-013: the queued money actions execute here, with the parameters
     // stored in pending_approvals.detail at queue time. Execution happens
@@ -2250,7 +3023,7 @@ router.post('/approvals/:id/approve', async (req, res) => {
     } else if (a.action === 'draw.cancel') {
       await cancelDraw(req.db, a.entity_id, req.settings, { actorId: req.user.id, ip: req.ip });
       await notifyDrawCancelled(req.db, req.settings, a.entity_id);
-    } else if (entity === 'deposit') await decideDeposit(req.db, a.entity_id, decision, req.user.id);
+    } else if (entity === 'deposit') await decideDeposit(req.db, a.entity_id, decision, req.user.id, req.settings);
     else if (entity === 'withdrawal') await decideWithdrawal(req.db, a.entity_id, decision, req.user.id);
     else throw new Error('Unknown approval action');
     await req.db.run("UPDATE pending_approvals SET status = 'approved', decided_by = ?, decided_at = ? WHERE id = ?", [req.user.id, now(), a.id]);
@@ -2274,6 +3047,11 @@ router.post('/approvals/:id/reject', async (req, res) => {
   const a = await req.db.get('SELECT * FROM pending_approvals WHERE id = ?', [req.params.id]);
   if (!a || a.status !== 'open') { await req.setFlash('error', 'Approval not found or already decided.'); return res.redirect(R(req, '/approvals')); }
   if (a.requested_by === req.user.id) { await req.setFlash('error', 'You cannot decide your own request.'); return res.redirect(R(req, '/approvals')); }
+  const { normalizeRole: nrA } = require('../lib/rbac');
+  const deciderRole = nrA(req.user);
+  const isDrawApproval = String(a.action || '').startsWith('draw.');
+  const roleOk = isDrawApproval ? (deciderRole === 'super' || deciderRole === 'risk') : (deciderRole === 'super' || deciderRole === 'finance');
+  if (!roleOk) { await req.setFlash('error', 'Your staff role cannot decide this type of approval.'); return res.redirect(R(req, '/approvals')); }
   await req.db.run("UPDATE pending_approvals SET status = 'rejected', decided_by = ?, decided_at = ? WHERE id = ?", [req.user.id, now(), a.id]);
   await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'approval.rejected', entity: a.entity, entityId: a.entity_id, detail: { approval_id: a.id, action: a.action }, ip: req.ip });
   // R-053: a rejection used to notify nobody — the requester never learned
@@ -2400,7 +3178,7 @@ router.get('/security', async (req, res) => {
     <p class="muted">Your authenticator protects the admin panel. ${enforced ? 'TOTP is REQUIRED for admins on this site (admin_totp_required is ON).' : 'TOTP enforcement is OFF (admin_totp_required). Enroll first, then an admin can enable enforcement in Settings → Toggles.'}</p>
     <p>Status: ${u.totp_secret ? ui.badge('enabled', 'ok') : ui.badge('not enrolled', 'warn')}</p>
     ${u.totp_secret
-      ? `<form method="POST" action="${R(req, '/security/totp/disable')}"><input type="hidden" name="_csrf" value="${req.csrfToken}"><div class="field"><label>Password (to confirm)</label><input type="password" name="password" required></div><div class="field"><label>Current authenticator code (or a backup code)</label><input type="text" name="totp_code" required autocomplete="off"></div><button class="btn btn-d" type="submit" data-confirm="Disable your authenticator?">Disable authenticator</button></form>`
+      ? `<form method="POST" action="${R(req, '/security/totp/disable')}"><input type="hidden" name="_csrf" value="${req.csrfToken}"><div class="field"><label>Password (to confirm)</label><input type="password" name="password" required></div><div class="field"><label>Current authenticator code (or a backup code)</label><input type="text" name="totp_code" required autocomplete="off"></div><button class="btn btn-d" type="submit">Disable authenticator</button></form>`
       : `<form method="POST" action="${R(req, '/security/totp/start')}"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-p" type="submit">Enroll authenticator</button></form>`}
   `)));
 });
@@ -2423,6 +3201,8 @@ router.post('/security/totp/confirm', rateLimit({ windowMs: 15 * 60000, max: 10,
   if (!verifyTotp(secret, req.body.totp_code)) { await req.setFlash('error', 'Invalid code. Try again.'); return res.redirect(R(req, '/security')); }
   const authLib = require('../lib/auth');
   const codes = authLib.newBackupCodes(8);
+  const enrollStepA = authLib.verifyTotpStep(secret, req.body.totp_code);
+  if (enrollStepA !== null) await req.db.run('UPDATE users SET totp_last_step = ? WHERE id = ?', [enrollStepA, req.user.id]);
   await req.db.run('UPDATE users SET totp_secret = ?, backup_codes = ?, force_totp_enroll = 0 WHERE id = ?', [secret, authLib.hashBackupCodes(codes), req.user.id]);
   await authLib.touchSession(req.db, req.sess.id, { admin_totp_pending: null });
   await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'admin.totp_enable', entity: 'user', entityId: req.user.id, detail: {}, ip: req.ip });

@@ -2,7 +2,7 @@
   <div class="form-card auth-card fade-in">
     <div class="auth-logo">🎰</div>
     <h1>Welcome back</h1>
-    <p class="login-value">Sign in to <strong>play draws</strong>, track your winnings, and get <strong>instant payouts</strong>.</p>
+    <p class="login-value">Sign in to <strong>play draws</strong>, track your winnings, and <strong>cash out fast</strong>.</p>
 
     <% if (typeof formError !== 'undefined' && formError) { %><div class="flash f-err"><%= formError %></div><% } %>
 
@@ -38,7 +38,7 @@
         <input type="hidden" name="_csrf" value="<%= csrf %>">
         <div class="field">
           <label for="totpCode">Authenticator code</label>
-          <input type="text" id="totpCode" name="totp_code" inputmode="numeric" maxlength="8" placeholder="000000" autocomplete="one-time-code" required>
+          <input type="text" id="totpCode" name="totp_code" maxlength="16" placeholder="123456 or XXXX-XXXX" autocomplete="one-time-code" required>
         </div>
         <button type="submit" class="btn btn-p btn-lg btn-block">Verify &amp; Sign In →</button>
       </form>
@@ -47,12 +47,12 @@
     <% } %>
 
     <!-- PASSWORD SIGN-IN (primary) -->
-    <div id="loginPw">
+    <div id="loginPw"<%= (typeof totpRequired !== 'undefined' && totpRequired) ? ' hidden' : '' %>>
       <form id="pwForm" method="POST" action="/login">
         <input type="hidden" name="_csrf" value="<%= csrf %>">
         <div class="field">
           <label for="pwIdentifier">Email or phone number</label>
-          <input type="text" id="pwIdentifier" name="email" placeholder="you@example.com or +1234567890" autocomplete="username" required>
+          <input type="text" id="pwIdentifier" name="email" placeholder="you@example.com or +1234567890" autocomplete="username" required value="<%= typeof emailPrefill !== 'undefined' ? emailPrefill : '' %>">
         </div>
         <div class="field">
           <label for="pwPassword">Password</label>
@@ -118,8 +118,8 @@
     <% } %>
 
     <div class="login-branding">
-      <div class="login-jackpot">🎰 <strong>Daily Draws</strong> · Provably Fair · Instant Payouts</div>
-      <div class="login-trust">🔒 Secure &amp; Licensed · 18+ only · Play responsibly</div>
+      <div class="login-jackpot">🎰 <strong>Daily Draws</strong> · Provably Fair</div>
+      <div class="login-trust">🔒 Secure sign-in · 18+ only · Play responsibly</div>
     </div>
     <p class="muted center">Don't have an account? <a href="/register"><strong>Register</strong></a></p>
     <p class="text-caption center">By continuing, you agree to our Terms &amp; Privacy Policy.</p>

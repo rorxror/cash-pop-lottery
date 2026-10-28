@@ -1,0 +1,14 @@
+<section class="wrap section narrow-wide">
+  <h1 class="sec-title">Contact us</h1>
+  <div class="card">
+    <p class="muted">Send us a message and the support team will get back to you by email. For account-specific help, <a href="/support">open a support ticket</a> instead — it reaches us faster.</p>
+    <form action="/contact" method="POST" class="mt">
+      <input type="hidden" name="_csrf" value="<%= csrf %>">
+      <div class="field"><label for="cname">Your name</label><input id="cname" name="name" required maxlength="120" value="<%= user ? user.name : '' %>"></div>
+      <div class="field"><label for="cemail">Email</label><input id="cemail" name="email" type="email" required maxlength="190" value="<%= user ? user.email : '' %>"></div>
+      <div class="field"><label for="csubject">Subject</label><input id="csubject" name="subject" maxlength="255"></div>
+      <div class="field"><label for="cmessage">Message</label><textarea id="cmessage" name="message" rows="6" required maxlength="5000"></textarea></div>
+      <button type="submit" class="btn btn-p">Send message</button>
+    </form>
+  </div>
+</section>

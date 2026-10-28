@@ -16,9 +16,8 @@
           <td><%= fmt(t.total, t.currency) %></td>
           <td><%= t.won_count %>/<%= t.entry_count %></td>
           <td>
-            <% if (t.status === 'won') { %><span class="badge b-ok">WON</span>
-            <% } else if (t.status === 'lost') { %><span class="badge b-muted">LOST</span>
-            <% } else if (t.status === 'cancelled') { %><span class="badge b-err">CANCELLED</span>
+            <% if (t.status === 'cancelled') { %><span class="badge b-err">CANCELLED</span>
+            <% } else if (t.status === 'settled') { %><%- t.won_count > 0 ? '<span class="badge b-ok">WON</span>' : '<span class="badge b-muted">LOST</span>' %>
             <% } else { %><span class="badge b-info">ACTIVE</span><% } %>
           </td>
         </tr>
@@ -26,6 +25,9 @@
       </tbody>
     </table>
     </div>
+    <% if (typeof totalPages !== 'undefined' && totalPages > 1) { %>
+    <p class="mt"><% if (page > 1) { %><a class="btn btn-g btn-sm" href="/tickets?page=<%= page - 1 %>">&larr; Newer</a><% } %> Page <%= page %> of <%= totalPages %> <% if (page < totalPages) { %><a class="btn btn-g btn-sm" href="/tickets?page=<%= page + 1 %>">Older &rarr;</a><% } %></p>
+    <% } %>
     <% } else { %>
     <p class="muted">You haven't bought any tickets yet. <a href="/play">Play now</a>.</p>
     <% } %>

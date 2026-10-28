@@ -192,7 +192,7 @@ test('R-018/R-019: scratch daily loss limit enforced inside buyTicket (second bu
       [series.id, i, 'n' + i, sha256(`${series.id}|${i}|n${i}|0`)]);
   }
   await buyTicket(db, user, series.id, '127.0.0.1');
-  await assert.rejects(() => buyTicket(db, user, series.id, '127.0.0.1'), /daily scratch loss limit/);
+  await assert.rejects(() => buyTicket(db, user, series.id, '127.0.0.1'), /daily loss limit/); // DS-053: wording unified when the loss limit became combined lottery+scratch
   const bought = await db.get('SELECT COUNT(*) AS c FROM scratch_tickets WHERE user_id = ?', [user]);
   assert.strictEqual(bought.c, 1, 'failed buy must not create a ticket');
 });

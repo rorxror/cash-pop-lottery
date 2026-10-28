@@ -1,5 +1,6 @@
 <section class="wrap section">
   <h1 class="sec-title">New Withdrawal</h1>
+  <p class="muted">18+ only · Play responsibly — you can set deposit, loss and session limits at any time on the <a href="/scratch/responsible-play">Play Limits</a> page.</p>
   <div class="grid2">
     <div class="card">
       <div class="card-h"><h2>Payment method</h2></div>
@@ -22,9 +23,9 @@
         <input type="hidden" name="method_id" value="<%= method.id %>">
         <div class="field">
           <label for="wdAmount">Amount (<%= method.currency %>)</label>
-          <input type="number" id="wdAmount" name="amount" min="<%= method.min %>" max="<%= method.max %>" required
-                 data-fixed="<%= method.fixed_charge %>" data-percent="<%= method.percent_charge %>" data-currency="<%= method.currency %>">
-          <small class="muted">Min <%= fmt(method.min, method.currency) %> &middot; Max <%= fmt(method.max, method.currency) %></small>
+          <input type="number" id="wdAmount" name="amount" min="<%= method.min_amount ? (method.min_amount / Math.pow(10, methodDec)) : '' %>" max="<%= method.max_amount ? (method.max_amount / Math.pow(10, methodDec)) : '' %>" required
+                 data-fixed="<%= method.fixed_charge %>" data-percent="<%= method.percent_charge %>" data-currency="<%= method.currency %>" data-decimals="<%= methodDec %>">
+          <small class="muted"><% if (method.min_amount) { %>Min <%= fmt(method.min_amount, method.currency) %><% } %><% if (method.min_amount && method.max_amount) { %> &middot; <% } %><% if (method.max_amount) { %>Max <%= fmt(method.max_amount, method.currency) %><% } %><% if (!method.min_amount && !method.max_amount) { %>No limits<% } %></small>
         </div>
         <p class="muted" id="chargePreview"></p>
         <% (method.custom_fields || []).forEach(function(f){ %>
@@ -36,7 +37,7 @@
         <button type="submit" class="btn btn-p btn-lg btn-block">Submit Withdrawal</button>
       </form>
       <% } else if (typeof noMethods !== 'undefined' && noMethods) { %>
-      <p class="muted"><%= (typeof noMethodsReason !== 'undefined' && noMethodsReason) ? noMethodsReason : 'No withdrawal methods are available right now. The operator has not enabled any withdrawal method yet — please check back later or contact support.' %></p>
+      <p class="muted"><%= (typeof noMethodsReason !== 'undefined' && noMethodsReason) ? noMethodsReason : 'No withdrawal methods are available right now. Please check back later or contact support.' %></p>
       <p><a class="btn btn-g" href="/wallet">Back to wallet</a></p>
       <% } else { %>
       <p class="muted">Select a payment method to continue.</p>

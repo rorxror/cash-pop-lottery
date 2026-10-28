@@ -87,7 +87,10 @@ router.get('/players/new', async (req, res) => {
 
 router.post('/players/new', async (req, res) => {
   const aid = agentId(req);
-  const { name, email, phone, password } = req.body;
+  const name = typeof req.body.name === 'string' ? req.body.name : ''; // B-08: type-confusion guards
+  const email = typeof req.body.email === 'string' ? req.body.email : '';
+  const phone = typeof req.body.phone === 'string' ? req.body.phone : '';
+  const password = typeof req.body.password === 'string' ? req.body.password : '';
   // v14: player minimum is 8 (standing rule — the old 6 here was a hole).
   const { passwordError } = require('../lib/validate');
   const pwErr = passwordError(password, 'player', getBool(req.settings, 'secure_password', true));
@@ -164,6 +167,57 @@ router.get('/commissions', async (req, res) => {
      FROM commissions c JOIN users u ON u.id = c.user_id LEFT JOIN tickets t ON t.id = c.ticket_id
      WHERE c.agent_id = ? ORDER BY c.created_at DESC LIMIT 200`, [aid]);
   res.render('agent/commissions', { metaTitle: 'Commissions', metaDesc: '', rows });
+});
+
+/* DS-010: agents are the player's first support contact, but tickets only
+   ever reached the admin panel - the agent router had no support routes at
+   all. Agents now see and answer tickets from THEIR OWN players only
+   (ownership is enforced by the users.agent_id join on every query). */
+router.get('/support', async (req, res) => {
+  const aid = agentId(req);
+  const tickets = await req.db.query(
+    `SELECT t.*, u.name AS player_name, u.email AS player_email FROM support_tickets t
+     JOIN users u ON u.id = t.user_id WHERE u.agent_id = ? ORDER BY t.updated_at DESC LIMIT 200`, [aid]);
+  res.render('agent/support', { metaTitle: 'Support', metaDesc: '', tickets });
+});
+
+async function agentTicket(req) {
+  const aid = agentId(req);
+  return req.db.get(
+    `SELECT t.*, u.name AS player_name, u.email AS player_email FROM support_tickets t
+     JOIN users u ON u.id = t.user_id WHERE t.public_id = ? AND u.agent_id = ?`, [req.params.publicId, aid]);
+}
+
+router.get('/support/:publicId', async (req, res) => {
+  const ticket = await agentTicket(req);
+  if (!ticket) return res.status(404).render('error', { status: 404, message: 'Ticket not found.' });
+  const rows = await req.db.query('SELECT * FROM support_messages WHERE ticket_id = ? ORDER BY created_at', [ticket.id]);
+  const messages = rows.map(m => ({ ...m, mine: m.author_role === 'agent' && m.author_id === req.user.id }));
+  // BP-15 (v19): the same admin-managed canned replies are offered to
+  // agents — one shared list, one shared picker (public/app.js).
+  const canned = ticket.status !== 'closed'
+    ? await req.db.query('SELECT id, title, body FROM canned_replies ORDER BY title, id')
+    : [];
+  res.render('agent/support_view', { metaTitle: 'Ticket ' + ticket.public_id, metaDesc: '', ticket, messages, canned });
+});
+
+router.post('/support/:publicId/reply', async (req, res) => {
+  const ticket = await agentTicket(req);
+  if (!ticket) return res.status(404).render('error', { status: 404, message: 'Ticket not found.' });
+  if (ticket.status === 'closed') { await req.setFlash('error', 'This ticket is closed.'); return res.redirect('/agent/support/' + ticket.public_id); }
+  const body = String(req.body.message || '').trim().slice(0, 5000);
+  if (!body) return res.redirect('/agent/support/' + ticket.public_id);
+  await req.db.run('INSERT INTO support_messages (ticket_id, author_id, author_role, body, created_at) VALUES (?, ?, ?, ?, ?)', [ticket.id, req.user.id, 'agent', body, now()]);
+  await req.db.run("UPDATE support_tickets SET status = 'answered', updated_at = ? WHERE id = ?", [now(), ticket.id]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'agent', action: 'support.reply', entity: 'support', entityId: ticket.public_id, detail: {}, ip: req.ip });
+  try {
+    const notify = require('../lib/notify');
+    // BP-13: support-reply email respects the player's preference.
+    if (await notify.emailPrefEnabled(req.db, ticket.user_id, 'support_reply'))
+      await notify.send(req.db, req.settings, 'email', 'support_reply', ticket.player_email, { name: ticket.player_name, subject: ticket.subject });
+  } catch {}
+  await req.setFlash('success', 'Reply sent.');
+  res.redirect('/agent/support/' + ticket.public_id);
 });
 
 module.exports = router;

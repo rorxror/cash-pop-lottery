@@ -4,7 +4,7 @@
     <% if (user) { %><div class="scratch-actions"><a class="btn btn-g" href="/scratch/my-tickets">My Scratch Tickets</a><a class="btn btn-g" href="/scratch/responsible-play">Play Limits</a></div><% } %>
   </div>
   <% if (!series.length) { %>
-    <div class="card empty-state"><h2>No scratch series on sale</h2><p class="muted">The operator has not launched an active series yet.</p></div>
+    <div class="card empty-state"><h2>No scratch series on sale</h2><p class="muted">No scratch cards are on sale right now. Please check back soon.</p></div>
   <% } else { %>
     <div class="scratch-grid">
       <% series.forEach(function(s){ const rtp = s.total_tickets ? (Number(s.total_prizes || 0) / (Number(s.total_tickets) * Number(s.price)) * 100) : 0; %>

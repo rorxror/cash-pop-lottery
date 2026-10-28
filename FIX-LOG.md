@@ -791,8 +791,8 @@ below per item. Line numbers are from the fix copy at write time.
   README: `TICKET_HMAC_SECRET`, `CREDENTIAL_ENCRYPTION_KEY`,
   `DB_DRIVER`, `DATABASE_URL`, `PGSSL_INSECURE` (opt-out only),
   `ADMIN_PATH`, `BASE_URL`, `PORT`, `SMTP_*`, `TWILIO_*`,
-  `SMS_PROVIDER`, `TEXTBELT_KEY`, `GOOGLE_CLIENT_ID`/`GOOGLE_SECRET`,
-  `FACEBOOK_APP_ID`/`FACEBOOK_SECRET`, `DRAND_API`,
+  `SMS_PROVIDER`, `TEXTBELT_KEY`, `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`,
+  `FACEBOOK_APP_ID`/`FACEBOOK_APP_SECRET`, `DRAND_API`,
   `ADMIN_SEED_*`, `SQLITE_PATH`, MySQL/PG vars) and a minimal
   `.gitignore` (`.env`, `node_modules/`, `data/`, `*.log`).
 - R-101 (stale docs) — FIXED. `README-DEPLOY.md`: Render-first

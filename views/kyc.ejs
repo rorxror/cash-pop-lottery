@@ -1,0 +1,57 @@
+<section class="wrap section narrow">
+  <div class="form-card">
+    <h1>Identity Verification (KYC)</h1>
+    <p class="muted">Your verification status: <strong><%= kyc.statusLabel %></strong></p>
+    <% if (kyc.status === 'verified') { %>
+      <p>Your identity is verified. No further action is needed.</p>
+    <% } else if (kyc.status === 'pending') { %>
+      <p>Your document is with our team for review. We will update this page when the review is done.</p>
+    <% } else if (kyc.status === 'rejected') { %>
+      <p>Your last submission was rejected<% if (kyc.note) { %>: <strong><%= kyc.note %></strong><% } %>. Please submit a clear document below.</p>
+    <% } else if (kyc.withdraw.required || kyc.deposit.required) { %>
+      <p>Verification is required for your account<% if (kyc.withdraw.blocked && kyc.deposit.blocked) { %> before deposits and withdrawals<% } else if (kyc.withdraw.blocked) { %> before withdrawals<% } else if (kyc.deposit.blocked) { %> before deposits<% } %>. Submit one document below.</p>
+    <% } else { %>
+      <p>Verification is not currently required for your account. You can still submit a document below if you want to be verified ahead of time.</p>
+    <% } %>
+    <% if (kyc.status !== 'verified' && kyc.status !== 'pending') { %>
+    <form action="/kyc" method="POST" enctype="multipart/form-data">
+      <input type="hidden" name="_csrf" value="<%= csrf %>">
+      <div class="field">
+        <label for="doc_type">Document type</label>
+        <select id="doc_type" name="doc_type" required>
+          <% docTypes.forEach(function(t){ %>
+          <option value="<%= t %>"><%= docLabels[t] %></option>
+          <% }) %>
+        </select>
+      </div>
+      <div class="field">
+        <label for="document">Document file</label>
+        <input type="file" id="document" name="document" accept=".jpg,.jpeg,.png,.pdf" required>
+        <small class="muted">JPG, PNG or PDF, maximum 5 MB. Make sure the whole document is visible and readable.</small>
+      </div>
+      <button type="submit" class="btn btn-p btn-lg btn-block">Submit Document</button>
+    </form>
+    <% } %>
+  </div>
+
+  <% if (docs && docs.length) { %>
+  <div class="form-card mt">
+    <h2>Your submissions</h2>
+    <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr><th>Document</th><th>Submitted</th><th>Status</th><th></th></tr></thead>
+      <tbody>
+        <% docs.forEach(function(doc){ %>
+        <tr>
+          <td><%= docLabels[doc.doc_type] || doc.doc_type %><br><small class="muted"><%= doc.original_name %></small></td>
+          <td><%= new Date(doc.created_at).toLocaleString() %></td>
+          <td><%= statusLabels[doc.status === 'approved' ? 'verified' : doc.status] || doc.status %><% if (doc.status === 'rejected' && doc.review_note) { %><br><small class="muted">Reason: <%= doc.review_note %></small><% } %></td>
+          <td><a class="btn btn-sm" href="/kyc/document/<%= doc.id %>" target="_blank" rel="noopener">View</a></td>
+        </tr>
+        <% }) %>
+      </tbody>
+    </table>
+    </div>
+  </div>
+  <% } %>
+</section>

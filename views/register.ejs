@@ -1,28 +1,39 @@
 <section class="wrap section narrow">
   <div class="form-card">
     <h1>Create Account</h1>
+    <% if ((typeof facebookOn !== 'undefined' && facebookOn) || (typeof googleOn !== 'undefined' && googleOn)) { %>
+    <div class="social-login">
+      <% if (typeof googleOn !== 'undefined' && googleOn) { %>
+      <a class="btn btn-google btn-block" href="/auth/google"><span class="social-ico">G</span> Continue with Google</a>
+      <% } %>
+      <% if (typeof facebookOn !== 'undefined' && facebookOn) { %>
+      <a class="btn btn-fb btn-block" href="/auth/facebook"><span class="social-ico">f</span> Continue with Facebook</a>
+      <% } %>
+    </div>
+    <div class="divider"><span>or create an account with</span></div>
+    <% } %>
 <% if (typeof formError !== 'undefined' && formError) { %><div class="flash f-err"><%= formError %></div><% } %>
         <form action="/register" method="POST" id="registerForm">
         <% if (typeof refCode !== 'undefined' && refCode) { %><input type="hidden" name="ref" value="<%= refCode %>"><% } %>
       <input type="hidden" name="_csrf" value="<%= csrf %>">
       <div class="field">
         <label for="name">Full name</label>
-        <input type="text" id="name" name="name" required autocomplete="name">
+        <input type="text" id="name" name="name" required autocomplete="name" value="<%= typeof old !== 'undefined' ? old.name : '' %>">
       </div>
       <div class="field">
         <label for="email">Email</label>
-        <input type="email" id="email" name="email" required autocomplete="email">
+        <input type="email" id="email" name="email" required autocomplete="email" value="<%= typeof old !== 'undefined' ? old.email : '' %>">
       </div>
       <div class="field">
         <label for="phoneLocal">Phone</label>
         <div class="phone-row">
           <select id="phoneCc" name="phone_cc" aria-label="Country dial code">
-            <option value="" selected disabled>Select country code</option>
+            <option value="" disabled<%= (typeof old !== 'undefined' && old.phone_cc) ? '' : ' selected' %>>Select country code</option>
             <% (typeof phoneCountries !== 'undefined' ? phoneCountries : []).forEach(function(c){ %>
-            <option value="<%= c.dial %>"><%= c.name %> (+<%= c.dial %>)</option>
+            <option value="<%= c.dial %>"<%= (typeof old !== 'undefined' && old.phone_cc === c.dial) ? ' selected' : '' %>><%= c.name %> (+<%= c.dial %>)</option>
             <% }) %>
           </select>
-          <input type="tel" id="phoneLocal" name="phone_local" placeholder="Phone number" autocomplete="tel">
+          <input type="tel" id="phoneLocal" name="phone_local" placeholder="Phone number" autocomplete="tel" value="<%= typeof old !== 'undefined' ? old.phone_local : '' %>">
         </div>
         <input type="hidden" id="phoneFull" name="phone">
         <small class="muted">Choose your country code, then your number — no country is pre-forced.</small>
@@ -39,12 +50,12 @@
       <div class="field">
         <label for="otp_code">Signup code</label>
         <input type="text" id="otp_code" name="otp_code" required>
-        <small class="muted">Enter the signup code issued by the operator.</small>
+        <small class="muted">Enter the signup code you received.</small>
       </div>
       <% } %>
       <% if (S('policy_agreement')==='1') { %>
       <div class="field check">
-        <label><input type="checkbox" name="agree" value="1" required> I agree to the <a href="/page/terms">Terms</a> and <a href="/page/privacy">Privacy Policy</a></label>
+        <label><input type="checkbox" name="agree" value="1" required> I confirm I am 18 or older and I agree to the <a href="/page/terms">Terms</a> and <a href="/page/privacy">Privacy Policy</a></label>
       </div>
       <% } %>
       <%- captchaHtml %>

@@ -1,5 +1,20 @@
 <section class="wrap section">
   <h1 class="sec-title">Wallet</h1>
+  <p class="muted">18+ only · Play responsibly — you can set deposit, loss and session limits at any time on the <a href="/scratch/responsible-play">Play Limits</a> page.</p>
+  <% if (typeof kycNotice !== 'undefined' && kycNotice) { %>
+  <div class="card" style="border-left:4px solid #c98a00">
+    <div class="card-h"><h2>Identity verification (KYC) — <%= kycNotice.statusLabel %></h2></div>
+    <% if (kycNotice.withdrawBlocked || kycNotice.depositBlocked) { %>
+    <p>KYC approval is required before <%= kycNotice.withdrawBlocked && kycNotice.depositBlocked ? 'deposits and withdrawals' : (kycNotice.withdrawBlocked ? 'withdrawals' : 'deposits') %> on your account. <a href="/kyc">Go to the KYC page</a> to submit your document.</p>
+    <% } else if (kycNotice.status === 'rejected') { %>
+    <p>Your last KYC submission was rejected<% if (kycNotice.note) { %>: <strong><%= kycNotice.note %></strong><% } %>. <a href="/kyc">Submit a new document</a>.</p>
+    <% } else if (kycNotice.status === 'verified') { %>
+    <p>Your identity is verified — no action is needed.</p>
+    <% } else if (kycNotice.status === 'pending') { %>
+    <p>Your KYC document is under review. <a href="/kyc">Check the status</a>.</p>
+    <% } %>
+  </div>
+  <% } %>
   <h2 class="sec-title">Balances</h2>
   <div class="cur-rows">
     <% (typeof wallets !== 'undefined' ? wallets : []).forEach(function(w){
@@ -21,7 +36,7 @@
         <% depositMethods.forEach(function(m){ %>
         <li>
           <span class="method-name"><%= m.name %></span>
-          <span class="muted"><% if (m.min == null && m.max == null) { %>No limits<% } else { %><%= m.min == null ? '' : fmt(m.min, m.currency) %><%= m.min == null || m.max == null ? '' : ' – ' %><%= m.max == null ? 'no max' : fmt(m.max, m.currency) %><% } %></span>
+          <span class="muted"><% if (m.min_amount == null && m.max_amount == null) { %>No limits<% } else { %><%= m.min_amount == null ? '' : fmt(m.min_amount, m.currency) %><%= m.min_amount == null || m.max_amount == null ? '' : ' – ' %><%= m.max_amount == null ? 'no max' : fmt(m.max_amount, m.currency) %><% } %></span>
           <a class="btn btn-p btn-sm" href="/deposit/new?m=<%= m.id %>">Deposit</a>
         </li>
         <% }) %>
@@ -35,7 +50,7 @@
         <% withdrawMethods.forEach(function(m){ %>
         <li>
           <span class="method-name"><%= m.name %></span>
-          <span class="muted"><% if (m.min == null && m.max == null) { %>No limits<% } else { %><%= m.min == null ? '' : fmt(m.min, m.currency) %><%= m.min == null || m.max == null ? '' : ' – ' %><%= m.max == null ? 'no max' : fmt(m.max, m.currency) %><% } %></span>
+          <span class="muted"><% if (m.min_amount == null && m.max_amount == null) { %>No limits<% } else { %><%= m.min_amount == null ? '' : fmt(m.min_amount, m.currency) %><%= m.min_amount == null || m.max_amount == null ? '' : ' – ' %><%= m.max_amount == null ? 'no max' : fmt(m.max_amount, m.currency) %><% } %></span>
           <a class="btn btn-g btn-sm" href="/withdraw/new?m=<%= m.id %>">Withdraw</a>
         </li>
         <% }) %>

@@ -14,6 +14,13 @@
       </div>
       <button type="submit" class="btn btn-p btn-lg btn-block">Verify &amp; Submit Withdrawal →</button>
     </form>
-    <p class="muted sm center"><a href="/withdraw/new">← Cancel and go back</a></p>
+    <form action="/withdraw/verify/resend" method="POST" class="center mt">
+      <input type="hidden" name="_csrf" value="<%= csrf %>">
+      <button type="submit" class="btn btn-g">Resend code</button>
+    </form>
+    <form action="/withdraw/verify/cancel" method="POST" class="center mt">
+      <input type="hidden" name="_csrf" value="<%= csrf %>">
+      <button type="submit" class="btn">Cancel withdrawal</button>
+    </form>
   </div>
 </section>

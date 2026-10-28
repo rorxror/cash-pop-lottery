@@ -1,10 +1,14 @@
 <section class="wrap section narrow">
   <div class="form-card error-page">
     <div class="error-code"><%= status %></div>
-    <h1>Something went wrong</h1>
+    <% /* SCAN fix (A-07): the heading matches the situation — a clean
+          4xx is not "something went wrong", and a blocked action can
+          offer its way forward (cta) instead of a dead end. */ %>
+    <h1><%= status === 404 ? 'Page not found' : (status === 403 ? 'Not available' : (status === 400 ? 'Check your request' : 'Something went wrong')) %></h1>
     <p class="muted"><%= message %></p>
     <div class="hero-cta">
-      <a href="/" class="btn btn-p">Back to Home</a>
+      <% if (typeof cta !== 'undefined' && cta) { %><a href="<%= cta.href %>" class="btn btn-p"><%= cta.label %></a><% } %>
+      <a href="/" class="btn <%= (typeof cta !== 'undefined' && cta) ? 'btn-g' : 'btn-p' %>">Back to Home</a>
       <a href="/support" class="btn btn-g">Contact Support</a>
     </div>
   </div>

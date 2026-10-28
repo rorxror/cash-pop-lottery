@@ -11,12 +11,13 @@
     <table class="tbl">
       <thead><tr><th>Date</th><th>Type</th><th>Reference</th><th>Amount</th><th>Balance after</th></tr></thead>
       <tbody>
+        <% var typeLabels = { deposit: 'Deposit', deposit_revoke: 'Deposit reversed', bonus: 'Deposit bonus', bonus_revoke: 'Bonus reversed', withdrawal: 'Withdrawal', withdrawal_hold: 'Withdrawal hold', withdrawal_refund: 'Withdrawal refund', ticket_purchase: 'Lottery ticket', win: 'Lottery win', draw_refund: 'Draw refund', scratch_purchase: 'Scratch ticket', scratch_prize: 'Scratch prize', referral_commission: 'Referral commission', commission: 'Commission', adjustment: 'Adjustment', transfer_in: 'Transfer in', transfer_out: 'Transfer out' }; %>
         <% txs.forEach(function(t){ %>
         <tr>
           <td><%= new Date(t.created_at).toLocaleString() %></td>
-          <td><%= t.type %></td>
-          <td><span class="code"><%= t.ref %></span></td>
-          <td class="<%= t.amount >= 0 ? 'pos' : 'neg' %>"><%= (t.amount >= 0 ? '+' : '&minus;') + fmt(Math.abs(t.amount), t.currency) %></td>
+          <td><%= typeLabels[t.type] || String(t.type || '').replace(/_/g, ' ') %></td>
+          <td><span class="code"><%= t.ref_id || '' %></span></td>
+          <td class="<%= t.amount >= 0 ? 'pos' : 'neg' %>"><%= (t.amount >= 0 ? '+' : '-') + fmt(Math.abs(t.amount), t.currency) %></td>
           <td><%= fmt(t.balance_after, t.currency) %></td>
         </tr>
         <% }) %>
@@ -24,5 +25,8 @@
     </table>
     </div>
     <% } else { %><p class="muted">No transactions yet.</p><% } %>
+    <% if (typeof totalPages !== 'undefined' && totalPages > 1) { %>
+    <p class="mt"><% if (page > 1) { %><a class="btn btn-g btn-sm" href="/transactions?type=<%= filterType %>&page=<%= page - 1 %>">&larr; Newer</a><% } %> Page <%= page %> of <%= totalPages %> (<%= total %> transactions) <% if (page < totalPages) { %><a class="btn btn-g btn-sm" href="/transactions?type=<%= filterType %>&page=<%= page + 1 %>">Older &rarr;</a><% } %></p>
+    <% } %>
   </div>
 </section>

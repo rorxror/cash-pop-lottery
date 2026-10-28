@@ -59,10 +59,10 @@ async function boot() {
   await ensureScratchSchema(db, driver);
   console.log(`[db] ${driver} ready`);
 
-  // Self-healing demo: Render's free-tier ephemeral disk wipes SQLite on every
-  // redeploy/restart, which killed the demo admin account repeatedly ("Invalid
-  // email or password"). If no admin exists after migrations, seed the demo
-  // admin automatically so the demo login always works after a wipe.
+  // Self-healing: Render's free-tier ephemeral disk wipes SQLite on every
+  // redeploy/restart, which killed the admin account repeatedly ("Invalid
+  // email or password"). If no admin exists after migrations, seed the
+  // configured admin automatically so the admin login always works after a wipe.
   // Override with env vars: ADMIN_SEED_EMAIL / ADMIN_SEED_PASSWORD / ADMIN_SEED_NAME.
   {
     const seeded = await db.get("SELECT id FROM users WHERE role = 'admin' LIMIT 1");
@@ -89,7 +89,7 @@ async function boot() {
   // live+enabled series exists — and never re-create it: if Gold Rush already
   // exists (e.g. the operator stopped it), that choice is respected so a
   // restart can never crash on the slug UNIQUE constraint or override the
-  // operator. Same 75% RTP math as the demo series: $1 ticket, 100 tickets,
+  // operator. Standard 75% RTP math: $1 ticket, 100 tickets,
   // prizes 1x$10 + 5x$5 + 20x$2 = $75 pool. Outcomes committed via launchSeries.
   {
     const { launchSeries } = require('./lib/scratch');
@@ -170,6 +170,10 @@ async function boot() {
   app.use(async (req, res, next) => {
     try {
       req.db = db; req.driver = driver;
+      /* SCAN fix (A-11): authenticated pages are never cached — after
+         logout, the browser Back button must not re-display wallet /
+         profile / security pages from cache on a shared device. */
+      if (req.user) res.set('Cache-Control', 'no-store');
       req.settings = await getSettings(db, driver);
       req.adminPath = ADMIN_PATH;
       req.currencies = getCurrencies(req.settings);
@@ -230,7 +234,7 @@ async function boot() {
         extOn: (k) => !!(exts[k] && exts[k].enabled),
         extCfg: (k) => (exts[k] && exts[k].config) || {},
         footerPages,
-        siteName: getS(req.settings, 'site_name', 'Cash Pop'),
+        siteName: getS(req.settings, 'site_name', 'Cash Pop Lottery'),
         metaTitle: 'Home', metaDesc: '',
         currentPath: req.path,
         adminPath: ADMIN_PATH,
@@ -266,11 +270,45 @@ async function boot() {
   // session (login/register/forgot GET), so a legitimate POST carries a
   // token; a POST with no session at all must have come without visiting
   // the form first, and is refused.
+  /* BP-21: the app's only multipart form is POST /kyc (document upload).
+     The global urlencoded/json parsers skip multipart bodies, so this
+     scoped parser runs BEFORE the CSRF check for that one route: it
+     reads the raw stream (hard size cap), parses fields (incl. _csrf)
+     and the file into req.body / req.kycFile, and the standard CSRF
+     check below then applies unchanged. Parse failures leave req.body
+     empty → CSRF refuses (fail closed); file-level problems surface to
+     the handler as req.kycUploadError. */
+  const { parseMultipart: parseKycMultipart, MAX_BODY_BYTES: KYC_MAX_BODY } = require('./lib/upload');
+  app.use((req, res, next) => {
+    if (req.method !== 'POST' || req.path !== '/kyc') return next();
+    const ct = String(req.headers['content-type'] || '');
+    if (!ct.startsWith('multipart/form-data')) return next();
+    const chunks = []; let size = 0; let tooBig = false; let destroyed = false;
+    req.on('data', (c) => {
+      size += c.length;
+      /* SCAN fix (B-07): past the cap we stop BUFFERING (memory stays
+         bounded) but keep draining so a legitimate user still gets the
+         friendly error — up to a hard ceiling of 4x the cap, after
+         which the stream is destroyed outright (flood cut-off). */
+      if (size > KYC_MAX_BODY * 4 && !destroyed) { destroyed = true; req.destroy(); return; }
+      if (size > KYC_MAX_BODY) { tooBig = true; chunks.length = 0; } else if (!tooBig) chunks.push(c);
+    });
+    req.on('end', () => {
+      if (tooBig) { req.kycUploadError = 'Document is too large (maximum 5 MB).'; req.body = {}; return next(); }
+      try {
+        const parsed = parseKycMultipart(Buffer.concat(chunks), ct);
+        req.body = parsed.fields;
+        req.kycFile = parsed.file;
+      } catch (e) { req.kycUploadError = e.message; req.body = {}; }
+      next();
+    });
+    req.on('error', () => { req.body = {}; next(); });
+  });
   app.use((req, res, next) => {
     if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
     if (req.path.startsWith('/webhooks/')) return next();
     if (!req.sess) {
-      const authPaths = ['/login', '/forgot', '/register', '/login/otp/request', '/login/otp/verify'];
+      const authPaths = ['/login', '/forgot', '/register', '/login/otp/request', '/login/otp/verify', '/contact']; // SCAN fix (A-10): /contact joins the session-required set
       if (authPaths.includes(req.path)) return res.status(403).render('error', { status: 403, message: 'Security token mismatch. Please open the form first and try again.' });
       return next(); // e.g. /setup — nothing to forge against
     }

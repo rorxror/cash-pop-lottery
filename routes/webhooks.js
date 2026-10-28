@@ -149,16 +149,16 @@ router.post('/:rail', rateLimit({ windowMs: 60000, max: 60, keyFn: r => 'webhook
       }
       if (ev.action === 'payment_success' && dep.status === 'pending' && amountOk) {
         try {
-          await decideDeposit(req.db, dep.id, 'approve', null); // v17.1: webhook is not an admin; NULL, not a fake admin id 0
-          await req.db.run('UPDATE deposits SET provider_txn_id = ? WHERE id = ?', [ev.ref, dep.id]);
           const settings = await getSettings(req.db, req.driver, true);
+          await decideDeposit(req.db, dep.id, 'approve', null, settings); // v17.1: webhook is not an admin; NULL, not a fake admin id 0
+          await req.db.run('UPDATE deposits SET provider_txn_id = ? WHERE id = ?', [ev.ref, dep.id]);
           try { await releaseReferralCredits(req.db, dep.user_id, settings); } catch {}
           await audit.log(req.db, { actorId: null, actorRole: 'webhook', action: 'webhook.deposit_approved', entity: 'deposit', entityId: dep.public_id, detail: { provider: rail.key, ref: ev.ref }, ip: req.ip });
           note = 'deposit approved via webhook';
         } catch (e) { note = 'approve failed: ' + e.message; }
       } else if (ev.action === 'refund' && dep.status === 'approved' && amountOk) {
         try {
-          await decideDeposit(req.db, dep.id, 'revoke', null); // v17.1: see approve above
+          await decideDeposit(req.db, dep.id, 'revoke', null, await getSettings(req.db, req.driver, true)); // v17.1: see approve above
           await audit.log(req.db, { actorId: null, actorRole: 'webhook', action: 'webhook.deposit_revoked', entity: 'deposit', entityId: dep.public_id, detail: { provider: rail.key, ref: ev.ref }, ip: req.ip });
           note = 'deposit revoked via webhook (refund/chargeback)';
         } catch (e) { note = 'revoke failed: ' + e.message; }

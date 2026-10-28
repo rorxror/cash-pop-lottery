@@ -12,6 +12,10 @@
     </form>
   </div>
 
+  <% if (typeof result !== 'undefined' && result && result.notFound) { %>
+  <div class="card mt"><p class="flash f-err">Draw not found. Check the draw ID and try again.</p></div>
+  <% } %>
+
   <% if (typeof result !== 'undefined' && result && result.draw) { %>
   <div class="card mt">
     <div class="card-h"><h2>Verification result &mdash; draw #<%= result.draw.id %></h2></div>
@@ -19,11 +23,12 @@
       <div class="slip-line"><span>Draw</span><span><%= result.draw.draw_type %> &middot; <%= result.draw.draw_date %><%= result.draw.is_test ? ' <span class="badge b-warn">TEST</span>' : '' %></span></div>
       <div class="slip-line"><span>Published seed hash</span><span class="code"><%= result.draw.seed_hash %></span></div>
       <div class="slip-line"><span>Recomputed hash of revealed seed</span><span class="code"><%= result.recomputed_hash || '—' %></span></div>
-      <div class="slip-line"><span>Hash match</span><span><%- (result.hash_match === null || result.hash_match === undefined) ? '<span class="badge b-warn">Not settled yet</span>' : (result.hash_match ? '<span class="badge b-ok">&#10003; MATCH</span>' : '<span class="badge b-err">&#10007; MISMATCH</span>') %></span></div>
+      <div class="slip-line"><span>Hash match</span><span><%- (result.hash_match === null || result.hash_match === undefined) ? (result.state === 'cancelled' ? '<span class="badge b-err">Cancelled</span>' : '<span class="badge b-warn">Not settled yet</span>') : (result.hash_match ? '<span class="badge b-ok">&#10003; MATCH</span>' : '<span class="badge b-err">&#10007; MISMATCH</span>') %></span></div>
       <div class="slip-line"><span>Revealed seed</span><span class="code"><%= result.draw.seed || '—' %></span></div>
       <div class="slip-line"><span>Published winning number</span><span><%= (result.draw.winning_number === null || result.draw.winning_number === undefined) ? '—' : result.draw.winning_number %></span></div>
       <div class="slip-line"><span>Recomputed winning number</span><span><%= (result.recomputed_number === null || result.recomputed_number === undefined) ? '—' : result.recomputed_number %></span></div>
-      <div class="slip-line"><span>Number match</span><span><%- (result.number_match === null || result.number_match === undefined) ? '<span class="badge b-warn">Not settled yet</span>' : (result.number_match ? '<span class="badge b-ok">&#10003; MATCH</span>' : '<span class="badge b-err">&#10007; MISMATCH</span>') %></span></div>
+      <div class="slip-line"><span>Number match</span><span><%- result.number_note === 'test_override' ? '<span class="badge b-warn">TEST draw — operator-set number</span>' : ((result.number_match === null || result.number_match === undefined) ? (result.state === 'cancelled' ? '<span class="badge b-err">Cancelled — stakes refunded</span>' : '<span class="badge b-warn">Not settled yet</span>') : (result.number_match ? '<span class="badge b-ok">&#10003; MATCH</span>' : '<span class="badge b-err">&#10007; MISMATCH</span>')) %></span></div>
+      <% if (result.number_note === 'test_override') { %><p class="muted">This TEST draw's winning number was set by the operator for testing (recorded in the admin audit log at creation), so there is no derived number to recompute. The seed hash above still verifies the draw's committed seed.</p><% } %>
       <% if (result.draw.beacon_status) { %>
       <div class="slip-line"><span>Beacon</span><span>drand round <%= result.draw.beacon_round %> — <%= result.draw.beacon_status %></span></div>
       <div class="slip-line"><span>Beacon randomness</span><span class="code"><%= result.draw.beacon_randomness || '—' %></span></div>

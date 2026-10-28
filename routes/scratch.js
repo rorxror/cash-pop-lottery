@@ -6,7 +6,8 @@ const { requireLogin, requireRole, rateLimit } = require('../lib/auth');
 const { now, randHex, sha256, toMinor, decimalsFor, esc } = require('../lib/util');
 const ui = require('../lib/admin-ui');
 const { buyTicket, revealTicket, launchSeries, responsibleStatus, logEvent } = require('../lib/scratch');
-const { getCurrencies } = require('../lib/settings');
+const { getCurrencies, getS } = require('../lib/settings');
+const engine = require('../lib/prize-engine');
 const audit = require('../lib/audit');
 
 playerRouter.get('/scratch', async (req, res) => {
@@ -23,15 +24,20 @@ playerRouter.get('/scratch/my-tickets', requireLogin, async (req, res) => {
   let where = "st.status='purchased'";
   if (tab === 'scratched') where = "st.status='revealed'";
   if (tab === 'history') where = '1=1';
+  // DS-058: paginated (was a hard LIMIT 200 with no way to reach older tickets).
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const totalRow = await req.db.get(
+    `SELECT COUNT(*) AS c FROM scratch_tickets st WHERE st.user_id=? AND ${where}`, [req.user.id]);
+  const totalPages = Math.max(1, Math.ceil(Number(totalRow.c) / 25));
   const tickets = await req.db.query(
     `SELECT st.public_id,st.currency,st.price,st.status,st.prize,st.purchased_at,st.revealed_at,s.title,s.game_type
      FROM scratch_tickets st JOIN scratch_series s ON s.id=st.series_id
-     WHERE st.user_id=? AND ${where} ORDER BY st.purchased_at DESC LIMIT 200`, [req.user.id]);
+     WHERE st.user_id=? AND ${where} ORDER BY st.purchased_at DESC LIMIT 25 OFFSET ?`, [req.user.id, (page - 1) * 25]);
   const counts = await req.db.get(
     `SELECT SUM(CASE WHEN status='purchased' THEN 1 ELSE 0 END) AS unscratched,
       SUM(CASE WHEN status='revealed' THEN 1 ELSE 0 END) AS scratched, COUNT(*) AS history
      FROM scratch_tickets WHERE user_id=?`, [req.user.id]);
-  res.render('scratch_tickets', { metaTitle: 'My Scratch Tickets', metaDesc: '', tickets, counts: counts || {}, tab });
+  res.render('scratch_tickets', { metaTitle: 'My Scratch Tickets', metaDesc: '', tickets, counts: counts || {}, tab, page, totalPages });
 });
 
 playerRouter.get('/scratch/responsible-play', requireLogin, async (req, res) => {
@@ -41,6 +47,9 @@ playerRouter.get('/scratch/responsible-play', requireLogin, async (req, res) => 
 
 playerRouter.post('/scratch/responsible-play', requireLogin, async (req, res) => {
   const daily = Math.max(0, toMinor(req.body.daily_loss_limit) || 0);
+  // DS-018: player-set daily deposit limit applies immediately (a player
+  // lowering their own cap must not wait 24h for protection).
+  const depLimit = Math.max(0, toMinor(req.body.daily_deposit_limit) || 0);
   const session = Math.max(0, Math.min(1440, parseInt(req.body.session_limit_minutes, 10) || 0));
   const coolHours = Math.max(0, Math.min(720, parseInt(req.body.cooling_off_hours, 10) || 0));
   const exclusionDays = Math.max(0, Math.min(3650, parseInt(req.body.self_exclusion_days, 10) || 0));
@@ -59,11 +68,11 @@ playerRouter.post('/scratch/responsible-play', requireLogin, async (req, res) =>
   const pendD = daily < curD ? daily : null, pendS = session < curS ? session : null;
   const existing = await req.db.get('SELECT user_id FROM responsible_play WHERE user_id=?', [req.user.id]);
   if (existing) await req.db.run(
-    'UPDATE responsible_play SET daily_loss_limit=?,session_limit_minutes=?,cooling_off_until=?,self_excluded_until=?,updated_at=? WHERE user_id=?',
-    [mainD, mainS, coolingUntil, excludedUntil, now(), req.user.id]);
+    'UPDATE responsible_play SET daily_loss_limit=?,session_limit_minutes=?,daily_deposit_limit=?,cooling_off_until=?,self_excluded_until=?,updated_at=? WHERE user_id=?',
+    [mainD, mainS, depLimit, coolingUntil, excludedUntil, now(), req.user.id]);
   else await req.db.run(
-    'INSERT INTO responsible_play (user_id,daily_loss_limit,session_limit_minutes,cooling_off_until,self_excluded_until,updated_at) VALUES (?,?,?,?,?,?)',
-    [req.user.id, mainD, mainS, coolingUntil, excludedUntil, now()]);
+    'INSERT INTO responsible_play (user_id,daily_loss_limit,daily_deposit_limit,session_limit_minutes,cooling_off_until,self_excluded_until,updated_at) VALUES (?,?,?,?,?,?,?)',
+    [req.user.id, mainD, depLimit, mainS, coolingUntil, excludedUntil, now()]);
   await req.db.run('DELETE FROM responsible_play_pending WHERE user_id = ?', [req.user.id]);
   if (pendD !== null || pendS !== null) await req.db.run(
     'INSERT INTO responsible_play_pending (user_id,pending_daily_loss_limit,pending_session_limit_minutes,effective_at) VALUES (?,?,?,?)',
@@ -100,9 +109,26 @@ playerRouter.post('/scratch/ticket/:publicId/reveal', requireLogin,
   async (req, res) => {
     try {
       await revealTicket(req.db, req.user.id, req.params.publicId);
+      // DS-027: scratch wins sent no notification on any channel (the win
+      // templates only ever fired for lottery draws). Attempt all three;
+      // notify.send logs each attempt to the outbox and never throws.
+      try {
+        const t = await req.db.get('SELECT * FROM scratch_tickets WHERE public_id = ?', [req.params.publicId]);
+        if (t && Number(t.prize) > 0) {
+          const notify = require('../lib/notify');
+          const vars = { name: req.user.name, amount: req.fmt(t.prize, t.currency), ticket: t.public_id };
+          if (req.user.email && await notify.emailPrefEnabled(req.db, req.user.id, 'win')) await notify.send(req.db, req.settings, 'email', 'win', req.user.email, vars);
+          if (req.user.phone) await notify.send(req.db, req.settings, 'sms', 'win', req.user.phone, vars);
+          await notify.send(req.db, req.settings, 'push', 'win', String(req.user.id), vars);
+        }
+      } catch (e) { console.error('[scratch/reveal] win notify failed:', e.message); }
       res.redirect('/scratch/ticket/' + encodeURIComponent(req.params.publicId));
     } catch (e) {
-      res.status(400).render('error', { status: 400, message: e.message });
+      // DS-076: never pass raw engine errors to players (a commitment
+      // mismatch used to be shown verbatim). Log the real error server-side.
+      console.error('[scratch/reveal] failed:', e.message);
+      const msg = /not found/i.test(e.message) ? 'Scratch ticket not found.' : 'This ticket could not be revealed. Please contact support.';
+      res.status(400).render('error', { status: 400, message: msg });
     }
   });
 
@@ -170,17 +196,21 @@ adminRouter.get('/', async (req, res) => {
       (SELECT COALESCE(SUM(prize),0) FROM scratch_tickets t WHERE t.series_id=s.id AND t.status='revealed') AS paid,
       (SELECT COALESCE(SUM(amount*quantity),0) FROM scratch_prize_tiers p WHERE p.series_id=s.id) AS prize_pool
      FROM scratch_series s ORDER BY s.created_at DESC`);
-  const fmt = (minor, cur) => (Number(minor || 0) / 100).toFixed(2) + ' ' + (cur || 'USD');
+  const fmt = (minor, cur) => { const dec = decimalsFor(cur || 'USD', getCurrencies(req.settings)); return (Number(minor || 0) / Math.pow(10, dec)).toFixed(dec) + ' ' + (cur || 'USD'); }; // SCAN fix (C-12): honour the currency's real decimals
   const base = req.adminPath + '/scratch';
   const body = ui.card('Scratch series', ui.table(['Title', 'Game', 'Price', 'Sold / total', 'Revenue', 'Paid out', 'Prize pool', 'Status', 'Enabled', 'Actions'],
     series.map(s => [
       esc(s.title), esc(s.game_type), fmt(s.price, s.currency), `${s.sold} / ${s.total_tickets}`,
       fmt(s.revenue, s.currency), fmt(s.paid, s.currency), fmt(s.prize_pool, s.currency),
       ui.statusBadge(s.status), s.enabled ? ui.badge('on', 'ok') : ui.badge('off', 'muted'),
+      /* SCAN fix (C-13): actions render only for the statuses where
+         they can succeed (Launch=draft, Toggle/Stop=live) — the old
+         unconditional buttons were guaranteed errors or silent no-ops
+         on the other rows. */
       `<a class="btn btn-sm" href="${base}/${s.id}">Detail</a>
-       <form method="POST" action="${base}/${s.id}/launch" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm" data-confirm="Launch this series? Outcomes lock on launch.">Launch</button></form>
-       <form method="POST" action="${base}/${s.id}/toggle" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm">${s.enabled ? 'Disable' : 'Enable'}</button></form>
-       <form method="POST" action="${base}/${s.id}/stop" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm btn-d" data-confirm="Stop this series?">Stop</button></form>`,
+       ${s.status === 'draft' ? `<form method="POST" action="${base}/${s.id}/launch" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm">Launch</button></form>` : ''}
+       ${s.status === 'live' ? `<form method="POST" action="${base}/${s.id}/toggle" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm">${s.enabled ? 'Disable' : 'Enable'}</button></form>
+       <form method="POST" action="${base}/${s.id}/stop" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm btn-d">Stop</button></form>` : ''}`,
     ]))) +
     ui.card('Create series', `<p class="muted">New series start as drafts. Review the payout math, then launch — outcomes lock on launch and are provably fair.</p>` +
       ui.formHtml(base + '/create', [
@@ -192,8 +222,90 @@ adminRouter.get('/', async (req, res) => {
         { key: 'total_tickets', label: 'Total tickets', type: 'number', required: true },
         { key: 'tiers', label: 'Prize tiers (one per line: amount:quantity:label)', type: 'textarea', required: true },
         { key: 'rules', label: 'Rules', type: 'textarea' },
-      ], { csrf: req.csrfToken, submit: 'Create draft' }));
+        { key: 'launch_at', label: 'Auto-launch at (optional, UTC e.g. 2026-11-01 10:00)', type: 'text' },
+        { key: 'ends_at', label: 'Auto-stop at (optional, UTC e.g. 2026-12-01 10:00)', type: 'text' },
+      ], { csrf: req.csrfToken, submit: 'Create draft' })) +
+    ui.card('Prize Pool Planner (BP-23)', `<p class="muted">Set a price, an inventory and a target RTP — the planner generates a tier table whose total prize liability matches the target (see the rounding note on the preview). The plan creates a DRAFT: review it, hand-tune tiers via the series page if you like, then launch. Outcomes stay predetermined and committed at launch, exactly as with a hand-built series.</p>` +
+      ui.formHtml(base + '/planner/preview', [
+        { key: 'title', label: 'Title', type: 'text', required: true },
+        { key: 'game_type', label: 'Game type', type: 'select', options: ['single', 'match3', 'six', 'bonus'] },
+        { key: 'currency', label: 'Currency', type: 'text', value: 'USD' },
+        { key: 'price', label: 'Ticket price (major units, e.g. 1.00)', type: 'text', required: true },
+        { key: 'total_tickets', label: 'Total tickets', type: 'number', required: true },
+        { key: 'target_rtp', label: 'Target RTP % (e.g. 75)', type: 'text', value: getS(req.settings, 'scratch_planner_target_rtp', '75'), required: true },
+      ], { csrf: req.csrfToken, submit: 'Preview plan' }));
   res.send(ui.layout({ adminPath: req.adminPath, section: '/scratch', title: 'Scratch', body, csrf: req.csrfToken, flash: req.flashData || {}, assetV: req.app.locals.assetV || '1' }));
+});
+
+/* BP-23(a): Prize Pool Planner — preview the generated tier table and
+   the projected margins BEFORE anything is created, then create the
+   draft with one click. The plan is recomputed server-side at create
+   time from the same inputs (deterministic), never trusted from the
+   form. Creating a draft does not launch it. */
+function plannerInputs(req) {
+  const title = String(req.body.title || '').trim().slice(0, 120);
+  const gameType = ['single', 'match3', 'six', 'bonus'].includes(req.body.game_type) ? req.body.game_type : 'single';
+  const currency = String(req.body.currency || 'USD').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 8);
+  if (!getCurrencies(req.settings).some(c => c.code === currency)) throw new Error('Currency must be one of the configured currencies (Settings → Currencies).');
+  const price = toMinor(req.body.price, decimalsFor(currency, getCurrencies(req.settings)));
+  const totalTickets = parseInt(String(req.body.total_tickets || ''), 10);
+  const targetRtpPct = parseFloat(String(req.body.target_rtp || ''));
+  if (!title) throw new Error('Title is required.');
+  if (!price || price < 1) throw new Error('Ticket price is required.');
+  return { title, gameType, currency, price, totalTickets, targetRtpPct };
+}
+adminRouter.post('/planner/preview', async (req, res) => {
+  try {
+    const inp = plannerInputs(req);
+    const plan = engine.planPrizePool(inp);
+    if (!plan.ok) throw new Error(plan.error);
+    const fmt = (minor) => (Number(minor || 0) / Math.pow(10, decimalsFor(inp.currency, getCurrencies(req.settings)))).toFixed(decimalsFor(inp.currency, getCurrencies(req.settings))) + ' ' + inp.currency;
+    const base = req.adminPath + '/scratch';
+    const body = ui.card(`Prize plan — ${esc(inp.title)}`,
+      `<p class="muted">Target RTP ${inp.targetRtpPct}% → target liability ${fmt(plan.targetLiability)}. Achieved liability ${fmt(plan.liability)} (achieved RTP ${plan.achievedRtpPct.toFixed(2)}%)${plan.unallocated ? ` — ${fmt(plan.unallocated)} unallocated (smaller than one ticket price after exact fill).` : ' — exact.'} Winning tickets: ${plan.winners} of ${inp.totalTickets}; the rest win nothing. Projected operator margin assumes random sale order (expected payout scales with sell-through).</p>` +
+      ui.table(['Prize', 'Quantity', 'Tier liability'], plan.tiers.map(t => [fmt(t.amount), t.quantity, fmt(t.amount * t.quantity)])) +
+      ui.table(['Projection', 'Gross sales', 'Expected payout', 'Projected margin'], [100, 50, 25].map(pct => [
+        `Sell-through ${pct}%`, fmt(plan.gross * pct / 100), fmt(plan.liability * pct / 100), fmt(plan.marginAt(pct)),
+      ])) +
+      `<form method="POST" action="${base}/planner/create" class="adm-form">
+        <input type="hidden" name="_csrf" value="${req.csrfToken}">
+        <input type="hidden" name="title" value="${esc(inp.title)}">
+        <input type="hidden" name="game_type" value="${esc(inp.gameType)}">
+        <input type="hidden" name="currency" value="${esc(inp.currency)}">
+        <input type="hidden" name="price" value="${esc(String(req.body.price))}">
+        <input type="hidden" name="total_tickets" value="${inp.totalTickets}">
+        <input type="hidden" name="target_rtp" value="${inp.targetRtpPct}">
+        <div class="mt"><button class="btn btn-p" type="submit">Create draft series with this plan</button>
+        <a class="btn" href="${base}">Cancel</a></div>
+      </form>`);
+    res.send(ui.layout({ adminPath: req.adminPath, section: '/scratch', title: 'Scratch — prize plan', body, csrf: req.csrfToken, flash: req.flashData || {}, assetV: req.app.locals.assetV || '1' }));
+  } catch (e) {
+    res.status(400).render('error', { status: 400, message: e.message });
+  }
+});
+adminRouter.post('/planner/create', async (req, res) => {
+  try {
+    const inp = plannerInputs(req);
+    const plan = engine.planPrizePool(inp);
+    if (!plan.ok) throw new Error(plan.error);
+    const slugBase = inp.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60) || 'series';
+    const slug = slugBase + '-' + now().toString(36);
+    const seed = randHex(32);
+    const created = await req.db.transaction(async (tx) => {
+      const r = await tx.run(
+        `INSERT INTO scratch_series (title,slug,game_type,currency,price,total_tickets,status,enabled,rules,server_seed,seed_hash,created_by,created_at)
+         VALUES (?,?,?,?,?,?,'draft',0,'',?,?,?,?)`,
+        [inp.title, slug, inp.gameType, inp.currency, inp.price, inp.totalTickets, seed, sha256(seed), req.user.id, now()]);
+      for (const tier of plan.tiers) await tx.run('INSERT INTO scratch_prize_tiers (series_id,amount,quantity,label) VALUES (?,?,?,?)', [r.id, tier.amount, tier.quantity, 'Planner prize']);
+      return r.id;
+    });
+    await logEvent(req.db, req.user.id, 'series.planned', 'series', created, { targetRtp: inp.targetRtpPct, liability: plan.liability, achievedRtpPct: Math.round(plan.achievedRtpPct * 100) / 100 });
+    await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'scratch.series_planned', entity: 'series', entityId: created, detail: { title: inp.title, targetRtp: inp.targetRtpPct, liability: plan.liability, totalTickets: inp.totalTickets }, ip: req.ip });
+    await req.setFlash('success', 'Planned series created as a draft. Review it, then launch.');
+    res.redirect(req.adminPath + '/scratch/' + created);
+  } catch (e) {
+    res.status(400).render('error', { status: 400, message: e.message });
+  }
 });
 
 /* v16: series detail — the inventory dashboard the list page never had.
@@ -220,7 +332,7 @@ adminRouter.get('/:id', async (req, res) => {
        (SELECT COALESCE(SUM(prize),0) FROM scratch_tickets t WHERE t.series_id=? AND t.status='revealed') AS paid,
        (SELECT COALESCE(SUM(amount*quantity),0) FROM scratch_prize_tiers p WHERE p.series_id=?) AS prize_pool`,
     [series.id, series.id, series.id, series.id, series.id]);
-  const fmt = (minor, cur) => (Number(minor || 0) / 100).toFixed(2) + ' ' + (cur || 'USD');
+  const fmt = (minor, cur) => { const dec = decimalsFor(cur || 'USD', getCurrencies(req.settings)); return (Number(minor || 0) / Math.pow(10, dec)).toFixed(dec) + ' ' + (cur || 'USD'); }; // SCAN fix (C-12): honour the currency's real decimals
   const gross = Number(series.price) * Number(series.total_tickets);
   const theoretical = gross > 0 ? (Number(st.prize_pool) / gross * 100) : 0;
   const live = Number(st.revenue) > 0 ? (Number(st.paid) / Number(st.revenue) * 100) : 0;
@@ -282,10 +394,12 @@ adminRouter.post('/create', async (req, res) => {
     if (tiers.reduce((n, t) => n + t.quantity, 0) > totalTickets) throw new Error('Prize quantities exceed total inventory.');
     const seed = randHex(32);
     const created = await req.db.transaction(async tx => {
+      const parseWhen = (v) => { const t = Date.parse(String(v || '').trim().replace(' ', 'T') + (String(v || '').includes('Z') ? '' : 'Z')); return Number.isFinite(t) && String(v || '').trim() ? t : null; };
+      const launchAt = parseWhen(req.body.launch_at), endsAt = parseWhen(req.body.ends_at);
       const r = await tx.run(
-        `INSERT INTO scratch_series (title,slug,game_type,currency,price,total_tickets,status,enabled,rules,server_seed,seed_hash,created_by,created_at)
-         VALUES (?,?,?,?,?,?,'draft',0,?,?,?,?,?)`,
-        [title, slug, gameType, currency, price, totalTickets, String(req.body.rules || '').slice(0, 2000), seed, sha256(seed), req.user.id, now()]);
+        `INSERT INTO scratch_series (title,slug,game_type,currency,price,total_tickets,status,enabled,rules,server_seed,seed_hash,created_by,created_at,launch_at,ends_at)
+         VALUES (?,?,?,?,?,?,'draft',0,?,?,?,?,?,?,?)`,
+        [title, slug, gameType, currency, price, totalTickets, String(req.body.rules || '').slice(0, 2000), seed, sha256(seed), req.user.id, now(), launchAt, endsAt]);
       for (const tier of tiers) await tx.run('INSERT INTO scratch_prize_tiers (series_id,amount,quantity,label) VALUES (?,?,?,?)', [r.id, tier.amount, tier.quantity, tier.label]);
       return r.id;
     });
@@ -302,6 +416,18 @@ adminRouter.post('/create', async (req, res) => {
 
 adminRouter.post('/:id/launch', async (req, res) => {
   try {
+    // BP-23 launch cap (when guardrails are on): refuse a launch whose
+    // total prize liability exceeds the admin's cap % of sales value.
+    const srow = await req.db.get('SELECT * FROM scratch_series WHERE id = ?', [parseInt(req.params.id, 10)]);
+    if (srow) {
+      const expo = await engine.seriesExposure(req.db, srow);
+      const cap = engine.launchCapCheck(req.settings, srow, expo.totalLiability);
+      if (cap.enforced && !cap.ok) {
+        await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'scratch.guardrail_launch_blocked', entity: 'series', entityId: String(srow.id), detail: { liability: cap.liability, cap: cap.cap, capPct: cap.capPct }, ip: req.ip });
+        await req.setFlash('error', `Launch refused by the BP-23 guardrail: prize liability ${cap.liability} exceeds the cap of ${cap.capPct}% of full sales value (${cap.cap}). Lower the tiers or raise the cap in Automation → Scratch guardrails.`);
+        return res.redirect(req.adminPath + '/scratch');
+      }
+    }
     await launchSeries(req.db, parseInt(req.params.id, 10), req.user.id);
     await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'scratch.series_launched', entity: 'series', entityId: req.params.id, detail: {}, ip: req.ip });
     await req.setFlash('success', 'Series launched with locked shuffled outcomes.');

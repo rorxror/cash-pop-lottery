@@ -23,5 +23,5 @@
     <% } %>
   </div>
   <% if (typeof totalPages !== 'undefined' && totalPages > 1) { %><p class="muted center"><% if (page > 1) { %><a href="/results?page=<%= page - 1 %><%= filterType ? '&type=' + filterType : '' %>">← Previous</a> <% } %>Page <%= page %> of <%= totalPages %><% if (page < totalPages) { %> <a href="/results?page=<%= page + 1 %><%= filterType ? '&type=' + filterType : '' %>">Next →</a><% } %></p><% } %>
-  <p class="muted mt">Draws marked <span class="badge b-warn">TEST</span> are operator test draws and are excluded from payouts. Every result can be independently verified on the <a href="/fairness">Fairness</a> page.</p>
+  <p class="muted mt">Every result can be independently verified on the <a href="/fairness">Fairness</a> page.</p>
 </section>

@@ -4,7 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <title><%= metaTitle ? metaTitle : siteName %> | <%= siteName %></title>
-<meta name="description" content="<%= S('metaDesc') %>">
+<meta name="description" content="<%= typeof metaDesc !== 'undefined' && metaDesc ? metaDesc : siteName %>">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/style.css?v=<%= assetV %>">
 <script src="/app.js?v=<%= assetV %>" defer></script>
 <% if (S('custom_css')) { %><style><%- S('custom_css') %></style><% } %>
@@ -17,12 +18,12 @@ gtag('js', new Date());
 gtag('config', '<%= extCfg('google_analytics').tracking_id %>');
 </script>
 <% } %>
+</head>
+<body>
 <% if (extOn('fb_comments')) { %>
 <div id="fb-root"></div>
 <script async defer crossorigin="anonymous" src="https://connect.facebook.net/en_US/sdk.js#xfbml=1&version=v21.0"></script>
 <% } %>
-</head>
-<body>
 <% if (typeof impersonating !== 'undefined' && impersonating) { %>
 <div class="impersonate-bar">Staff view &mdash; acting as <%= user.name %> (admin: <%= impersonatorName %>)</div>
 <% } %>
@@ -31,11 +32,11 @@ gtag('config', '<%= extCfg('google_analytics').tracking_id %>');
     <a class="logo" href="/"><%= siteName %></a>
     <button class="nav-toggle" id="navToggle" aria-label="Toggle menu" aria-expanded="false">&#9776;</button>
     <nav class="main-nav" id="mainNav">
-      <a href="/" class="<%= S('currentPath')==='/' ? 'active' : '' %>">Home</a>
-      <a href="/play" class="<%= S('currentPath')==='/play' ? 'active' : '' %>">Play</a>
-      <a href="/scratch" class="<%= String(S('currentPath')).startsWith('/scratch') ? 'active' : '' %>">Scratch</a>
-      <a href="/results" class="<%= S('currentPath')==='/results' ? 'active' : '' %>">Results</a>
-      <a href="/fairness" class="<%= S('currentPath')==='/fairness' ? 'active' : '' %>">Fairness</a>
+      <a href="/" class="<%= currentPath==='/' ? 'active' : '' %>">Home</a>
+      <a href="/play" class="<%= currentPath==='/play' ? 'active' : '' %>">Play</a>
+      <a href="/scratch" class="<%= String(currentPath).startsWith('/scratch') ? 'active' : '' %>">Scratch</a>
+      <a href="/results" class="<%= currentPath==='/results' ? 'active' : '' %>">Results</a>
+      <a href="/fairness" class="<%= currentPath==='/fairness' ? 'active' : '' %>">Fairness</a>
       <a href="/page/how-it-works">How It Works</a>
       <a href="/page/faq">FAQ</a>
       <a href="/support">Support</a>
@@ -77,6 +78,7 @@ gtag('config', '<%= extCfg('google_analytics').tracking_id %>');
           <a href="/profile">Profile</a>
           <a href="/security">Security</a>
           <a href="/support">Support</a>
+          <a href="/announcements">Announcements</a>
           <% if (typeof isAgent !== 'undefined' && isAgent) { %><a href="/agent">Agent Panel</a><% } %>
           <form action="/logout" method="POST"><input type="hidden" name="_csrf" value="<%= csrf %>"><button type="submit" class="link-btn">Logout</button></form>
         </div>
@@ -112,6 +114,7 @@ gtag('config', '<%= extCfg('google_analytics').tracking_id %>');
         <li><a href="/results">Results</a></li>
         <li><a href="/fairness">Fairness</a></li>
         <li><a href="/support">Support</a></li>
+        <li><a href="/contact">Contact us</a></li>
       </ul>
     </div>
     <div class="foot-col"><%- content('footer_contact') %></div>

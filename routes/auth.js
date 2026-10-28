@@ -125,7 +125,16 @@ router.post('/login', loginLimiter, async (req, res) => {
     metaTitle: 'Sign In', metaDesc: 'Sign in to your account.',
     totpRequired: !!req.sessionData.pending_user_id, emailPrefill: req.body.email || '',
     captchaHtml: await captchaHtml(req), recaptchaHtml: await recaptchaHtml(req),
+    // DS-045: pass the SAME method vars as GET /login - the re-render after
+    // a failed attempt used to drop the Facebook button and the OTP UI.
+    phoneCountries: require('../lib/phone-countries').allowedCountries(req.settings),
     googleOn: getBool(req.settings, 'google_oauth_enabled', false) && !!process.env.GOOGLE_CLIENT_ID,
+    facebookOn: getBool(req.settings, 'facebook_oauth_enabled', false) && !!process.env.FACEBOOK_APP_ID,
+    phoneOtpOn: getBool(req.settings, 'phone_otp_enabled', false),
+    emailOtpOn: getBool(req.settings, 'email_otp_enabled', false),
+    passwordOn: getBool(req.settings, 'password_login_enabled', true),
+    phonePwOn: getBool(req.settings, 'password_login_enabled', true),
+    emailPwOn: getBool(req.settings, 'password_login_enabled', true),
     formError: vars.formError,
   });
   // R-002: the TOTP second step is exempt from the captcha re-check — the
@@ -145,7 +154,16 @@ router.post('/login', loginLimiter, async (req, res) => {
       const fails = await req.db.get('SELECT COUNT(*) AS c FROM login_history WHERE user_id = ? AND success = 0 AND created_at > ?', [u.id, now() - 15 * 60 * 1000]);
       if (fails && Number(fails.c) >= 10) return render({ formError: 'Too many failed sign-in attempts. Please wait 15 minutes and try again.' });
     } catch { return render({ formError: 'Sign-in temporarily unavailable. Please try again.' }); }
-    let ok = verifyTotp(u.totp_secret, req.body.totp_code);
+    // RT-01: a TOTP code is one-time. Claim its time-step with a guarded
+    // UPDATE - a replayed code (step <= last accepted) and a parallel
+    // duplicate both fail the claim and fall through to backup codes.
+    const { verifyTotpStep } = require('../lib/auth');
+    let ok = false;
+    const matchedStep = verifyTotpStep(u.totp_secret, req.body.totp_code);
+    if (matchedStep !== null && matchedStep > Number(u.totp_last_step == null ? -1 : u.totp_last_step)) {
+      const claim = await req.db.run('UPDATE users SET totp_last_step = ? WHERE id = ? AND COALESCE(totp_last_step, -1) < ?', [matchedStep, u.id, matchedStep]);
+      if (claim.changes === 1) ok = true;
+    }
     let usedBackup = false;
     if (!ok && u.backup_codes) {
       const remaining = useBackupCode(u.backup_codes, req.body.totp_code);
@@ -252,7 +270,7 @@ router.post('/logout', async (req, res) => {
    sign-in is for returning players. No merged/OTP-first confusion. */
 router.get('/register', async (req, res) => {
   if (!getBool(req.settings, 'registration_enabled', true))
-    return res.status(403).render('error', { status: 403, message: 'Registration is currently disabled.' });
+    return res.status(403).render('error', { status: 403, message: 'Registration is currently closed.' });
   if (req.user) return res.redirect('/');
   await anonSession(req, res); // R-036: anon session for CSRF on every logged-out form
   const { allowedCountries } = require('../lib/phone-countries');
@@ -263,6 +281,7 @@ router.get('/register', async (req, res) => {
     otpEnabled: getBool(req.settings, 'otp_registration', false),
     captchaHtml: await captchaHtml(req), recaptchaHtml: await recaptchaHtml(req),
     googleOn: getBool(req.settings, 'google_oauth_enabled', false) && !!process.env.GOOGLE_CLIENT_ID,
+    facebookOn: getBool(req.settings, 'facebook_oauth_enabled', false) && !!process.env.FACEBOOK_APP_ID,
   });
 });
 
@@ -280,15 +299,37 @@ async function consumeOtpCode(db, code) {
 }
 
 router.post('/register', rateLimit({ windowMs: 3600000, max: 20, keyFn: r => 'reg:' + r.ip }), async (req, res) => {
+  /* SCAN fix (A-01): the error re-render must carry everything the GET
+     render passes — without phoneCountries the country-code dropdown
+     rendered EMPTY after any validation error (phone unenterable),
+     without refCode the referral was silently dropped, and without
+     `old` every typed field had to be re-entered. */
+  const { allowedCountries } = require('../lib/phone-countries');
   const render = async (formError) => res.render('register', {
     metaTitle: 'Create Account', metaDesc: '', formError,
+    phoneCountries: allowedCountries(req.settings),
+    refCode: String(typeof req.body.ref === 'string' ? req.body.ref : '').trim().toUpperCase(),
+    old: {
+      name: typeof req.body.name === 'string' ? req.body.name : '',
+      email: typeof req.body.email === 'string' ? req.body.email : '',
+      phone_cc: typeof req.body.phone_cc === 'string' ? req.body.phone_cc : '',
+      phone_local: typeof req.body.phone_local === 'string' ? req.body.phone_local : '',
+    },
     otpEnabled: getBool(req.settings, 'otp_registration', false),
-    captchaHtml: await captchaHtml(req), recaptchaHtml: await recaptchaHtml(req), googleOn: false,
+    captchaHtml: await captchaHtml(req), recaptchaHtml: await recaptchaHtml(req),
+    googleOn: getBool(req.settings, 'google_oauth_enabled', false) && !!process.env.GOOGLE_CLIENT_ID,
+    facebookOn: getBool(req.settings, 'facebook_oauth_enabled', false) && !!process.env.FACEBOOK_APP_ID,
   });
   if (!getBool(req.settings, 'registration_enabled', true)) return res.status(403).render('error', { status: 403, message: 'Registration is currently disabled.' });
   if (!(await verifyCaptcha(req))) return render('Captcha verification failed.');
 
-  const { name, email, password, password_confirm, otp_code, agree } = req.body;
+  /* SCAN fix (B-08): qs parsing turns name[x]=1 into an object — coerce
+     every text field to a string up front so .trim()/.length below can
+     never throw a 500 on type-confused input. */
+  const strField = (v) => (typeof v === 'string' ? v : '');
+  const name = strField(req.body.name), email = strField(req.body.email);
+  const password = strField(req.body.password), password_confirm = strField(req.body.password_confirm), otp_code = strField(req.body.otp_code);
+  const agree = req.body.agree;
   // Phone = dial code + local number (combined client-side; recombine server-side as fallback)
   // Canonicalized: the same number in any spelling (+1 555..., +1555...) is one identity.
   let phone = String(req.body.phone || '').trim();
@@ -327,7 +368,7 @@ router.post('/register', rateLimit({ windowMs: 3600000, max: 20, keyFn: r => 're
     if (exPhone) return render('An account with this phone number already exists.');
   }
   if (getBool(req.settings, 'otp_registration', false)) {
-    if (!otp_code || !(await consumeOtpCode(req.db, otp_code))) return render('Invalid or expired signup code. Ask the operator for a valid code.');
+    if (!otp_code || !(await consumeOtpCode(req.db, otp_code))) return render('Invalid or expired signup code. Ask support for a valid code.');
   }
 
   // Referral: ?ref=CODE on the register link credits the referrer (ViserLab-style)
@@ -344,6 +385,9 @@ router.post('/register', rateLimit({ windowMs: 3600000, max: 20, keyFn: r => 're
   await req.db.run('UPDATE users SET referral_code = ? WHERE id = ?', ['CP' + r.id.toString(36).toUpperCase(), r.id]);
   const u = await req.db.get('SELECT * FROM users WHERE id = ?', [r.id]);
   await audit.log(req.db, { actorId: u.id, actorRole: 'player', action: 'user.register', entity: 'user', entityId: u.id, detail: { email: emailLc, terms_accepted_at: agree ? now() : null }, ip: req.ip });
+  // SMART-ADMIN bonus engine: signup-trigger campaigns (grant failure must
+  // never break registration itself).
+  try { await require('../lib/bonus').onSignup(req.db, req.settings, u.id); } catch {}
   // Device/IP duplicate detection (v14): flags only, never blocks.
   try {
     const { checkSharedDevice } = require('../lib/flags');
@@ -367,7 +411,10 @@ router.post('/forgot', rateLimit({ windowMs: 3600000, max: 10, keyFn: r => 'forg
     const token = randHex(24);
     await req.db.run('INSERT INTO password_resets (user_id, token_hash, expires_at, used, created_at) VALUES (?, ?, ?, 0, ?)',
       [u.id, sha256('reset:' + token), now() + 3600000, now()]);
-    const link = (process.env.BASE_URL || '') + '/reset/' + token;
+    /* SCAN fix (A-09): same host fallback as the verify-email flow —
+       without BASE_URL the old link was a bare relative path and the
+       reset email was unusable. */
+    const link = (process.env.BASE_URL || (req.protocol + '://' + req.get('host'))) + '/reset/' + token;
     await notify.send(req.db, req.settings, 'email', 'password_reset', email, { name: u.name, link }).catch(() => {});
   }
   res.render('forgot', { metaTitle: 'Reset Password', metaDesc: '', sent: true });
@@ -390,8 +437,12 @@ router.post('/reset/:token', loginLimiter, async (req, res) => { // R-091: reset
     if (await isBreached(req.body.password))
       return res.render('reset', { metaTitle: 'Set New Password', metaDesc: '', token: req.params.token, formError: 'This password has appeared in a data breach. Please choose a different one.' });
   }
+  // RT-05: claim the token FIRST with a used=0 guard. Two parallel POSTs
+  // with the same token both used to succeed (last writer won); now only
+  // the request whose guarded UPDATE lands may change the password.
+  const claim = await req.db.run('UPDATE password_resets SET used = 1 WHERE id = ? AND used = 0', [pr.id]);
+  if (claim.changes !== 1) return res.status(400).render('error', { status: 400, message: 'This reset link is invalid or expired.' });
   await req.db.run('UPDATE users SET password_hash = ? WHERE id = ?', [hashPassword(req.body.password), pr.user_id]);
-  await req.db.run('UPDATE password_resets SET used = 1 WHERE id = ?', [pr.id]);
   // R-030: a successful reset also burns every other outstanding token.
   await req.db.run('UPDATE password_resets SET used = 1 WHERE user_id = ? AND used = 0', [pr.user_id]);
   const { destroyUserSessions } = require('../lib/auth');
@@ -436,9 +487,9 @@ router.post('/login/otp/request', loginLimiter, async (req, res) => {
     return res.status(400).json({ ok: false, error: 'Enter a valid phone number.' });
   // Fail closed: OTP login is OFF unless the admin explicitly enabled it.
   if (idType === 'phone' && !getBool(req.settings, 'phone_otp_enabled', false))
-    return res.status(400).json({ ok: false, error: 'Phone login is disabled.' });
+    return res.status(400).json({ ok: false, error: 'Phone sign-in is unavailable right now.' });
   if (idType === 'email' && !getBool(req.settings, 'email_otp_enabled', false))
-    return res.status(400).json({ ok: false, error: 'Email login is disabled.' });
+    return res.status(400).json({ ok: false, error: 'Email sign-in is unavailable right now.' });
   // R-009 (account half): when registration is disabled, OTP codes go only
   // to identifiers tied to an existing account — no pumping arbitrary
   // phones/emails at operator cost.
@@ -481,7 +532,7 @@ router.post('/login/otp/verify', loginLimiter, async (req, res) => {
   let isNew = false;
   if (!u) {
     if (!getBool(req.settings, 'registration_enabled', true))
-      return res.status(403).json({ ok: false, error: 'Registration is disabled.' });
+      return res.status(403).json({ ok: false, error: 'Registration is currently closed.' });
     // Phone-only accounts have no real email. The email column is UNIQUE + NOT NULL,
     // so a second phone-only account used to crash on ''. Use an unroutable,
     // phone-derived placeholder instead (unique by construction: the phone itself
@@ -497,10 +548,15 @@ router.post('/login/otp/verify', loginLimiter, async (req, res) => {
   // OTP login must be exactly as strict as password login: staff accounts
   // never log in by OTP, blocked/pending accounts stay out, and accounts
   // with authenticator 2FA must use password + TOTP (no 2FA bypass via OTP).
-  if (u.role !== 'player') return res.status(403).json({ ok: false, error: 'Staff accounts cannot sign in with a code. Use your password.' });
-  if (u.status === 'banned') { await recordLogin(req, u.id, identifier, false); return res.status(403).json({ ok: false, error: 'This account has been blocked. Contact support.' }); }
-  if (u.status === 'pending_review') { await recordLogin(req, u.id, identifier, false); return res.status(403).json({ ok: false, error: 'Your account is pending review.' }); }
-  if (u.totp_secret) { await recordLogin(req, u.id, identifier, false); return res.status(403).json({ ok: false, error: 'This account has two-factor authentication enabled. Please sign in with your password.' }); }
+  // DS-040: ONE generic refusal for every non-eligible case. The old
+  // distinct messages enumerated whether the identifier was staff, banned,
+  // pending review, or 2FA-enrolled (password path fixed in R-027; this
+  // path was not). The real outcome stays server-side via recordLogin.
+  const otpRefusal = 'Sign-in could not be completed with a code. Please sign in with your password, or contact support if you need help.';
+  if (u.role !== 'player') return res.status(403).json({ ok: false, error: otpRefusal });
+  if (u.status === 'banned') { await recordLogin(req, u.id, identifier, false); return res.status(403).json({ ok: false, error: otpRefusal }); }
+  if (u.status === 'pending_review') { await recordLogin(req, u.id, identifier, false); return res.status(403).json({ ok: false, error: otpRefusal }); }
+  if (u.totp_secret) { await recordLogin(req, u.id, identifier, false); return res.status(403).json({ ok: false, error: otpRefusal }); }
   await recordLogin(req, u.id, identifier, true);
   // NEW USER: details are NOT lost — collect name + terms before full login (registration step preserved)
   if (isNew) {
@@ -567,7 +623,7 @@ router.post('/login/complete-profile', async (req, res) => {
 router.get('/auth/facebook', async (req, res) => {
   const id = process.env.FACEBOOK_APP_ID;
   if (!getBool(req.settings, 'facebook_oauth_enabled', false) || !id)
-    return res.status(503).render('error', { status: 503, message: 'Facebook sign-in is not configured yet.' });
+    return res.status(503).render('error', { status: 503, message: 'Facebook sign-in is unavailable right now. Please try again later.' });
   const redirect = encodeURIComponent((process.env.BASE_URL || '') + '/auth/facebook/callback');
   const state = randHex(12);
   // v16: ALWAYS store the state, even for logged-out visitors. The old code
@@ -586,10 +642,10 @@ router.get('/auth/facebook/callback', async (req, res) => {
     if (!req.sessionData.oauth_state || req.query.state !== req.sessionData.oauth_state) throw new Error('bad state');
     if (req.sess) await require('../lib/auth').touchSession(req.db, req.sess.id, { oauth_state: null });
     const redirect = (process.env.BASE_URL || '') + '/auth/facebook/callback';
-    const tok = await fetch(`https://graph.facebook.com/v18.0/oauth/access_token?client_id=${id}&client_secret=${secret}&redirect_uri=${encodeURIComponent(redirect)}&code=${req.query.code}`);
+    const tok = await fetch(`https://graph.facebook.com/v18.0/oauth/access_token?client_id=${id}&client_secret=${secret}&redirect_uri=${encodeURIComponent(redirect)}&code=${req.query.code}`, { signal: AbortSignal.timeout(8000) }); // DS-015: provider calls need a deadline
     const tj = await tok.json();
     if (!tj.access_token) throw new Error('token exchange failed');
-    const me = await fetch(`https://graph.facebook.com/me?fields=id,name,email&access_token=${tj.access_token}`);
+    const me = await fetch(`https://graph.facebook.com/me?fields=id,name,email&access_token=${tj.access_token}`, { signal: AbortSignal.timeout(8000) }); // DS-015
     const profile = await me.json();
     if (!profile.id) throw new Error('no profile from Facebook');
     // R-096: refuse no-email Facebook signups instead of inserting '' (the
@@ -633,7 +689,7 @@ router.get('/auth/facebook/callback', async (req, res) => {
 router.get('/auth/google', async (req, res) => {
   const id = process.env.GOOGLE_CLIENT_ID;
   if (!getBool(req.settings, 'google_oauth_enabled', false) || !id)
-    return res.status(503).render('error', { status: 503, message: 'Google sign-in is not configured yet. The operator needs to add the Google OAuth credentials.' });
+    return res.status(503).render('error', { status: 503, message: 'Google sign-in is unavailable right now. Please try again later.' });
   const redirect = encodeURIComponent((process.env.BASE_URL || '') + '/auth/google/callback');
   const state = randHex(12);
   // v16: same anonymous-start fix as Facebook (see above).
@@ -650,12 +706,12 @@ router.get('/auth/google/callback', async (req, res) => {
     if (req.sess) await require('../lib/auth').touchSession(req.db, req.sess.id, { oauth_state: null });
     const redirect = (process.env.BASE_URL || '') + '/auth/google/callback';
     const tok = await fetch('https://oauth2.googleapis.com/token', {
-      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, signal: AbortSignal.timeout(8000), // DS-015: provider calls need a deadline
       body: new URLSearchParams({ code: req.query.code, client_id: id, client_secret: secret, redirect_uri: redirect, grant_type: 'authorization_code' }).toString(),
     });
     const tj = await tok.json();
     if (!tj.access_token) throw new Error('token exchange failed');
-    const me = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', { headers: { Authorization: 'Bearer ' + tj.access_token } });
+    const me = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', { headers: { Authorization: 'Bearer ' + tj.access_token }, signal: AbortSignal.timeout(8000) }); // DS-015
     const profile = await me.json();
     if (!profile.email) throw new Error('no email from Google');
     // v16: Google tells us whether it verified this email — refuse an

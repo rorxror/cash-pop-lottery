@@ -3,11 +3,21 @@
   'use strict';
 
   /* ---------- Money formatting (minor units -> currency string) ---------- */
-  function fmtMoney(minor, code) {
+  /* SCAN fix (A-18/D-25): minor-unit divisor follows the currency's
+     real fraction digits (JPY 0, KWD 3, most 2) instead of a hardcoded
+     100 — Intl resolves them from the currency code itself. */
+  function decFor(code) {
     try {
-      return new Intl.NumberFormat('en-US', { style: 'currency', currency: code || 'USD' }).format((minor || 0) / 100);
+      var d = new Intl.NumberFormat('en-US', { style: 'currency', currency: code || 'USD' }).resolvedOptions().maximumFractionDigits;
+      return (typeof d === 'number' && d >= 0 && d <= 6) ? d : 2;
+    } catch (e) { return 2; }
+  }
+  function fmtMoney(minor, code) {
+    var dec = decFor(code);
+    try {
+      return new Intl.NumberFormat('en-US', { style: 'currency', currency: code || 'USD' }).format((minor || 0) / Math.pow(10, dec));
     } catch (e) {
-      return ((minor || 0) / 100).toFixed(2) + ' ' + (code || '');
+      return ((minor || 0) / Math.pow(10, dec)).toFixed(dec) + ' ' + (code || '');
     }
   }
 
@@ -41,6 +51,14 @@
       }
       return 0;
     }
+    // DS-023: bundle discounts, keyed exactly like the server - on the
+    // number of draws SELECTED (Both counts once). The slip total and the
+    // Buy button must show the price the server will actually charge.
+    var bundleMap = {};
+    (form.getAttribute('data-discounts') || '').split(',').forEach(function (part) {
+      var kv = part.split(':'); var n = Number(kv[0]), pc = Number(kv[1]);
+      if (n > 0 && pc > 0 && pc < 100) bundleMap[n] = pc;
+    });
     function recalc() {
       var pops = selectedPops().length;
       var wager = wagerVal();
@@ -48,12 +66,14 @@
       var dt = drawType();
       var mult = dt === 'BOTH' ? 2 : 1;
       var total = pops * wager * draws * mult;
+      var discPct = bundleMap[draws] || 0;
+      if (discPct) total = Math.round(total * (100 - discPct) / 100);
       var dtLabel = dt === 'BOTH' ? 'Both (Day+Eve)' : dt === 'EVE' ? 'Evening' : 'Day';
 
       popCount.textContent = pops;
       slPops.textContent = pops;
       slWager.textContent = fmtMoney(wager, cur);
-      slDraws.textContent = draws + ' x ' + dtLabel;
+      slDraws.textContent = draws + ' x ' + dtLabel + (discPct ? ' - ' + discPct + '% bundle discount applied' : '');
       totalAmt.textContent = fmtMoney(total, cur);
       if (totalAmtBtn) totalAmtBtn.textContent = fmtMoney(total, cur);
 
@@ -105,8 +125,10 @@
   document.querySelectorAll('.live-count').forEach(function (el) {
     var base = parseInt(el.getAttribute('data-count'), 10) || 0;
     var isMoney = el.getAttribute('data-money') === '1';
+    var sym = el.getAttribute('data-symbol') || '$'; // DS-041: server currency, never a hard-coded $
+    var dec = parseInt(el.getAttribute('data-decimals'), 10); if (!(dec >= 0)) dec = 2;
     function fmt(v) {
-      if (isMoney) return '$' + (v / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      if (isMoney) return sym + (v / Math.pow(10, dec)).toLocaleString('en-US', { minimumFractionDigits: dec, maximumFractionDigits: dec });
       return v.toLocaleString('en-US');
     }
     // Count-up on load: ease-out over ~1.4s, ends exactly at the true value
@@ -134,8 +156,10 @@
   var lastWinsKey = '';
   function tweenNum(el, from, to, isMoney) {
     var start = null, dur = 1000;
+    var sym = (el && el.getAttribute('data-symbol')) || '$'; // DS-041
+    var dec = parseInt(el && el.getAttribute('data-decimals'), 10); if (!(dec >= 0)) dec = 2;
     function fmt(v) {
-      if (isMoney) return '$' + (v / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      if (isMoney) return sym + (v / Math.pow(10, dec)).toLocaleString('en-US', { minimumFractionDigits: dec, maximumFractionDigits: dec });
       return Math.round(v).toLocaleString('en-US');
     }
     function step(ts) {
@@ -162,10 +186,11 @@
         var isMoney = el.getAttribute('data-money') === '1';
         var target = isMoney ? d.paid_out : vals[i];
         // Money el stores cents in data-count; displayed text strips to dollars — compare via target
-        var displayed = isMoney ? Math.round(d.paid_out / 100) : vals[i];
+        var elDec = parseInt(el.getAttribute('data-decimals'), 10); if (!(elDec >= 0)) elDec = 2;
+        var displayed = isMoney ? Math.round(d.paid_out / Math.pow(10, elDec)) : vals[i];
         var curDisp = parseInt((el.textContent || '').replace(/[^0-9.]/g, ''), 10);
         if (!isNaN(curDisp) && curDisp !== displayed) {
-          var fromVal = isMoney ? curDisp * 100 : curDisp;
+          var fromVal = isMoney ? curDisp * Math.pow(10, elDec) : curDisp;
           tweenNum(el, fromVal, target, isMoney);
         }
         el.setAttribute('data-count', target);
@@ -180,7 +205,7 @@
           // so a crafted name executed script in every visitor's browser.
           var esc = function (s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); };
           var items = (d.recentWins || []).map(function (w) {
-            return '<span class="ticker-item"><strong>' + esc(w.name) + '</strong> won ' + esc(w.amount_fmt) + ' <span class="verified-badge">✓ Verified</span></span>';
+            return '<span class="ticker-item"><strong>' + esc(w.name) + '</strong> won ' + esc(w.amount_fmt) + '</span>';
           }).join('');
           track.innerHTML = items + items; // duplicated for seamless loop
         }
@@ -282,13 +307,21 @@
     var prev = document.getElementById('chargePreview');
     if (!amt || !prev) return;
     function update() {
-      var v = Number(amt.value) || 0; // minor units
+      // DS-016: the input holds MAJOR units (e.g. 50), data-fixed holds
+      // MINOR units (100 = 1.00) and fmtMoney expects minor. Convert first -
+      // the old code mixed all three and told a $50 depositor they would be
+      // credited $0.00 (real charge $3.50, real credit $46.50).
+      var vMajor = Number(amt.value) || 0;
+      var decAttr = parseInt(amt.getAttribute('data-decimals'), 10); var dec = (decAttr >= 0) ? decAttr : decFor(amt.getAttribute('data-currency') || 'USD');
+      var v = Math.round(vMajor * Math.pow(10, dec)); // minor units
       var fixed = Number(amt.getAttribute('data-fixed')) || 0;
       var pct = Number(amt.getAttribute('data-percent')) || 0;
       var code = amt.getAttribute('data-currency') || 'USD';
-      var charge = fixed + Math.round(v * pct / 100);
+      var charge = Math.min(v, fixed + Math.round(v * pct / 100));
       prev.textContent = v > 0
-        ? 'Charge: ' + fmtMoney(charge, code) + ' — you will be credited ' + fmtMoney(Math.max(0, v - charge), code)
+        ? (id === 'wdAmount'
+            ? 'Charge: ' + fmtMoney(charge, code) + ' — you will receive ' + fmtMoney(Math.max(0, v - charge), code)
+            : 'Charge: ' + fmtMoney(charge, code) + ' — you will be credited ' + fmtMoney(Math.max(0, v - charge), code))
         : '';
     }
     amt.addEventListener('input', update);
@@ -554,4 +587,40 @@
   /* Ticket print button */
   var printBtn = document.getElementById('printBtn');
   if (printBtn) printBtn.addEventListener('click', function () { window.print(); });
+
+  /* ---------- Canned-reply picker (BP-15, staff support pages) ----------
+     A <select data-canned-picker data-source="cannedData"> lists reply
+     titles; the bodies live in a JSON island (#cannedData). Choosing one
+     appends its text to the reply textarea of the enclosing form. The
+     picker never sends anything by itself — staff review and press Send. */
+  /* SCAN fix (D-17): the /play wallet-currency switch used an inline
+     onchange handler, which the site's own CSP (script-src without
+     'unsafe-inline') blocks — changing currency silently did nothing.
+     Delegated here like every other behaviour. */
+  document.addEventListener('change', function (e) {
+    var sel = e.target;
+    if (!sel || sel.id !== 'playCurrency') return;
+    window.location = '/play?currency=' + encodeURIComponent(sel.value);
+  });
+
+  document.addEventListener('change', function (e) {
+    var sel = e.target;
+    if (!sel || !sel.hasAttribute || !sel.hasAttribute('data-canned-picker')) return;
+    var id = sel.value;
+    if (!id) return;
+    sel.value = '';
+    var island = document.getElementById(sel.getAttribute('data-source') || 'cannedData');
+    if (!island) return;
+    var rows = [];
+    try { rows = JSON.parse(island.textContent || '[]'); } catch (err) { rows = []; }
+    var row = null;
+    for (var i = 0; i < rows.length; i++) if (String(rows[i].id) === String(id)) { row = rows[i]; break; }
+    if (!row) return;
+    var form = sel.closest ? sel.closest('form') : null;
+    var box = form ? (form.querySelector('textarea[name="message"]') || form.querySelector('textarea')) : null;
+    if (!box) return;
+    var cur = box.value || '';
+    box.value = cur ? cur.replace(/\s+$/, '') + '\n\n' + row.body : row.body;
+    box.focus();
+  });
 })();

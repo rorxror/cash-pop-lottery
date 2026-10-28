@@ -1,0 +1,14 @@
+<section class="wrap section narrow-wide">
+  <h1 class="sec-title">Announcements</h1>
+  <% if (announcements && announcements.length) { %>
+    <% announcements.forEach(function(a){ %>
+    <div class="card mt">
+      <h3><%= a.title %></h3>
+      <p class="muted sm"><%= new Date(a.created_at).toLocaleString() %></p>
+      <p><%= a.body %></p>
+    </div>
+    <% }) %>
+  <% } else { %>
+  <div class="card"><p class="muted">No announcements right now.</p></div>
+  <% } %>
+</section>

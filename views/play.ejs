@@ -2,7 +2,8 @@
 <% if (_bundles.length) { %><p class="muted wrap">🎁 Multi-draw bundles: <%= _bundles.map(b => { const [n, pc] = b.split(':'); return n + ' draws → ' + pc + '% off'; }).join(' · ') %></p><% } %>
 <section class="wrap section">
   <h1 class="sec-title">Play &mdash; Build Your Slip</h1>
-  <form action="/play/buy" method="POST" id="playForm" class="play-grid" data-cur="<%= cur %>">
+  <p class="muted">18+ only · Play responsibly — you can set deposit, loss and session limits at any time on the <a href="/scratch/responsible-play">Play Limits</a> page.</p>
+  <form action="/play/buy" method="POST" id="playForm" class="play-grid" data-cur="<%= playCurrency %>" data-discounts="<%= S('multi_draw_discounts') %>">
     <input type="hidden" name="_csrf" value="<%= csrf %>">
     <script type="application/json" id="prizeData"><%- JSON.stringify(prizeTable || []) %></script>
 
@@ -12,7 +13,7 @@
          reloads the slip so the shown balance matches the wallet used. -->
     <div class="pstep">
       <div class="field"><label for="playCurrency">Wallet currency</label>
-      <select name="currency" id="playCurrency" onchange="window.location='/play?currency='+encodeURIComponent(this.value)">
+      <select name="currency" id="playCurrency">
         <% const _funded = (wallets || []).filter(function(w){ return Number(w.balance) > 0; }).map(function(w){ return w.currency; }); %>
         <% const _opts = _funded.indexOf(playCurrency) === -1 ? _funded.concat([playCurrency]) : _funded; %>
         <% _opts.forEach(function(c){ %><option value="<%= c %>"<%= c === playCurrency ? ' selected' : '' %>><%= c %></option><% }); %>
@@ -44,7 +45,7 @@
         <p class="pstep-sub">The more you wager, the higher the cash prize you could win!</p>
         <div class="wager-circles" id="wagerBox">
           <% wagerOptions.forEach(function(w, idx){ %>
-          <label class="circle-wrap"><input type="radio" name="wager" value="<%= w %>" class="circle-input"<%= idx===0 ? ' checked' : '' %>><span class="circle-ball wager-ball"><%= fmt(w, cur) %></span></label>
+          <label class="circle-wrap"><input type="radio" name="wager" value="<%= w %>" class="circle-input"<%= idx===0 ? ' checked' : '' %>><span class="circle-ball wager-ball"><%= fmt(w, playCurrency) %></span></label>
           <% }) %>
         </div>
       </div>
@@ -75,10 +76,10 @@
         <p class="pstep-sub">Match your number to the drawn number to win the multiplier for your pops.</p>
         <div class="tbl-wrap">
         <table class="tbl tbl-sm prize-tbl">
-          <thead><tr><th>Pops played</th><th>Multiplier</th><th>Win per $1</th></tr></thead>
+          <thead><tr><th>Pops played</th><th>Multiplier</th><th>Win per <%= fmt(100, playCurrency) %> wager</th></tr></thead>
           <tbody>
             <% prizeTable.forEach(function(p){ %>
-            <tr><td><%= p.pops_count %></td><td>&times;<%= p.multiplier %></td><td><%= fmt(p.multiplier * 100, cur) %></td></tr>
+            <tr><td><%= p.pops_count %></td><td>&times;<%= p.multiplier %></td><td><%= fmt(p.multiplier * 100, playCurrency) %></td></tr>
             <% }) %>
           </tbody>
         </table>
@@ -92,13 +93,13 @@
       <div class="card-h"><h2>Your slip</h2><button type="button" id="slipToggle" class="btn btn-g btn-sm">Hide</button></div>
       <div id="slipBreakdown" class="slip-lines">
         <div class="slip-line"><span>Pops</span><span id="slPops">0</span></div>
-        <div class="slip-line"><span>Wager each</span><span id="slWager"><%= fmt(wagerOptions[0], cur) %></span></div>
+        <div class="slip-line"><span>Wager each</span><span id="slWager"><%= fmt(wagerOptions[0], playCurrency) %></span></div>
         <div class="slip-line"><span>Draws</span><span id="slDraws">1 &times; Day</span></div>
       </div>
       <p class="muted" id="prizePreview"></p>
-      <div class="slip-total"><span>Total cost</span><span id="totalAmt"><%= fmt(0, cur) %></span></div>
-      <p class="muted">Wallet balance: <%= fmt(balance, cur) %></p>
-      <button type="submit" class="btn btn-p btn-lg btn-block" id="buyBtn">Buy Ticket &mdash; <span id="totalAmtBtn"><%= fmt(0, cur) %></span></button>
+      <div class="slip-total"><span>Total cost</span><span id="totalAmt"><%= fmt(0, playCurrency) %></span></div>
+      <p class="muted">Wallet balance: <%= fmt(balance, playCurrency) %></p>
+      <button type="submit" class="btn btn-p btn-lg btn-block" id="buyBtn">Buy Ticket &mdash; <span id="totalAmtBtn"><%= fmt(0, playCurrency) %></span></button>
     </div>
   </form>
 </section>

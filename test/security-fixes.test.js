@@ -161,7 +161,7 @@ test('withdrawal rules: turnover, caps, payout lock, same-method', async () => {
   raw.exec(`CREATE TABLE deposits (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, status TEXT, currency TEXT, net INTEGER, method_id INTEGER, created_at INTEGER);
             CREATE TABLE transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, type TEXT, currency TEXT, amount INTEGER);
             CREATE TABLE withdrawals (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, status TEXT, currency TEXT, amount INTEGER, created_at INTEGER, method_id INTEGER);
-            CREATE TABLE users (id INTEGER PRIMARY KEY, payout_updated_at INTEGER, payout_fingerprint TEXT);`);
+            CREATE TABLE users (id INTEGER PRIMARY KEY, payout_updated_at INTEGER, payout_fingerprint TEXT, payout_pending_fingerprint TEXT DEFAULT '', payout_change_at INTEGER DEFAULT 0, totp_last_step INTEGER DEFAULT -1);`);
   const db = {
     get: (s, p = []) => Promise.resolve(raw.prepare(s).get(...p)),
     run: (s, p = []) => { const r = raw.prepare(s).run(...p); return Promise.resolve({ id: Number(r.lastInsertRowid), changes: r.changes }); },
@@ -187,25 +187,34 @@ test('withdrawal rules: turnover, caps, payout lock, same-method', async () => {
   r = await checkWithdrawalRules(db, { ...base, withdrawal_daily_cap: '5000' }, user, method, 2000, { account: 'A1' });
   assert.equal(r.ok, false);
   assert.match(r.reason, /Daily withdrawal limit/);
-  // Payout lock: stored fingerprint A changed just now, new details B -> blocked, clock NOT refreshed.
-  raw.prepare("UPDATE users SET payout_fingerprint = ?, payout_updated_at = ? WHERE id = 1").run('fp-A', now());
-  r = await checkWithdrawalRules(db, base, user, method, 1000, { account: 'B2' });
-  assert.equal(r.ok, false);
-  assert.equal(r.changeDetected, false);
-  // Lock expired long ago -> blocked once WITH changeDetected (records the change).
-  raw.prepare("UPDATE users SET payout_updated_at = ? WHERE id = 1").run(now() - 100 * 3600 * 1000);
+  // Payout lock (RT-20 semantics): stored fingerprint is A1's. A first
+  // attempt with NEW details B2 is blocked WITH changeDetected - the caller
+  // records the change as PENDING only; the active fingerprint is untouched.
+  const { sha256 } = require('../lib/util');
+  const fpA1 = sha256(JSON.stringify({ account: 'A1' }));
+  const fpB2 = sha256(JSON.stringify({ account: 'B2' }));
+  raw.prepare("UPDATE users SET payout_fingerprint = ? WHERE id = 1").run(fpA1);
   r = await checkWithdrawalRules(db, base, user, method, 1000, { account: 'B2' });
   assert.equal(r.ok, false);
   assert.equal(r.changeDetected, true);
-  // Same details as stored BUT lock window still running -> blocked (the lock
-  // is on the change, not on the details differing).
-  const { sha256 } = require('../lib/util');
-  const fpA1 = sha256(JSON.stringify({ account: 'A1' }));
-  raw.prepare("UPDATE users SET payout_fingerprint = ?, payout_updated_at = ? WHERE id = 1").run(fpA1, now());
-  r = await checkWithdrawalRules(db, base, user, method, 1000, { account: 'A1' });
-  assert.equal(r.ok, false);
   assert.match(r.reason, /locked for 48 hours/);
+  // Pending recorded, window running: retry with B2 -> blocked, no new
+  // change signal (clock NOT refreshed).
+  raw.prepare("UPDATE users SET payout_pending_fingerprint = ?, payout_change_at = ? WHERE id = 1").run(fpB2, now());
+  r = await checkWithdrawalRules(db, base, user, method, 1000, { account: 'B2' });
+  assert.equal(r.ok, false);
   assert.equal(r.changeDetected, false);
+  // RT-20 core: while a change is pending, the ORIGINAL stored details
+  // still work - a blocked attempt must not lock the old details out.
+  r = await checkWithdrawalRules(db, base, user, method, 1000, { account: 'A1' });
+  assert.equal(r.ok, true);
+  // Window expired: the pending details proceed and are flagged for
+  // promotion to active on success.
+  raw.prepare("UPDATE users SET payout_change_at = ? WHERE id = 1").run(now() - 100 * 3600 * 1000);
+  r = await checkWithdrawalRules(db, base, user, method, 1000, { account: 'B2' });
+  assert.equal(r.ok, true);
+  assert.equal(r.promotePending, true);
+  raw.prepare("UPDATE users SET payout_pending_fingerprint = '', payout_change_at = 0 WHERE id = 1").run();
   // Same details as stored -> lock passes, so the same-method rule decides.
   // The fingerprint is sha256 of the sorted userData JSON (single key here).
   raw.prepare("UPDATE users SET payout_fingerprint = ?, payout_updated_at = 0 WHERE id = 1").run(fpA1);
