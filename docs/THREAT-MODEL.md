@@ -29,7 +29,7 @@ external pen-test (see "Residual risks" — that needs outside testers).
 | Unverified-contact abuse | Verified-contact gate (email OR phone) before deposit/withdraw; staff attestation is audited. No KYC by operator policy. |
 | Referral farming | Credits are pending until referee's first approved deposit + wagering; per-referee cap; release is a ledger post. |
 | Shared-device multi-accounts | Flags only (device/IP overlap), never auto-ban; staff review page. |
-| Credential theft from DB | AES-256-GCM at rest (env key); plaintext legacy rows stay readable until re-saved; unreadable rows show a warning, never crash. Without the env key, new credentials store plaintext with a warning flash. |
+| Credential theft from DB | AES-256-GCM at rest (env key); without the env key, credential saves are REFUSED (fail closed, v16) — no plaintext fallback for new credentials. Plaintext legacy rows stay readable until re-saved; unreadable rows show a warning, never crash. (Row updated 2026-10-27, v17 round 2b.) |
 | Admin account takeover | Stealth path (non-admin → plain 404 + audit probe); RBAC (finance/support/risk/super, fail-closed on unknown POST); TOTP enrollment + optional enforcement (guarded: cannot enable before enrolling); staff role changes audited; own-role change blocked. |
 | Session hijack | Opaque random session ids; HttpOnly + Secure flags; revoke-sessions; login-as is audited and bannered. |
 | Audit tampering | Hash-chained audit_log (prev_hash + sha256 of row contents), serialized inserts, /audit verifies the chain and shows a banner. Single-instance assumption: a multi-instance deployment would need a DB-side sequence to avoid chain forks. |

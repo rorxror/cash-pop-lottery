@@ -3,9 +3,11 @@ const express = require('express');
 const playerRouter = express.Router();
 const adminRouter = express.Router();
 const { requireLogin, requireRole, rateLimit } = require('../lib/auth');
-const { now, randHex, sha256, toMinor, esc } = require('../lib/util');
+const { now, randHex, sha256, toMinor, decimalsFor, esc } = require('../lib/util');
 const ui = require('../lib/admin-ui');
 const { buyTicket, revealTicket, launchSeries, responsibleStatus, logEvent } = require('../lib/scratch');
+const { getCurrencies } = require('../lib/settings');
+const audit = require('../lib/audit');
 
 playerRouter.get('/scratch', async (req, res) => {
   const series = await req.db.query(
@@ -45,15 +47,31 @@ playerRouter.post('/scratch/responsible-play', requireLogin, async (req, res) =>
   const current = await responsibleStatus(req.db, req.user.id);
   const coolingUntil = Math.max(Number(current.cooling_off_until || 0), coolHours ? now() + coolHours * 3600000 : 0);
   const excludedUntil = Math.max(Number(current.self_excluded_until || 0), exclusionDays ? now() + exclusionDays * 86400000 : 0);
+  // Limit DECREASES take 24h to take effect; increases apply immediately.
+  // Previously a player could remove their own loss protection in one click
+  // and spend freely the same day. Per field: requested >= current limit
+  // applies immediately (and cancels any pending decrease for that field);
+  // requested < current limit leaves the main row untouched and writes the
+  // decrease to responsible_play_pending, applied by responsibleStatus once
+  // effective_at passes. Cooling-off/self-exclusion stay extend-only.
+  const curD = Number(current.daily_loss_limit || 0), curS = Number(current.session_limit_minutes || 0);
+  const mainD = daily >= curD ? daily : curD, mainS = session >= curS ? session : curS;
+  const pendD = daily < curD ? daily : null, pendS = session < curS ? session : null;
   const existing = await req.db.get('SELECT user_id FROM responsible_play WHERE user_id=?', [req.user.id]);
   if (existing) await req.db.run(
     'UPDATE responsible_play SET daily_loss_limit=?,session_limit_minutes=?,cooling_off_until=?,self_excluded_until=?,updated_at=? WHERE user_id=?',
-    [daily, session, coolingUntil, excludedUntil, now(), req.user.id]);
+    [mainD, mainS, coolingUntil, excludedUntil, now(), req.user.id]);
   else await req.db.run(
     'INSERT INTO responsible_play (user_id,daily_loss_limit,session_limit_minutes,cooling_off_until,self_excluded_until,updated_at) VALUES (?,?,?,?,?,?)',
-    [req.user.id, daily, session, coolingUntil, excludedUntil, now()]);
-  await logEvent(req.db, req.user.id, 'responsible_play.updated', 'user', req.user.id, { daily, session, coolingUntil, excludedUntil });
-  await req.setFlash('success', 'Scratch play limits updated. Cooling-off and self-exclusion can only be extended, not shortened.');
+    [req.user.id, mainD, mainS, coolingUntil, excludedUntil, now()]);
+  await req.db.run('DELETE FROM responsible_play_pending WHERE user_id = ?', [req.user.id]);
+  if (pendD !== null || pendS !== null) await req.db.run(
+    'INSERT INTO responsible_play_pending (user_id,pending_daily_loss_limit,pending_session_limit_minutes,effective_at) VALUES (?,?,?,?)',
+    [req.user.id, pendD, pendS, now() + 24 * 3600000]);
+  await logEvent(req.db, req.user.id, 'responsible_play.updated', 'user', req.user.id, { daily: mainD, session: mainS, pendingDaily: pendD, pendingSession: pendS, coolingUntil, excludedUntil });
+  await req.setFlash('success', (pendD !== null || pendS !== null)
+    ? 'Limits updated. Increases apply immediately; decreases take effect after 24 hours. Cooling-off and self-exclusion can only be extended, not shortened.'
+    : 'Scratch play limits updated. Cooling-off and self-exclusion can only be extended, not shortened.');
   res.redirect('/scratch/responsible-play');
 });
 
@@ -92,10 +110,19 @@ playerRouter.post('/scratch/:id/buy', requireLogin,
   rateLimit({ windowMs: 60000, max: 10, keyFn: req => `scratch-buy:${req.user.id}` }),
   async (req, res) => {
     try {
+      // R-024 (scratch half): the lottery buy enforces session_limit_minutes;
+      // the scratch buy never did. Same rule, same session-start basis.
+      const rp = await responsibleStatus(req.db, req.user.id);
+      const lim = Number(rp.session_limit_minutes || 0);
+      if (lim > 0 && req.sess && req.sess.created_at && (now() - Number(req.sess.created_at)) > lim * 60000)
+        return res.status(400).render('error', { status: 400, message: 'Your session limit has been reached. Please sign out and take a break before playing again.' });
       const bought = await buyTicket(req.db, req.user.id, parseInt(req.params.id, 10), req.ip);
       res.redirect('/scratch/ticket/' + encodeURIComponent(bought.publicId));
     } catch (e) {
-      res.status(400).render('error', { status: 400, message: 'Scratch purchase failed: ' + e.message });
+      // R-117 (scratch half): generic user-facing message; details stay in
+      // the server log instead of echoing driver text to the player.
+      console.error('scratch buy failed:', e.message);
+      res.status(400).render('error', { status: 400, message: 'Scratch purchase failed. Please try again.' });
     }
   });
 
@@ -179,7 +206,7 @@ adminRouter.get('/', async (req, res) => {
 adminRouter.get('/:id', async (req, res) => {
   const series = await req.db.get('SELECT * FROM scratch_series WHERE id = ?', [req.params.id]);
   const base = req.adminPath + '/scratch';
-  if (!series) return res.send(ui.layout({ adminPath: req.adminPath, section: '/scratch', title: 'Scratch', body: ui.card('Not found', '<p class="muted">No such series.</p>'), csrf: req.csrfToken, flash: req.flashData || {}, assetV: req.app.locals.assetV || '1' }));
+  if (!series) return res.status(404).send(ui.layout({ adminPath: req.adminPath, section: '/scratch', title: 'Scratch', body: ui.card('Not found', '<p class="muted">No such series.</p>'), csrf: req.csrfToken, flash: req.flashData || {}, assetV: req.app.locals.assetV || '1' }));
   const tiers = await req.db.query('SELECT amount,quantity,label FROM scratch_prize_tiers WHERE series_id=? ORDER BY amount DESC', [series.id]);
   const breakdown = series.status === 'draft' ? [] : await req.db.query(
     `SELECT o.prize AS amount, COUNT(*) AS total,
@@ -226,18 +253,30 @@ adminRouter.post('/create', async (req, res) => {
     const title = String(req.body.title || '').trim().slice(0, 120);
     const slug = String(req.body.slug || title).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 80);
     const gameType = ['single', 'match3', 'six', 'bonus'].includes(req.body.game_type) ? req.body.game_type : 'single';
+    // R-064 (route half): currency was only uppercased, never whitelisted —
+    // a bogus-currency series could launch but never sell. Inventory was
+    // silently clamped (garbage became 1, 2M became 1M). Tier labels were
+    // truncated at the SECOND colon (100:5:Win:Big → Win). All three now
+    // reject or preserve honestly.
     const currency = String(req.body.currency || 'USD').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 8);
-    const price = toMinor(req.body.price);
-    const totalTickets = Math.max(1, Math.min(1000000, parseInt(req.body.total_tickets, 10) || 0));
+    if (!getCurrencies(req.settings).some(c => c.code === currency)) throw new Error('Currency must be one of the configured currencies (Settings → Currencies).');
+    const price = toMinor(req.body.price, decimalsFor(currency, getCurrencies(req.settings)));
+    const totalRaw = String(req.body.total_tickets || '').trim();
+    if (!/^\d+$/.test(totalRaw)) throw new Error('Total tickets must be a positive integer.');
+    const totalTickets = parseInt(totalRaw, 10);
+    if (totalTickets < 1 || totalTickets > 1000000) throw new Error('Total tickets must be between 1 and 1,000,000.');
     if (!title || !slug || !price || price < 1) throw new Error('Title, slug, price and inventory are required.');
     const tiers = [];
     for (const line of String(req.body.tiers || '').split(/\r?\n/)) {
       if (!line.trim()) continue;
-      const [amountText, quantityText, labelText] = line.split(':');
-      const amount = toMinor(amountText);
+      const idx1 = line.indexOf(':');
+      const idx2 = idx1 === -1 ? -1 : line.indexOf(':', idx1 + 1);
+      if (idx1 === -1 || idx2 === -1) throw new Error('Each prize tier must use amount:quantity:label format.');
+      const amountText = line.slice(0, idx1), quantityText = line.slice(idx1 + 1, idx2), labelText = line.slice(idx2 + 1);
+      const amount = toMinor(amountText, decimalsFor(currency, getCurrencies(req.settings)));
       const quantity = parseInt(quantityText, 10);
-      if (amount === null || amount < 0 || !Number.isInteger(quantity) || quantity < 1) throw new Error('Each prize tier must use amount:quantity:label format.');
-      tiers.push({ amount, quantity, label: String(labelText || '').trim().slice(0, 120) });
+      if (amount === null || amount < 0 || !/^\d+$/.test(quantityText.trim()) || quantity < 1) throw new Error('Each prize tier must use amount:quantity:label format.');
+      tiers.push({ amount, quantity, label: labelText.trim().slice(0, 120) });
     }
     if (!tiers.length) throw new Error('Add at least one prize tier.');
     if (tiers.reduce((n, t) => n + t.quantity, 0) > totalTickets) throw new Error('Prize quantities exceed total inventory.');
@@ -251,6 +290,9 @@ adminRouter.post('/create', async (req, res) => {
       return r.id;
     });
     await logEvent(req.db, req.user.id, 'series.created', 'series', created, { title, gameType, totalTickets });
+    // R-066: scratch_events was write-only with no panel reader. Series
+    // lifecycle now mirrors into audit_log (searchable in Admin → Audit).
+    await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'scratch.series_created', entity: 'series', entityId: created, detail: { title, gameType, totalTickets }, ip: req.ip });
     await req.setFlash('success', 'Scratch series created as a draft. Review the payout math, then launch it.');
     res.redirect(req.adminPath + '/scratch');
   } catch (e) {
@@ -259,26 +301,40 @@ adminRouter.post('/create', async (req, res) => {
 });
 
 adminRouter.post('/:id/launch', async (req, res) => {
-  try { await launchSeries(req.db, parseInt(req.params.id, 10), req.user.id); await req.setFlash('success', 'Series launched with locked shuffled outcomes.'); }
+  try {
+    await launchSeries(req.db, parseInt(req.params.id, 10), req.user.id);
+    await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'scratch.series_launched', entity: 'series', entityId: req.params.id, detail: {}, ip: req.ip });
+    await req.setFlash('success', 'Series launched with locked shuffled outcomes.');
+  }
   catch (e) { await req.setFlash('error', e.message); }
   res.redirect(req.adminPath + '/scratch');
 });
 
 adminRouter.post('/:id/toggle', async (req, res) => {
   const s = await req.db.get('SELECT * FROM scratch_series WHERE id=?', [req.params.id]);
-  if (s) {
-    await req.db.run('UPDATE scratch_series SET enabled=? WHERE id=?', [s.enabled ? 0 : 1, s.id]);
-    await logEvent(req.db, req.user.id, 'series.toggled', 'series', s.id, { enabled: !s.enabled });
-  }
+  if (!s) { await req.setFlash('error', 'Series not found.'); return res.redirect(req.adminPath + '/scratch'); }
+  // R-067: toggling a stopped or draft series flipped `enabled` with no
+  // visible effect (the lobby only sells live+enabled series), so an
+  // operator could believe a stopped series was back on sale. Refuse with
+  // a clear message; launch is the path that makes a series live (and
+  // launch sets enabled=1 itself).
+  if (s.status === 'stopped' || s.status === 'draft') { await req.setFlash('error', `Cannot toggle a ${s.status} series — launch it to put it on sale.`); return res.redirect(req.adminPath + '/scratch'); }
+  await req.db.run('UPDATE scratch_series SET enabled=? WHERE id=?', [s.enabled ? 0 : 1, s.id]);
+  await logEvent(req.db, req.user.id, 'series.toggled', 'series', s.id, { enabled: !s.enabled });
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'scratch.series_toggled', entity: 'series', entityId: s.id, detail: { enabled: !s.enabled }, ip: req.ip });
   res.redirect(req.adminPath + '/scratch');
 });
 
 adminRouter.post('/:id/stop', async (req, res) => {
   const s = await req.db.get('SELECT * FROM scratch_series WHERE id=?', [req.params.id]);
-  if (s && s.status === 'live') {
-    await req.db.run("UPDATE scratch_series SET status='stopped',enabled=0,stopped_at=? WHERE id=?", [now(), s.id]);
-    await logEvent(req.db, req.user.id, 'series.stopped', 'series', s.id, { seedReveal: s.server_seed });
-  }
+  if (!s) { await req.setFlash('error', 'Series not found.'); return res.redirect(req.adminPath + '/scratch'); }
+  if (s.status !== 'live') { await req.setFlash('error', 'Only a live series can be stopped.'); return res.redirect(req.adminPath + '/scratch'); }
+  await req.db.run("UPDATE scratch_series SET status='stopped',enabled=0,stopped_at=? WHERE id=?", [now(), s.id]);
+  // R-065: the old stop logged the FULL server seed in plaintext to
+  // scratch_events — anyone reading the event log could forge outcomes
+  // for unrevealed tickets. Only the seed hash is logged now.
+  await logEvent(req.db, req.user.id, 'series.stopped', 'series', s.id, { seedHash: s.seed_hash });
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'scratch.series_stopped', entity: 'series', entityId: s.id, detail: { seedHash: s.seed_hash }, ip: req.ip });
   res.redirect(req.adminPath + '/scratch');
 });
 

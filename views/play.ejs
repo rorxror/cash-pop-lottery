@@ -6,6 +6,20 @@
     <input type="hidden" name="_csrf" value="<%= csrf %>">
     <script type="application/json" id="prizeData"><%- JSON.stringify(prizeTable || []) %></script>
 
+    <!-- R-071: wallet currency picker. The buy handler debits the wallet
+         matching this currency (base only, before); without a picker a
+         EUR-funded player could never spend their balance. Changing it
+         reloads the slip so the shown balance matches the wallet used. -->
+    <div class="pstep">
+      <div class="field"><label for="playCurrency">Wallet currency</label>
+      <select name="currency" id="playCurrency" onchange="window.location='/play?currency='+encodeURIComponent(this.value)">
+        <% const _funded = (wallets || []).filter(function(w){ return Number(w.balance) > 0; }).map(function(w){ return w.currency; }); %>
+        <% const _opts = _funded.indexOf(playCurrency) === -1 ? _funded.concat([playCurrency]) : _funded; %>
+        <% _opts.forEach(function(c){ %><option value="<%= c %>"<%= c === playCurrency ? ' selected' : '' %>><%= c %></option><% }); %>
+      </select></div>
+      <p class="muted">Your ticket is debited from this wallet. Funded wallets only, plus your current selection.</p>
+    </div>
+
     <div class="pslip">
       <!-- STEP 1 -->
       <div class="pstep">

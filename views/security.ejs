@@ -19,12 +19,24 @@
         <label for="password">Confirm your password</label>
         <input type="password" id="password" name="password" required autocomplete="current-password">
       </div>
+      <div class="field">
+        <label for="disable_totp_code">Authenticator code (or a backup code)</label>
+        <input type="text" id="disable_totp_code" name="totp_code" inputmode="numeric" autocomplete="one-time-code" required>
+      </div>
       <button type="submit" class="btn btn-d" data-confirm="Disable two-factor authentication?">Disable 2FA</button>
     </form>
     <h3 class="mt">Backup codes</h3>
     <p class="muted">Regenerating invalidates all previously issued codes. Store the new codes somewhere safe.</p>
     <form action="/security/totp/backup" method="POST">
       <input type="hidden" name="_csrf" value="<%= csrf %>">
+      <div class="field">
+        <label for="backup_password">Confirm your password</label>
+        <input type="password" id="backup_password" name="password" required autocomplete="current-password">
+      </div>
+      <div class="field">
+        <label for="backup_totp_code">Authenticator code (or a backup code)</label>
+        <input type="text" id="backup_totp_code" name="totp_code" inputmode="numeric" autocomplete="one-time-code" required>
+      </div>
       <button type="submit" class="btn btn-g" data-confirm="Regenerate backup codes? Old codes will stop working.">Regenerate backup codes</button>
     </form>
     <% if (typeof showBackup !== 'undefined' && showBackup && backupCodes && backupCodes.length) { %>
@@ -58,3 +70,16 @@
     <% } %>
   </div>
 </section>
+
+<!-- R-122: logged-in password change -->
+<div class="card" style="margin-top:16px">
+  <h2>Change password</h2>
+  <form method="POST" action="/security/password">
+    <input type="hidden" name="_csrf" value="<%= csrf %>">
+    <div class="field"><label>Current password</label><input type="password" name="current_password" required></div>
+    <div class="field"><label>New password</label><input type="password" name="password" required></div>
+    <div class="field"><label>Confirm new password</label><input type="password" name="password2" required></div>
+    <button type="submit" class="btn btn-p">Change password</button>
+  </form>
+  <p class="muted sm">Changing your password signs out all other sessions.</p>
+</div>

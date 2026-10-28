@@ -4,8 +4,8 @@
 const express = require('express');
 const router = express.Router();
 const { sha256 } = require('../lib/util');
-const { keyCol } = require('../lib/settings');
-const { deriveWinningNumberLegacy, deriveWinningNumberFair, combineSeed, publicDrawInfo } = require('../lib/draws');
+const { keyCol, getS } = require('../lib/settings');
+const { publicDrawInfo, fairnessForDraw } = require('../lib/draws');
 
 function resolveContent(body, blocks) {
   return String(body || '').replace(/\{\{\s*content:([a-z0-9_]+)\s*\}\}/gi, (_, k) => blocks[k] || '');
@@ -18,14 +18,18 @@ function resolveContent(body, blocks) {
 router.get('/api/stats', async (req, res) => {
   const players = await req.db.get("SELECT COUNT(*) AS c FROM users WHERE role = 'player'");
   const ticketsToday = await req.db.get('SELECT COUNT(*) AS c FROM tickets WHERE created_at > ?', [Date.now() - 86400000]);
-  const paidOut = await req.db.get("SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE type = 'win'");
+  // R-118: paid-out split by currency (no cross-currency sum); the
+  // headline figure is the BASE-currency total only, labelled as such.
+  const paidByCur = await req.db.query("SELECT currency, COALESCE(SUM(amount),0) AS s FROM transactions WHERE type = 'win' GROUP BY currency");
+  const baseCur = req.settings.base_currency || 'USD';
+  const paidOut = { s: Number((paidByCur.find(r => r.currency === baseCur) || { s: 0 }).s) };
   const recentWins = await req.db.query(
-    "SELECT t.amount, t.created_at, u.name FROM transactions t JOIN users u ON u.id = t.user_id WHERE t.type = 'win' ORDER BY t.created_at DESC LIMIT 12"
+    "SELECT t.amount, t.currency, t.created_at, u.name FROM transactions t JOIN users u ON u.id = t.user_id WHERE t.type = 'win' ORDER BY t.created_at DESC LIMIT 12"
   );
   res.json({
     players: players.c, tickets_today: ticketsToday.c, paid_out: paidOut.s,
-    paid_out_fmt: req.fmt(paidOut.s),
-    recentWins: recentWins.map(w => ({ name: String(w.name).split(' ')[0], amount: w.amount, amount_fmt: req.fmt(w.amount, 'USD'), created_at: w.created_at })),
+    paid_out_fmt: req.fmt(paidOut.s, baseCur), paid_out_by_currency: paidByCur,
+    recentWins: recentWins.map(w => ({ name: String(w.name).split(' ')[0], amount: w.amount, amount_fmt: req.fmt(w.amount, w.currency), currency: w.currency, created_at: w.created_at })),
   });
 });
 
@@ -38,14 +42,11 @@ router.get('/', async (req, res) => {
   );
   const players = await req.db.get("SELECT COUNT(*) AS c FROM users WHERE role = 'player'");
   const ticketsToday = await req.db.get('SELECT COUNT(*) AS c FROM tickets WHERE created_at > ?', [Date.now() - 86400000]);
-  const paidOut = await req.db.get("SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE type = 'win'");
-  // Hero stats: real mode uses DB counts; marketing mode uses admin-set base numbers that tick up live
-  const statsMode = (req.settings && req.settings.hero_stats_mode) || 'real';
-  let statPlayers = players.c, statPaid = paidOut.s;
-  if (statsMode === 'marketing') {
-    statPlayers = parseInt((req.settings && req.settings.hero_stats_players_base) || '1250', 10);
-    statPaid = parseInt((req.settings && req.settings.hero_stats_paid_base) || '50000', 10);
-  }
+  const paidOut = await req.db.get("SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE type = 'win' AND currency = ?", [getS(req.settings, 'base_currency', 'USD')]);
+  // Hero stats are ALWAYS real DB counts (base currency only — R-118). The old 'marketing' mode served
+  // admin-invented base numbers that ticked up by random amounts on the
+  // homepage — fabricated public statistics. It is removed, not just off.
+  const statPlayers = players.c, statPaid = paidOut.s;
   const recentWins = await req.db.query(
     "SELECT t.amount, t.created_at, u.name FROM transactions t JOIN users u ON u.id = t.user_id WHERE t.type = 'win' ORDER BY t.created_at DESC LIMIT 12"
   );
@@ -54,7 +55,7 @@ router.get('/', async (req, res) => {
     metaTitle: 'Home', metaDesc: 'Play Cash Pop lottery — provably fair draws, instant wins.',
     draws: draws.map(d => ({ ...d, label: d.draw_type === 'DAY' ? 'Day Draw' : 'Evening Draw' })),
     recentResults, recentWins, nextDraw,
-    stats: { players: statPlayers, tickets_today: ticketsToday.c, paid_out: statPaid, paid_out_fmt: req.fmt(statPaid), mode: statsMode },
+    stats: { players: statPlayers, tickets_today: ticketsToday.c, paid_out: statPaid, paid_out_fmt: req.fmt(statPaid), mode: 'real' },
   });
 });
 
@@ -71,8 +72,16 @@ router.get('/page/:slug', async (req, res) => {
 });
 
 router.get('/results', async (req, res) => {
-  const draws = await req.db.query("SELECT * FROM draws WHERE status = 'settled' ORDER BY close_at DESC LIMIT 60");
-  res.render('results', { metaTitle: 'Results', metaDesc: 'Latest Cash Pop draw results.', draws });
+  // R-119: paginated + filterable results; each row links to its fairness proof via the template.
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const type = ['DAY', 'EVE', 'TEST'].includes(String(req.query.type || '')) ? req.query.type : '';
+  const params = [];
+  let where = "status = 'settled'";
+  if (type) { where += ' AND draw_type = ?'; params.push(type); }
+  const totalRow = await req.db.get(`SELECT COUNT(*) AS c FROM draws WHERE ${where}`, params);
+  const total = Number(totalRow.c);
+  const draws = await req.db.query(`SELECT * FROM draws WHERE ${where} ORDER BY close_at DESC LIMIT 25 OFFSET ?`, [...params, (page - 1) * 25]);
+  res.render('results', { metaTitle: 'Results', metaDesc: 'Latest Cash Pop draw results.', draws, page, totalPages: Math.max(1, Math.ceil(total / 25)), filterType: type });
 });
 
 router.get('/fairness', async (req, res) => {
@@ -80,26 +89,10 @@ router.get('/fairness', async (req, res) => {
   const drawId = parseInt(req.query.draw_id, 10);
   if (drawId) {
     const d = await req.db.get('SELECT * FROM draws WHERE id = ?', [drawId]);
-    if (d) {
-      const recomputedHash = d.seed ? sha256(d.seed) : null;
-      // v14: pre-v14 draws (no beacon fields) use the legacy %15 derivation;
-      // newer draws combine the revealed seed with the recorded beacon
-      // randomness and use rejection sampling — exactly as settle did.
-      let recomputedNumber = null;
-      if (d.seed) {
-        if (!d.beacon_status) recomputedNumber = deriveWinningNumberLegacy(d.seed, d.id);
-        else recomputedNumber = deriveWinningNumberFair(combineSeed(d.seed, d.beacon_randomness || ''), d.id);
-      }
-      result = {
-        draw: publicDrawInfo(d),
-        recomputed_hash: recomputedHash,
-        hash_match: recomputedHash ? (recomputedHash === d.seed_hash) : null,
-        recomputed_number: recomputedNumber,
-        number_match: recomputedNumber !== null ? (recomputedNumber === d.winning_number) : null,
-      };
-    } else {
-      result = { notFound: true };
-    }
+    // Settled-only verification (see fairnessForDraw): an unsettled draw's
+    // seed is committed but unrevealed, so no number/verdict is shown at all.
+    if (d) result = fairnessForDraw(d);
+    else result = { notFound: true };
   }
   res.render('verify', { metaTitle: 'Provably Fair', metaDesc: 'Verify any draw yourself.', result });
 });

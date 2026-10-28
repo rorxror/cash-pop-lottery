@@ -10,7 +10,7 @@
   <div class="kpis mt">
     <div class="kpi"><span class="n"><%= stats.players %></span><span class="l">Your players</span></div>
     <div class="kpi"><span class="n"><%= stats.tickets_week %></span><span class="l">Player tickets this week</span></div>
-    <div class="kpi"><span class="n"><%= stats.commission_earned_fmt %></span><span class="l">Commission earned</span></div>
+    <div class="kpi"><span class="n"><% if (stats.commissions_by_currency && stats.commissions_by_currency.length) { %><%= stats.commissions_by_currency.map(function(c){ return fmt(c.s, c.currency); }).join(' · ') %><% } else { %>—<% } %></span><span class="l">Commission earned</span></div>
   </div>
   <div class="grid2 mt">
     <div class="card">

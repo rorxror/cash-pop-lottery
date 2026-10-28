@@ -1,9 +1,34 @@
 # Cash Pop Lottery — Deploy Guide
 
+> Docs updated 2026-10-27 (v17 round 2b): Render is now the primary
+> deployment target; the cPanel route is retained below as a
+> not-recommended fallback for real money.
+
 Standalone real-money lottery platform. **Node.js 22+**, pure-JavaScript
 dependencies only (no native modules), SQLite built in, MySQL optional.
 
-## Option A — cPanel shared hosting ("Setup Node.js App")
+## Option A — Render (recommended for real money)
+
+1. Create a **Web Service** from the repo (Node 22, start command
+   `node server.js`). Do NOT use a static site or a cron job.
+2. Add a **persistent disk** (or attach a Render Postgres Basic database
+   and set `DATABASE_URL` — see "Switching to Postgres" below). Without
+   one, a free-tier service sleeps and its SQLite file is wiped on
+   redeploy/restart. Starter ($7/mo) + a small persistent disk is the
+   minimum real-money setup; Starter + Postgres Basic is the proper
+   final setup.
+3. Set the environment variables from `.env.example` — at minimum
+   `TICKET_HMAC_SECRET` (long random string; the app refuses to boot
+   without it in ANY environment) and `CREDENTIAL_ENCRYPTION_KEY`
+   (64 hex chars; credential saves are REFUSED without it).
+4. Set `ADMIN_PATH` to a random path (e.g. `/ops-9f2c1a-console`);
+   the admin panel has no public link and non-admin requests to admin
+   paths get a plain 404.
+
+## Option B — cPanel shared hosting ("Setup Node.js App") — NOT recommended for real money
+
+cPanel shared hosting has no persistent process, no private database and
+no proper backups for a real-money app. Use it only for a demo. Steps:
 
 1. In cPanel open **Setup Node.js App** → **Create Application**.
    - Node.js version: **22** (or newer)
@@ -21,9 +46,10 @@ dependencies only (no native modules), SQLite built in, MySQL optional.
    - `CREDENTIAL_ENCRYPTION_KEY` (v14) — 64 hex characters (32 random bytes:
      generate with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`).
      Gateway credentials are AES-256-GCM encrypted at rest with this key.
-     Without it, credentials store in plaintext with a warning — set it
-     BEFORE saving any provider credential. If you rotate it, re-save every
-     method's credentials afterwards (old envelopes become unreadable).
+     Without it, credential saves are REFUSED (fail closed, v16) — there
+     is no plaintext fallback for new credentials. Set it BEFORE saving
+     any provider credential. If you rotate it, re-save every method's
+     credentials afterwards (old envelopes become unreadable).
    - Note: sessions use random opaque IDs and need no signing secret, so
      `SESSION_SECRET` is NOT required by the code (older docs listed it).
    - `ADMIN_PATH` — e.g. `/ops-9f2c1a-console` (your hidden admin URL;
@@ -149,11 +175,13 @@ these. Live automation needs:
   Basic database, then copy its Internal Database URL into the service's
   environment as `DATABASE_URL` and redeploy). `DATABASE_URL` alone also
   implies postgres; an explicit `DB_DRIVER` wins.
-- SSL: any non-localhost `DATABASE_URL` host gets SSL automatically
-  (Render Postgres requires it; `rejectUnauthorized: false` because Render
-  uses its own CA). Localhost demo DBs run without SSL. `PGSSLMODE=require`
-  forces SSL; `PGHOST`/`PGPORT`/`PGUSER`/`PGPASSWORD`/`PGDATABASE` may be
-  used instead of a URL.
+- SSL: TLS is VERIFIED by default (`rejectUnauthorized: true`) for
+  `PGSSLMODE` values `verify-full` / `verify-ca` / `require` and for any
+  non-localhost host; Render Postgres requires SSL. Only an explicit
+  opt-out (`PGSSL_INSECURE=1` or `PGSSLMODE=insecure`) disables
+  verification, and the app logs a warning when it does. Localhost demo
+  DBs run without SSL. `PGHOST`/`PGPORT`/`PGUSER`/`PGPASSWORD`/
+  `PGDATABASE` may be used instead of a URL.
 - All money/timestamps are BIGINT (epoch-ms, minor units — no 32-bit
   overflow); `pg` is a HARD dependency, not optional, so a build can never
   skip it and fail boot. App SQL keeps `?` placeholders; the adapter
@@ -170,3 +198,9 @@ these. Live automation needs:
   then resets each integer-id sequence past MAX(id). Verify afterwards:
   row counts match, admin login works, and a newly registered user gets an
   id above the transferred max.
+
+## MySQL DDL limitation (v17.1 note)
+MySQL cannot wrap DDL in a transaction: if a migration run fails midway,
+the migration version is left unrecorded and the next boot retries the
+migration from the last recorded version (R-043). This is a dialect
+limitation, not a bug — do not expect atomic MySQL migrations.

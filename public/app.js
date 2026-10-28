@@ -99,14 +99,12 @@
 
   /* ---------- (a2) Live hero counters ---------- */
   // Counters animate on every page load — logged out AND logged in, identically.
-  // Count-up runs from 0 to the TRUE value (real mode: no fake data, the final
-  // number is always the real DB total). In marketing mode they keep ticking up
-  // afterwards for effect; in real mode they stay pinned to the true value.
+  // Count-up runs from 0 to the TRUE value and stays pinned there: counters
+  // never tick up on their own (the old 'marketing' mode fabricated growth
+  // with random increments; it is removed server-side and here).
   document.querySelectorAll('.live-count').forEach(function (el) {
     var base = parseInt(el.getAttribute('data-count'), 10) || 0;
-    var mode = el.getAttribute('data-mode') || 'real';
     var isMoney = el.getAttribute('data-money') === '1';
-    var val = base;
     function fmt(v) {
       if (isMoney) return '$' + (v / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
       return v.toLocaleString('en-US');
@@ -122,12 +120,6 @@
       else el.textContent = fmt(base);
     }
     requestAnimationFrame(step);
-    if (mode === 'marketing') {
-      setInterval(function () {
-        val += isMoney ? Math.floor(Math.random() * 500) + 100 : (Math.random() < 0.3 ? 1 : 0);
-        el.textContent = fmt(val);
-      }, 3000);
-    }
   });
 
   /* ---------- (a3) Live stats refresh (real values only) ---------- */
@@ -183,8 +175,12 @@
       var track = document.getElementById('winnersTicker');
       if (track && winsKey && winsKey !== lastWinsKey) {
         if (lastWinsKey) {
+          // Escape winner names: they are user-chosen (registration only
+          // checks length), and the old code injected them via innerHTML,
+          // so a crafted name executed script in every visitor's browser.
+          var esc = function (s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); };
           var items = (d.recentWins || []).map(function (w) {
-            return '<span class="ticker-item"><strong>' + w.name + '</strong> won ' + w.amount_fmt + ' <span class="verified-badge">✓ Verified</span></span>';
+            return '<span class="ticker-item"><strong>' + esc(w.name) + '</strong> won ' + esc(w.amount_fmt) + ' <span class="verified-badge">✓ Verified</span></span>';
           }).join('');
           track.innerHTML = items + items; // duplicated for seamless loop
         }
@@ -203,7 +199,18 @@
       var closeAt = Number(el.getAttribute('data-close-at'));
       if (!closeAt || isNaN(closeAt)) { el.textContent = '--:--:--'; return; }
       var ms = closeAt - now;
-      if (ms <= 0) { el.textContent = 'Closing...'; return; }
+      if (ms <= 0) {
+        el.textContent = 'Closing...';
+        // R-120: resync instead of freezing forever, and disable the buy
+        // form until fresh draws arrive (server enforces close via R-072).
+        if (!el.dataset.resynced) {
+          el.dataset.resynced = '1';
+          var form = document.querySelector('#buyForm, form[action$="/play/buy"]');
+          if (form) form.querySelectorAll('button, input').forEach(function (x) { x.disabled = true; });
+          setTimeout(function () { window.location.reload(); }, 30000);
+        }
+        return;
+      }
       var s = Math.floor(ms / 1000);
       var d = Math.floor(s / 86400); s -= d * 86400;
       var h = Math.floor(s / 3600); s -= h * 3600;
@@ -427,6 +434,22 @@
     }
     segs.forEach(function (b) { b.addEventListener('click', function () { setType(b.dataset.type); }); });
     if (document.querySelector('.auth-otp-types .seg[data-type="email"].active')) setType('email');
+    function otpHeaders() {
+      var h = { 'Content-Type': 'application/json' };
+      var csrfEl = document.querySelector('input[name="_csrf"]');
+      if (csrfEl && csrfEl.value) h['x-csrf-token'] = csrfEl.value;
+      return h;
+    }
+    function otpExtra() {
+      var extra = {};
+      var cap = document.querySelector('input[name="captcha_answer"]');
+      if (cap) extra.captcha_answer = cap.value;
+      ['g-recaptcha-response', 'h-captcha-response', 'cf-turnstile-response'].forEach(function (f) {
+        var el = document.querySelector('[name="' + f + '"]');
+        if (el) extra[f] = el.value;
+      });
+      return extra;
+    }
     var reqBtn = document.getElementById('otpRequestBtn');
     if (reqBtn) reqBtn.addEventListener('click', async function () {
       hideErr();
@@ -438,7 +461,7 @@
         identifier = input.value.trim();
       }
       if (!identifier) return showErr(type === 'phone' ? 'Please enter your phone number.' : 'Please enter your email address.');
-      var r = await fetch('/login/otp/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: type, identifier: identifier }) });
+      var r = await fetch('/login/otp/request', { method: 'POST', headers: otpHeaders(), body: JSON.stringify(Object.assign({ type: type, identifier: identifier }, otpExtra())) });
       var d = await r.json().catch(function () { return {}; });
       if (!r.ok) return showErr(d.error || 'Could not send code. Please try again.');
       sentTo.textContent = identifier;
@@ -450,7 +473,7 @@
       hideErr();
       var code = document.getElementById('otpCode').value.trim();
       if (code.length !== 6) return showErr('Please enter the 6-digit code.');
-      var r = await fetch('/login/otp/verify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: type, identifier: identifier, code: code }) });
+      var r = await fetch('/login/otp/verify', { method: 'POST', headers: otpHeaders(), body: JSON.stringify({ type: type, identifier: identifier, code: code }) });
       var d = await r.json().catch(function () { return {}; });
       if (!r.ok) return showErr(d.error || 'Invalid code. Please try again.');
       if (d.needsProfile) { if (d.csrf) csrfToken = d.csrf; step2.hidden = true; stepProfile.hidden = false; document.getElementById('authFullName').focus(); return; }
@@ -459,7 +482,7 @@
     var resend = document.getElementById('otpResend');
     if (resend) resend.addEventListener('click', async function (e) {
       e.preventDefault(); hideErr();
-      var r = await fetch('/login/otp/request', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: type, identifier: identifier }) });
+      var r = await fetch('/login/otp/request', { method: 'POST', headers: otpHeaders(), body: JSON.stringify(Object.assign({ type: type, identifier: identifier }, otpExtra())) });
       if (!r.ok) showErr('Could not resend code. Please wait and try again.');
     });
     var back = document.getElementById('otpBack');

@@ -8,13 +8,16 @@ const ejs = require('ejs');
 
 // ---- tiny .env loader (no dependency) ----
 (function loadEnv() {
-  for (const p of ['.env', './.env']) {
+  // R-100: resolve .env from the APP ROOT (not CWD), support `export`,
+  // and strip trailing inline comments from unquoted values.
+  for (const p of [path.join(__dirname, '.env')]) {
     if (!fs.existsSync(p)) continue;
     for (const line of fs.readFileSync(p, 'utf8').split('\n')) {
-      const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
+      const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
       if (m && process.env[m[1]] === undefined) {
         let v = m[2].trim();
         if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+        else v = v.replace(/\s+#.*$/, '').trim();
         process.env[m[1]] = v;
       }
     }
@@ -47,9 +50,11 @@ async function boot() {
   // with TICKET_HMAC_SECRET. The old fallback 'dev-secret-change-me' is
   // public (it sits in the repo), so anyone could forge ticket proofs.
   // A production boot without a real secret refuses to start.
-  if (process.env.NODE_ENV === 'production' &&
-      (!process.env.TICKET_HMAC_SECRET || process.env.TICKET_HMAC_SECRET === 'dev-secret-change-me'))
-    throw new Error('TICKET_HMAC_SECRET must be set to a long random value in production');
+  // R-015: fail boot on an unset/fallback HMAC secret REGARDLESS of
+  // NODE_ENV — package.json start never set NODE_ENV=production, so the
+  // old production-only guard never fired in practice.
+  if (!process.env.TICKET_HMAC_SECRET || process.env.TICKET_HMAC_SECRET === 'dev-secret-change-me')
+    throw new Error('TICKET_HMAC_SECRET must be set to a long random value (refusing to boot with the repo-public fallback)');
   await migrate(db, driver);
   await ensureScratchSchema(db, driver);
   console.log(`[db] ${driver} ready`);
@@ -254,11 +259,21 @@ async function boot() {
     next();
   });
 
-  // CSRF enforcement on state-changing requests (sessions only; webhooks verify signatures instead)
+  // CSRF enforcement on state-changing requests (webhooks verify signatures instead).
+  // R-036: session-less POSTs to auth endpoints are NOT skipped anymore —
+  // a cross-site POST carries no sid cookie, so the old skip exempted
+  // exactly the forged requests. Logged-out forms always create an anon
+  // session (login/register/forgot GET), so a legitimate POST carries a
+  // token; a POST with no session at all must have come without visiting
+  // the form first, and is refused.
   app.use((req, res, next) => {
     if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
     if (req.path.startsWith('/webhooks/')) return next();
-    if (!req.sess) return next(); // no session (e.g. /setup) — nothing to forge against
+    if (!req.sess) {
+      const authPaths = ['/login', '/forgot', '/register', '/login/otp/request', '/login/otp/verify'];
+      if (authPaths.includes(req.path)) return res.status(403).render('error', { status: 403, message: 'Security token mismatch. Please open the form first and try again.' });
+      return next(); // e.g. /setup — nothing to forge against
+    }
     if (!checkCsrf(req)) return res.status(403).render('error', { status: 403, message: 'Security token mismatch. Please go back and try again.' });
     next();
   });
@@ -337,18 +352,25 @@ async function boot() {
   app.use(async (req, res, next) => {
     if (!req.user) return next();
     try {
-      const u = await db.get('SELECT force_password_reset, force_totp_enroll FROM users WHERE id = ?', [req.user.id]);
+      const u = await db.get('SELECT force_password_reset, force_totp_enroll, totp_secret FROM users WHERE id = ?', [req.user.id]);
       if (!u) return next();
       if (u.force_password_reset) {
         if (req.path === '/force-reset' || req.path === '/logout' || req.path === '/impersonate/exit') return next();
         return res.redirect('/force-reset');
       }
-      if (u.force_totp_enroll && req.user.role === 'admin') {
+      // admin_totp_required enforcement for PRE-EXISTING admins: the toggle
+      // could only be switched on by an already-enrolled admin, but other
+      // admins created earlier never got force_totp_enroll set, so they kept
+      // logging in with password alone while the setting claimed TOTP was
+      // required. The gate now derives enrollment from the live totp_secret
+      // instead of trusting the flag alone.
+      const totpRequired = req.settings && (req.settings.admin_totp_required === '1' || req.settings.admin_totp_required === 'true' || req.settings.admin_totp_required === true);
+      if ((u.force_totp_enroll || (totpRequired && !u.totp_secret)) && req.user.role === 'admin') {
         const adminPath = req.adminPath || '/ops-7f3a9c-console';
         if (req.path === adminPath + '/security' || req.path.startsWith(adminPath + '/security/') || req.path === '/logout' || req.path === '/impersonate/exit') return next();
         return res.redirect(adminPath + '/security');
       }
-    } catch {}
+    } catch (e) { return next(e); }
     next();
   });
 

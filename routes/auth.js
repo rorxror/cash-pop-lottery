@@ -5,7 +5,7 @@ const express = require('express');
 const router = express.Router();
 const { validEmail, hashPassword, verifyPassword, sha256, randHex, now, strongPassword, normalizeEmail, normalizePhone } = require('../lib/util');
 const { getS, getBool, getCurrencies } = require('../lib/settings');
-const { createSession, getSession, destroySession, rateLimit, verifyTotp, useBackupCode, parseUA, csrfToken, touchSession } = require('../lib/auth');
+const { createSession, getSession, destroySession, rateLimit, verifyTotp, useBackupCode, parseUA, csrfToken, touchSession, ANON_TTL, PREAUTH_TTL } = require('../lib/auth');
 const { getExtension, extEnabled } = require('../lib/extensions');
 const notify = require('../lib/notify');
 const otpLib = require('../lib/otp');
@@ -15,7 +15,7 @@ const audit = require('../lib/audit');
 async function anonSession(req, res) {
   // logged-out forms (login/register captcha, CSRF) need a session to persist
   if (req.sess) return;
-  const sid = await createSession(req.db, 0, { ip: req.ip, ua: req.headers['user-agent'] || '' });
+  const sid = await createSession(req.db, 0, { ip: req.ip, ua: req.headers['user-agent'] || '', ttlMs: ANON_TTL });
   res.cookie('sid', sid, { httpOnly: true, sameSite: 'lax', secure: req.secure || getBool(req.settings, 'force_ssl', false), maxAge: 3600000 });
   const sess = await getSession(req.db, sid);
   req.sess = sess; req.sessionData = sess ? sess.data : {};
@@ -29,10 +29,10 @@ function newCaptcha(req) {
   if (req.sess) { const { touchSession } = require('../lib/auth'); touchSession(req.db, req.sess.id, { _captcha: req.sessionData._captcha }); }
   return `<div class="field captcha"><label>Security check: what is ${a} + ${b}?</label><input type="text" name="captcha_answer" autocomplete="off" required></div>`;
 }
-function checkCaptcha(req) {
+function checkCaptcha(req, keep = false) {
   const ans = String(req.body.captcha_answer || '').trim();
   const ok = req.sessionData._captcha === sha256('captcha:' + ans + ':' + (req.sess ? req.sess.id : 'anon'));
-  req.sessionData._captcha = null;
+  if (!keep) req.sessionData._captcha = null;
   return ok;
 }
 async function captchaHtml(req) {
@@ -57,6 +57,7 @@ async function verifyProvider(key, ext, req) {
   const field = key === 'recaptcha' ? 'g-recaptcha-response' : key === 'hcaptcha' ? 'h-captcha-response' : 'cf-turnstile-response';
   const token = req.body[field];
   if (!token) return false;
+  // R-042: provider calls get a timeout (5s) so a hung provider cannot hang login. (async)
   const url = key === 'recaptcha' ? 'https://www.google.com/recaptcha/api/siteverify'
     : key === 'hcaptcha' ? 'https://hcaptcha.com/siteverify'
     : 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
@@ -64,6 +65,7 @@ async function verifyProvider(key, ext, req) {
     const r = await fetch(url, {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ secret: ext.config.secret_key, response: token, remoteip: req.ip }).toString(),
+      signal: AbortSignal.timeout(5000),
     });
     const j = await r.json();
     return !!j.success;
@@ -71,12 +73,15 @@ async function verifyProvider(key, ext, req) {
 }
 /* Unified captcha check (v14): every ENABLED provider must verify; when no
    provider is enabled, verification passes (nothing to check). */
-async function verifyCaptcha(req) {
+async function verifyCaptcha(req, opts = {}) {
   const capExt = await getExtension(req.db, 'custom_captcha');
-  if (extEnabled(capExt) && !checkCaptcha(req)) return false;
+  if (extEnabled(capExt) && !checkCaptcha(req, !!opts.keepCustom)) return false;
   for (const key of ['recaptcha', 'hcaptcha', 'turnstile']) {
     const ext = await getExtension(req.db, key);
-    if (!extEnabled(ext) || !ext.config.secret_key) continue;
+    // R-042: fail CLOSED when a provider is enabled but has no secret —
+    // the old code silently skipped verification (widget shown, nothing checked).
+    if (extEnabled(ext) && !ext.config.secret_key) return false;
+    if (!extEnabled(ext)) continue;
     if (!(await verifyProvider(key, ext, req))) return false;
   }
   return true;
@@ -92,8 +97,9 @@ async function recordLogin(req, userId, email, success) {
 /* ---------- login ---------- */
 router.get('/login', async (req, res) => {
   if (req.user) return res.redirect('/');
-  const capExt = await getExtension(req.db, 'custom_captcha');
-  if (extEnabled(capExt)) await anonSession(req, res);
+  // R-036: ALWAYS create the anon session (not only when custom captcha
+  // is on) so logged-out forms carry a CSRF token.
+  await anonSession(req, res);
   res.render('login', {
     phoneCountries: require('../lib/phone-countries').allowedCountries(req.settings),
     metaTitle: 'Sign In', metaDesc: 'Sign in to your account.',
@@ -101,11 +107,14 @@ router.get('/login', async (req, res) => {
     captchaHtml: await captchaHtml(req), recaptchaHtml: await recaptchaHtml(req),
     googleOn: getBool(req.settings, 'google_oauth_enabled', false) && !!process.env.GOOGLE_CLIENT_ID,
     facebookOn: getBool(req.settings, 'facebook_oauth_enabled', false) && !!process.env.FACEBOOK_APP_ID,
-    phoneOtpOn: getBool(req.settings, 'phone_otp_enabled', true),
-    emailOtpOn: getBool(req.settings, 'email_otp_enabled', true),
-    passwordOn: getBool(req.settings, 'password_login_enabled', false) || getBool(req.settings, 'phone_password_enabled', true) || getBool(req.settings, 'email_password_enabled', true),
-    phonePwOn: getBool(req.settings, 'phone_password_enabled', true),
-    emailPwOn: getBool(req.settings, 'email_password_enabled', true),
+    // R-047: OTP render and gate share fallback false (fail closed);
+    // passwordOn is the single password_login_enabled toggle — the phantom
+    // phone/email_password_enabled keys (never seeded) no longer force it on.
+    phoneOtpOn: getBool(req.settings, 'phone_otp_enabled', false),
+    emailOtpOn: getBool(req.settings, 'email_otp_enabled', false),
+    passwordOn: getBool(req.settings, 'password_login_enabled', true),
+    phonePwOn: getBool(req.settings, 'password_login_enabled', true),
+    emailPwOn: getBool(req.settings, 'password_login_enabled', true),
   });
 });
 
@@ -114,12 +123,15 @@ const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30, keyFn: r => 
 router.post('/login', loginLimiter, async (req, res) => {
   const render = async (vars = {}) => res.render('login', {
     metaTitle: 'Sign In', metaDesc: 'Sign in to your account.',
-    totpRequired: false, emailPrefill: req.body.email || '',
+    totpRequired: !!req.sessionData.pending_user_id, emailPrefill: req.body.email || '',
     captchaHtml: await captchaHtml(req), recaptchaHtml: await recaptchaHtml(req),
     googleOn: getBool(req.settings, 'google_oauth_enabled', false) && !!process.env.GOOGLE_CLIENT_ID,
     formError: vars.formError,
   });
-  if (!(await verifyCaptcha(req))) return render({ formError: 'Captcha verification failed.' });
+  // R-002: the TOTP second step is exempt from the captcha re-check — the
+  // password step already passed captcha, and the TOTP render carries none.
+  const isTotpStep = !!(req.body.totp_code && req.sessionData.pending_user_id);
+  if (!isTotpStep && !(await verifyCaptcha(req))) return render({ formError: 'Captcha verification failed.' });
 
   // TOTP challenge step
   if (req.body.totp_code && req.sessionData.pending_user_id) {
@@ -132,17 +144,23 @@ router.post('/login', loginLimiter, async (req, res) => {
     try {
       const fails = await req.db.get('SELECT COUNT(*) AS c FROM login_history WHERE user_id = ? AND success = 0 AND created_at > ?', [u.id, now() - 15 * 60 * 1000]);
       if (fails && Number(fails.c) >= 10) return render({ formError: 'Too many failed sign-in attempts. Please wait 15 minutes and try again.' });
-    } catch {}
+    } catch { return render({ formError: 'Sign-in temporarily unavailable. Please try again.' }); }
     let ok = verifyTotp(u.totp_secret, req.body.totp_code);
     let usedBackup = false;
     if (!ok && u.backup_codes) {
       const remaining = useBackupCode(u.backup_codes, req.body.totp_code);
-      if (remaining !== null) { await req.db.run('UPDATE users SET backup_codes = ? WHERE id = ?', [remaining, u.id]); ok = true; usedBackup = true; }
+      if (remaining !== null) {
+        // R-040: guarded CAS consume — a parallel request with the same
+        // backup code must not both succeed.
+        const upd = await req.db.run('UPDATE users SET backup_codes = ? WHERE id = ? AND backup_codes = ?', [remaining, u.id, u.backup_codes]);
+        if (upd.changes === 1) { ok = true; usedBackup = true; }
+      }
     }
     if (!ok) { await recordLogin(req, u.id, u.email, false); return render({ formError: 'Invalid authenticator code.' });
     }
     const { touchSession } = require('../lib/auth');
-    await touchSession(req.db, req.sess.id, { pending_user_id: null });
+    await touchSession(req.db, req.sess.id, { pending_user_id: null, pre_auth: null });
+    await recordLogin(req, u.id, u.email, true); // R-094: TOTP successes are now logged
     return finishLogin(req, res, u);
   }
 
@@ -150,30 +168,47 @@ router.post('/login', loginLimiter, async (req, res) => {
   // (/register collects full details) — a password sign-in never auto-creates an account.
   const isJson = (req.headers['content-type'] || '').includes('application/json');
   const jsonErr = (msg) => isJson ? res.status(401).json({ error: msg }) : render({ formError: msg });
-  const email = String(req.body.email || '').trim().toLowerCase();
-  const phone = String(req.body.phone || '').trim();
-  const identifier = email || phone;
+  // R-092: server-side email/phone routing mirrors the JS rule, so phone
+  // login works without JavaScript (identifier without '@' = phone).
+  const rawIdent = String(req.body.email || req.body.phone || '').trim();
+  const isEmailIdent = rawIdent.includes('@');
+  const email = isEmailIdent ? rawIdent.toLowerCase() : '';
+  const phone = isEmailIdent ? '' : normalizePhone(rawIdent);
+  const identifier = rawIdent;
+  // R-047 gate: password login can actually be disabled now.
+  if (!getBool(req.settings, 'password_login_enabled', true)) return jsonErr('Invalid credentials.');
   let u = email
     ? await req.db.get('SELECT * FROM users WHERE email = ?', [email])
     : await req.db.get('SELECT * FROM users WHERE phone = ?', [phone]);
+  // R-027: one generic message for no-account / wrong-password / banned /
+  // pending — the old four messages enumerated accounts and their status.
   if (!u) {
     await recordLogin(req, null, identifier, false);
-    return jsonErr('No account found with this ' + (email ? 'email' : 'phone') + '. Please register first.');
+    return jsonErr('Invalid credentials.');
   }
+  // R-028: per-account lockout on password failures (fail closed on error).
+  try {
+    const fails = await req.db.get('SELECT COUNT(*) AS c FROM login_history WHERE user_id = ? AND success = 0 AND created_at > ?', [u.id, now() - 15 * 60 * 1000]);
+    if (fails && Number(fails.c) >= 10) return jsonErr('Invalid credentials.');
+  } catch { return jsonErr('Invalid credentials.'); }
   if (!u.password_hash || !verifyPassword(req.body.password || '', u.password_hash)) {
-    await recordLogin(req, null, identifier, false);
-    return jsonErr('Invalid credentials. Please try again.');
+    await recordLogin(req, u.id, identifier, false);
+    return jsonErr('Invalid credentials.');
   }
-  if (u.status === 'banned') { await recordLogin(req, u.id, identifier, false); return jsonErr('This account has been blocked. Contact support.'); }
-  if (u.status === 'pending_review') { await recordLogin(req, u.id, identifier, false); return jsonErr('Your account is pending review.'); }
+  if (u.status === 'banned') { await recordLogin(req, u.id, identifier, false); return jsonErr('Invalid credentials.'); }
+  if (u.status === 'pending_review') { await recordLogin(req, u.id, identifier, false); return jsonErr('Invalid credentials.'); }
 
   if (u.totp_secret) {
     // stash pending auth; need a session to hold it — create temp session
     const { touchSession } = require('../lib/auth');
     let sess = req.sess;
     if (!sess) {
-      const sid = await createSession(req.db, u.id, { ip: req.ip, ua: req.headers['user-agent'], extra: { pending_user_id: u.id, pre_auth: true } });
+      // R-001: pending-TOTP session holds user_id 0 (anon) + pending id in
+      // data only; loadSession grants no req.user for pre_auth sessions.
+      const sid = await createSession(req.db, 0, { ip: req.ip, ua: req.headers['user-agent'], extra: { pending_user_id: u.id, pre_auth: true }, ttlMs: PREAUTH_TTL });
       res.cookie('sid', sid, { httpOnly: true, sameSite: 'lax', secure: req.secure || getBool(req.settings, 'force_ssl', false), maxAge: 15 * 60 * 1000 });
+      const { csrfToken: mkCsrf, touchSession: ts2 } = require('../lib/auth');
+      const tok = mkCsrf({}); await ts2(req.db, sid, { _csrf: tok }); req.csrfToken = tok;
       return res.render('login', {
         metaTitle: 'Two-Factor', metaDesc: '', totpRequired: true, emailPrefill: email,
         captchaHtml: '', recaptchaHtml: '', googleOn: false,
@@ -219,8 +254,7 @@ router.get('/register', async (req, res) => {
   if (!getBool(req.settings, 'registration_enabled', true))
     return res.status(403).render('error', { status: 403, message: 'Registration is currently disabled.' });
   if (req.user) return res.redirect('/');
-  const capExt2 = await getExtension(req.db, 'custom_captcha');
-  if (extEnabled(capExt2)) await anonSession(req, res);
+  await anonSession(req, res); // R-036: anon session for CSRF on every logged-out form
   const { allowedCountries } = require('../lib/phone-countries');
   res.render('register', {
     metaTitle: 'Create Account', metaDesc: 'Create your Cash Pop account.',
@@ -233,11 +267,13 @@ router.get('/register', async (req, res) => {
 });
 
 async function consumeOtpCode(db, code) {
+  // R-039/R-093: guarded atomic consume (changes===1) + scrypt verification.
+  const { verifyCode } = require('../lib/util');
   const rows = await db.query('SELECT * FROM otp_codes WHERE revoked = 0 AND (expires_at IS NULL OR expires_at > ?)', [now()]);
   for (const r of rows) {
-    if (r.code_hash === sha256('otp:' + String(code).trim()) && r.uses < r.max_uses) {
-      await db.run('UPDATE otp_codes SET uses = uses + 1 WHERE id = ?', [r.id]);
-      return r;
+    if (verifyCode(r.code_hash, String(code).trim()) && r.uses < r.max_uses) {
+      const upd = await db.run('UPDATE otp_codes SET uses = uses + 1 WHERE id = ? AND uses < max_uses', [r.id]);
+      if (upd.changes === 1) return r;
     }
   }
   return null;
@@ -281,18 +317,17 @@ router.post('/register', rateLimit({ windowMs: 3600000, max: 20, keyFn: r => 're
   if (password !== password_confirm) return render('Passwords do not match.');
   if (getBool(req.settings, 'policy_agreement', true) && !agree) return render('You must accept the terms to register.');
 
-  if (getBool(req.settings, 'otp_registration', false)) {
-    if (!otp_code || !(await consumeOtpCode(req.db, otp_code))) return render('Invalid or expired signup code. Ask the operator for a valid code.');
-  }
-
+  // R-039: duplicate checks run BEFORE consuming the signup code, so a
+  // failed (duplicate) registration no longer burns a single-use code.
   const emailLc = normalizeEmail(email);
   const ex = await req.db.get('SELECT id FROM users WHERE email = ?', [emailLc]);
   if (ex) return render('An account with this email already exists.');
-  // Same phone, second account: blocked. (Password is NOT unique: a different
-  // email/phone with the same password registers fine, as it should.)
   if (phone) {
     const exPhone = await req.db.get('SELECT id FROM users WHERE phone = ?', [phone]);
     if (exPhone) return render('An account with this phone number already exists.');
+  }
+  if (getBool(req.settings, 'otp_registration', false)) {
+    if (!otp_code || !(await consumeOtpCode(req.db, otp_code))) return render('Invalid or expired signup code. Ask the operator for a valid code.');
   }
 
   // Referral: ?ref=CODE on the register link credits the referrer (ViserLab-style)
@@ -303,12 +338,12 @@ router.post('/register', rateLimit({ windowMs: 3600000, max: 20, keyFn: r => 're
     if (ref) referredBy = ref.id;
   }
   const r = await req.db.run(
-    'INSERT INTO users (email, phone, name, password_hash, role, status, referred_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-    [emailLc, phone, name.trim(), hashPassword(password), 'player', 'active', referredBy, now()]);
+    'INSERT INTO users (email, phone, name, password_hash, role, status, referred_by, terms_accepted_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [emailLc, phone, name.trim(), hashPassword(password), 'player', 'active', referredBy, agree ? now() : null, now()]);
   // Referral code for the new player (used in their invite link)
   await req.db.run('UPDATE users SET referral_code = ? WHERE id = ?', ['CP' + r.id.toString(36).toUpperCase(), r.id]);
   const u = await req.db.get('SELECT * FROM users WHERE id = ?', [r.id]);
-  await audit.log(req.db, { actorId: u.id, actorRole: 'player', action: 'user.register', entity: 'user', entityId: u.id, detail: { email: emailLc }, ip: req.ip });
+  await audit.log(req.db, { actorId: u.id, actorRole: 'player', action: 'user.register', entity: 'user', entityId: u.id, detail: { email: emailLc, terms_accepted_at: agree ? now() : null }, ip: req.ip });
   // Device/IP duplicate detection (v14): flags only, never blocks.
   try {
     const { checkSharedDevice } = require('../lib/flags');
@@ -320,11 +355,15 @@ router.post('/register', rateLimit({ windowMs: 3600000, max: 20, keyFn: r => 're
 });
 
 /* ---------- forgot / reset password ---------- */
-router.get('/forgot', (req, res) => res.render('forgot', { metaTitle: 'Reset Password', metaDesc: '', sent: false }));
+router.get('/forgot', async (req, res) => { await anonSession(req, res); res.render('forgot', { metaTitle: 'Reset Password', metaDesc: '', sent: false, captchaHtml: await captchaHtml(req), recaptchaHtml: await recaptchaHtml(req) }); });
 router.post('/forgot', rateLimit({ windowMs: 3600000, max: 10, keyFn: r => 'forgot:' + r.ip }), async (req, res) => {
+  // R-091: captcha on forgot-password (was captcha-free at 10/hour for any address).
+  if (!(await verifyCaptcha(req))) return res.render('forgot', { metaTitle: 'Reset Password', metaDesc: '', sent: false, formError: 'Captcha verification failed.', captchaHtml: await captchaHtml(req), recaptchaHtml: await recaptchaHtml(req) });
   const email = String(req.body.email || '').trim().toLowerCase();
   const u = await req.db.get('SELECT * FROM users WHERE email = ?', [email]);
   if (u) {
+    // R-030: issuing a new token invalidates all prior unused tokens.
+    await req.db.run('UPDATE password_resets SET used = 1 WHERE user_id = ? AND used = 0', [u.id]);
     const token = randHex(24);
     await req.db.run('INSERT INTO password_resets (user_id, token_hash, expires_at, used, created_at) VALUES (?, ?, ?, 0, ?)',
       [u.id, sha256('reset:' + token), now() + 3600000, now()]);
@@ -338,7 +377,7 @@ router.get('/reset/:token', async (req, res) => {
   if (!pr) return res.status(400).render('error', { status: 400, message: 'This reset link is invalid or expired.' });
   res.render('reset', { metaTitle: 'Set New Password', metaDesc: '', token: req.params.token });
 });
-router.post('/reset/:token', async (req, res) => {
+router.post('/reset/:token', loginLimiter, async (req, res) => { // R-091: reset POST was rate-limit-free
   const pr = await req.db.get('SELECT * FROM password_resets WHERE token_hash = ? AND used = 0 AND expires_at > ?', [sha256('reset:' + req.params.token), now()]);
   if (!pr) return res.status(400).render('error', { status: 400, message: 'This reset link is invalid or expired.' });
   const target = await req.db.get('SELECT role FROM users WHERE id = ?', [pr.user_id]);
@@ -353,6 +392,8 @@ router.post('/reset/:token', async (req, res) => {
   }
   await req.db.run('UPDATE users SET password_hash = ? WHERE id = ?', [hashPassword(req.body.password), pr.user_id]);
   await req.db.run('UPDATE password_resets SET used = 1 WHERE id = ?', [pr.id]);
+  // R-030: a successful reset also burns every other outstanding token.
+  await req.db.run('UPDATE password_resets SET used = 1 WHERE user_id = ? AND used = 0', [pr.user_id]);
   const { destroyUserSessions } = require('../lib/auth');
   await destroyUserSessions(req.db, pr.user_id);
   await audit.log(req.db, { actorId: pr.user_id, actorRole: '', action: 'user.password_reset', entity: 'user', entityId: pr.user_id, detail: {}, ip: req.ip });
@@ -366,7 +407,14 @@ router.post('/reset/:token', async (req, res) => {
 router.get('/verify-email/:token', async (req, res) => {
   const row = await req.db.get('SELECT * FROM email_verifications WHERE token_hash = ? AND used = 0 AND expires_at > ?', [sha256('verify:' + req.params.token), now()]);
   if (!row) return res.status(400).render('error', { status: 400, message: 'This verification link is invalid or expired.' });
+  // R-095: duplicate-check FIRST, consume only on success — the old order
+  // burned a legitimate token when the address had been taken meanwhile.
+  const dup = await req.db.get('SELECT id FROM users WHERE email = ? AND id != ?', [row.new_email, row.user_id]);
+  if (dup) return res.status(400).render('error', { status: 400, message: 'This email address is already registered to another account.' });
   await req.db.run('UPDATE email_verifications SET used = 1 WHERE id = ?', [row.id]);
+  // R-014 (consume half): consuming one verification burns all other
+  // pending rows for this user, so a stale token cannot swap back later.
+  await req.db.run('UPDATE email_verifications SET used = 1 WHERE user_id = ? AND used = 0 AND id != ?', [row.user_id, row.id]);
   await req.db.run('UPDATE users SET email = ?, email_verified = 1 WHERE id = ?', [row.new_email, row.user_id]);
   await audit.log(req.db, { actorId: row.user_id, actorRole: 'player', action: 'user.email_verified', entity: 'user', entityId: row.user_id, detail: { via: 'link' }, ip: req.ip });
   try { await req.setFlash('success', 'Email verified. You can now deposit and withdraw.'); } catch {}
@@ -375,7 +423,11 @@ router.get('/verify-email/:token', async (req, res) => {
 
 /* ---------- OTP Login (phone/email, no password) ---------- */
 router.post('/login/otp/request', loginLimiter, async (req, res) => {
-  const idType = req.body.id_type === 'phone' ? 'phone' : 'email';
+  // R-009: captcha on OTP request (kept custom-captcha answer so resends
+  // on the same page still work) + account gate below.
+  if (!(await verifyCaptcha(req, { keepCustom: true }))) return res.status(400).json({ ok: false, error: 'Captcha verification failed.' });
+  // R-003: frontend sends {type}, server only read id_type — accept both.
+  const idType = (req.body.id_type || req.body.type) === 'phone' ? 'phone' : 'email';
   const rawId = String(req.body.identifier || '').trim();
   const identifier = idType === 'phone' ? normalizePhone(rawId) : normalizeEmail(rawId);
   if (idType === 'email' && !validEmail(identifier))
@@ -387,6 +439,15 @@ router.post('/login/otp/request', loginLimiter, async (req, res) => {
     return res.status(400).json({ ok: false, error: 'Phone login is disabled.' });
   if (idType === 'email' && !getBool(req.settings, 'email_otp_enabled', false))
     return res.status(400).json({ ok: false, error: 'Email login is disabled.' });
+  // R-009 (account half): when registration is disabled, OTP codes go only
+  // to identifiers tied to an existing account — no pumping arbitrary
+  // phones/emails at operator cost.
+  if (!getBool(req.settings, 'registration_enabled', true)) {
+    const acct = idType === 'phone'
+      ? await req.db.get('SELECT id FROM users WHERE phone = ? OR phone = ?', [identifier, identifier.startsWith('+') ? identifier.slice(1) : '+' + identifier])
+      : await req.db.get('SELECT id FROM users WHERE email = ?', [identifier]);
+    if (!acct) return res.status(400).json({ ok: false, error: 'Could not send the code.' });
+  }
   let code;
   try {
     code = await otpLib.createOtp(req.db, identifier, idType);
@@ -402,7 +463,7 @@ router.post('/login/otp/request', loginLimiter, async (req, res) => {
 });
 
 router.post('/login/otp/verify', loginLimiter, async (req, res) => {
-  const idType = req.body.id_type === 'phone' ? 'phone' : 'email';
+  const idType = (req.body.id_type || req.body.type) === 'phone' ? 'phone' : 'email';
   const rawId = String(req.body.identifier || '').trim();
   const identifier = idType === 'phone' ? normalizePhone(rawId) : normalizeEmail(rawId);
   const code = String(req.body.code || '').trim();
@@ -489,10 +550,10 @@ router.post('/login/complete-profile', async (req, res) => {
   const name = String(req.body.name || '').trim();
   if (name.length < 2) return res.status(400).json({ ok: false, error: 'Please enter your full name.' });
   if (!req.body.agree) return res.status(400).json({ ok: false, error: 'Please accept the Terms & Privacy Policy.' });
-  await req.db.run('UPDATE users SET name = ?, profile_completed = 1 WHERE id = ?', [name, u.id]);
+  await req.db.run('UPDATE users SET name = ?, profile_completed = 1, terms_accepted_at = ? WHERE id = ?', [name, now(), u.id]);
   const { touchSession } = require('../lib/auth');
   await touchSession(req.db, req.sess.id, { profile_pending: null });
-  await audit.log(req.db, { actorId: u.id, actorRole: 'player', action: 'user.profile_completed', entity: 'user', entityId: u.id, detail: {}, ip: req.ip });
+  await audit.log(req.db, { actorId: u.id, actorRole: 'player', action: 'user.profile_completed', entity: 'user', entityId: u.id, detail: { terms_accepted_at: now() }, ip: req.ip });
   notify.send(req.db, req.settings, 'email', 'welcome', u.email, { name }).catch(() => {});
   // v16: the page form posts as urlencoded (redirect), the modal posts JSON.
   if ((req.headers['content-type'] || '').includes('application/x-www-form-urlencoded')) {
@@ -531,6 +592,9 @@ router.get('/auth/facebook/callback', async (req, res) => {
     const me = await fetch(`https://graph.facebook.com/me?fields=id,name,email&access_token=${tj.access_token}`);
     const profile = await me.json();
     if (!profile.id) throw new Error('no profile from Facebook');
+    // R-096: refuse no-email Facebook signups instead of inserting '' (the
+    // second such user used to crash on the UNIQUE email column).
+    if (!profile.email) throw new Error('Facebook account has no email address on file');
     let u = await req.db.get('SELECT * FROM users WHERE facebook_id = ?', [profile.id]);
     if (!u && profile.email) u = await req.db.get('SELECT * FROM users WHERE email = ?', [String(profile.email).toLowerCase()]);
     if (!u) {
@@ -540,13 +604,28 @@ router.get('/auth/facebook/callback', async (req, res) => {
         [profile.email ? String(profile.email).toLowerCase() : '', '', String(profile.name || 'Facebook User'), '', 'player', 'active', profile.id, now()]);
       u = await req.db.get('SELECT * FROM users WHERE id = ?', [r.id]);
       await audit.log(req.db, { actorId: u.id, actorRole: 'player', action: 'user.register_oauth', entity: 'user', entityId: u.id, detail: { provider: 'facebook' }, ip: req.ip });
-    } else if (!u.facebook_id) {
+    }
+    // OAuth must not bypass account-status checks or the TOTP step (the
+    // Facebook callback previously checked neither).
+    const { oauthAccountCheck, touchSession } = require('../lib/auth');
+    const chk = oauthAccountCheck(u);
+    if (!chk.ok) { await recordLogin(req, u.id, u.email || profile.id, false); throw new Error(chk.error); }
+    if (!u.facebook_id) {
       await req.db.run('UPDATE users SET facebook_id = ? WHERE id = ?', [profile.id, u.id]);
+    }
+    if (chk.totpRequired) {
+      if (!req.sess) await anonSession(req, res);
+      await touchSession(req.db, req.sess.id, { pending_user_id: u.id, pre_auth: true });
+      return res.render('login', {
+        metaTitle: 'Two-Factor', metaDesc: '', totpRequired: true, emailPrefill: u.email || '',
+        captchaHtml: '', recaptchaHtml: '', googleOn: false,
+      });
     }
     await recordLogin(req, u.id, u.email || profile.id, true);
     return finishLogin(req, res, u, 'Welcome back!');
   } catch (e) {
-    return res.status(400).render('error', { status: 400, message: 'Facebook sign-in failed: ' + e.message });
+    console.error('[oauth] Facebook callback failed:', e.message);
+    return res.status(400).render('error', { status: 400, message: 'Facebook sign-in failed. Please try again.' });
   }
 });
 
@@ -591,7 +670,14 @@ router.get('/auth/google/callback', async (req, res) => {
         [emailLc, '', String(profile.name || emailLc.split('@')[0]), '', 'player', 'active', 1, now()]);
       u = await req.db.get('SELECT * FROM users WHERE id = ?', [r.id]);
       await audit.log(req.db, { actorId: u.id, actorRole: 'player', action: 'user.register_oauth', entity: 'user', entityId: u.id, detail: { provider: 'google' }, ip: req.ip });
-    } else if (!u.email_verified) {
+    }
+    // OAuth gate BEFORE any mutation of an existing account: previously
+    // 'banned' was checked only after the email_verified update, and
+    // pending_review/TOTP were never checked.
+    const { oauthAccountCheck, touchSession } = require('../lib/auth');
+    const chk = oauthAccountCheck(u);
+    if (!chk.ok) { await recordLogin(req, u.id, emailLc, false); throw new Error(chk.error); }
+    if (!u.email_verified) {
       // v16: an existing password-registered user who signs in via Google has
       // just proven ownership of this email — mark it verified so the
       // verified-contact gate (deposits/withdrawals) stops blocking them.
@@ -599,11 +685,19 @@ router.get('/auth/google/callback', async (req, res) => {
       await req.db.run('UPDATE users SET email_verified = 1 WHERE id = ?', [u.id]);
       u.email_verified = 1;
     }
-    if (u.status === 'banned') throw new Error('account blocked');
+    if (chk.totpRequired) {
+      if (!req.sess) await anonSession(req, res);
+      await touchSession(req.db, req.sess.id, { pending_user_id: u.id, pre_auth: true });
+      return res.render('login', {
+        metaTitle: 'Two-Factor', metaDesc: '', totpRequired: true, emailPrefill: emailLc,
+        captchaHtml: '', recaptchaHtml: '', googleOn: false,
+      });
+    }
     await recordLogin(req, u.id, emailLc, true);
     return finishLogin(req, res, u);
   } catch (e) {
-    return res.status(400).render('error', { status: 400, message: 'Google sign-in failed: ' + e.message });
+    console.error('[oauth] Google callback failed:', e.message);
+    return res.status(400).render('error', { status: 400, message: 'Google sign-in failed. Please try again.' });
   }
 });
 

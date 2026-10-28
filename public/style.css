@@ -680,6 +680,15 @@ img, video, svg { max-width: 100%; }
     --sys-label3: #636366;
     --sys-separator: rgba(84, 84, 88, 0.4);
     --sys-blue: #0a84ff;
+    /* The base theme's variable names are inverted (--white is dark navy,
+       --navy-900 is the light page background). Dark mode MUST invert the
+       pair together, or body text (color: var(--sys-label), near-white in
+       dark mode) renders on the still-light page background — unreadable.
+       Paired surfaces keep their contrast: --white-on---navy-900 pairs
+       (sidebar, badges, buttons) invert together. Pinned light surfaces
+       (form cards, admin inputs) keep their own dark text and stay readable. */
+    --white: #f5f5f7;
+    --navy-900: #0b0d12;
   }
 }
 

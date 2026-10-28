@@ -30,6 +30,22 @@
     </div>
     <% } %>
 
+    <!-- TOTP SECOND STEP (rendered when totpRequired) -->
+    <% if (typeof totpRequired !== 'undefined' && totpRequired) { %>
+    <div id="loginTotp">
+      <p class="muted center">Enter the 6-digit code from your authenticator app (or a backup code).</p>
+      <form method="POST" action="/login">
+        <input type="hidden" name="_csrf" value="<%= csrf %>">
+        <div class="field">
+          <label for="totpCode">Authenticator code</label>
+          <input type="text" id="totpCode" name="totp_code" inputmode="numeric" maxlength="8" placeholder="000000" autocomplete="one-time-code" required>
+        </div>
+        <button type="submit" class="btn btn-p btn-lg btn-block">Verify &amp; Sign In →</button>
+      </form>
+      <p class="muted sm center"><a href="/login">Back to sign-in</a></p>
+    </div>
+    <% } %>
+
     <!-- PASSWORD SIGN-IN (primary) -->
     <div id="loginPw">
       <form id="pwForm" method="POST" action="/login">

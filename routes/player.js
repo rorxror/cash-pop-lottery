@@ -4,12 +4,12 @@
 const express = require('express');
 const router = express.Router();
 const QRCode = require('qrcode');
-const { now, randHex, hmac, sha256, hashPassword, verifyPassword, toMinor, esc, signTicket } = require('../lib/util');
+const { now, randHex, hmac, sha256, hashPassword, verifyPassword, toMinor, decimalsFor, esc, signTicket, normalizePhone } = require('../lib/util');
 const { getS, getBool, getCurrencies, getSettings } = require('../lib/settings');
-const { requireLogin } = require('../lib/auth');
+const { requireLogin, rateLimit } = require('../lib/auth');
 const { getBalances, postLedger, depositPolicy, withdrawalPolicy, chargeFor, createDeposit, createWithdrawal, checkWithdrawalRules, notePayoutDetails, releaseReferralCredits } = require('../lib/money');
 const { getRail } = require('../lib/rails');
-const { newTotpSecret, totpUri, verifyTotp, newBackupCodes, hashBackupCodes, destroyUserSessions } = require('../lib/auth');
+const { newTotpSecret, totpUri, verifyTotp, newBackupCodes, hashBackupCodes, useBackupCode, destroyUserSessions } = require('../lib/auth');
 const notify = require('../lib/notify');
 const audit = require('../lib/audit');
 
@@ -20,14 +20,19 @@ router.get('/play', requireLogin, async (req, res) => {
   const wagerOptions = req.wagerOptions;
   const prizeTable = await req.db.query('SELECT pops_count, multiplier FROM prize_table ORDER BY pops_count');
   const wallets = await getBalances(req.db, req.user.id);
-  const bal = (wallets.find(w => w.currency === baseCurrency(req)) || { balance: 0 }).balance;
+  // R-071: the playslip offers every FUNDED wallet, not only the base
+  // wallet — a EUR-funded player used to see $0.00 and could not play.
+  const funded = wallets.filter(w => Number(w.balance) > 0).map(w => w.currency);
+  const sel = funded.includes(String(req.query.currency || '').toUpperCase()) ? String(req.query.currency).toUpperCase() : (funded[0] || baseCurrency(req));
+  const bal = (wallets.find(w => w.currency === sel) || { balance: 0 }).balance;
   res.render('play', {
     metaTitle: 'Play', metaDesc: 'Pick your pops and buy a Cash Pop ticket.',
     wagerOptions, prizeTable, maxDraws: parseInt(getS(req.settings, 'max_draws', '7'), 10) || 7, balance: bal,
+    wallets, playCurrency: sel,
   });
 });
 
-router.post('/play/buy', requireLogin, async (req, res) => {
+router.post('/play/buy', requireLogin, rateLimit({ windowMs: 60000, max: 10, keyFn: req => `lottery-buy:${req.user.id}` }), async (req, res) => { // R-073: buy rate limit mirroring scratch
   const settings = req.settings;
   const maxPops = parseInt(getS(settings, 'max_pops', '15'), 10) || 15;
   const maxDraws = parseInt(getS(settings, 'max_draws', '7'), 10) || 7;
@@ -46,8 +51,14 @@ router.post('/play/buy', requireLogin, async (req, res) => {
   // Responsible play: self-exclusion / cooling-off blocks the lottery too,
   // not just scratch (previously only scratch checked this).
   try {
-    const { enforceAccountPlayable } = require('../lib/scratch');
+    const { enforceAccountPlayable, responsibleStatus } = require('../lib/scratch');
     await enforceAccountPlayable(req.db, req.user.id);
+    // R-024: session_limit_minutes is now enforced (session start = the
+    // login session's created_at) instead of being a dead saved setting.
+    const rp = await responsibleStatus(req.db, req.user.id);
+    const lim = Number(rp.session_limit_minutes || 0);
+    if (lim > 0 && req.sess && req.sess.created_at && (now() - Number(req.sess.created_at)) > lim * 60000)
+      return fail('Your session limit has been reached. Please sign out and take a break before playing again.');
   } catch (e) { return fail(e.message); }
 
   // find upcoming draws (server-side — never trust client draw ids)
@@ -67,11 +78,15 @@ router.post('/play/buy', requireLogin, async (req, res) => {
     .map(x => x.trim().split(':').map(Number)).filter(([n, pc]) => n > 0 && pc > 0 && pc < 100);
   const bundle = bundles.find(([n]) => n === drawIds.length);
   if (bundle) { bundleDiscount = bundle[1]; total = Math.round(total * (100 - bundleDiscount) / 100); }
-  const currency = baseCurrency(req);
+  // R-071: buy in the requested currency when the player holds it (or
+  // when it is a configured currency); otherwise the base currency.
+  const reqCur = String(req.body.currency || '').toUpperCase();
+  const currency = (reqCur && getCurrencies(req.settings).some(c => c.code === reqCur)) ? reqCur : baseCurrency(req);
 
   try {
     const publicId = 'T' + now().toString(36).toUpperCase() + randHex(4).toUpperCase();
-    const secret = process.env.TICKET_HMAC_SECRET || 'dev-secret-change-me';
+    const secret = process.env.TICKET_HMAC_SECRET;
+    if (!secret) throw new Error('TICKET_HMAC_SECRET is not configured');
     const ticket = {
       public_id: publicId, user_id: req.user.id, pops: JSON.stringify(pops),
       wager, draw_ids: JSON.stringify(drawIds), total, currency,
@@ -84,9 +99,22 @@ router.post('/play/buy', requireLogin, async (req, res) => {
       // re-settle. Re-check inside the txn: any non-scheduled draw fails
       // the whole purchase cleanly (the debit rolls back with it).
       for (const did of drawIds) {
-        const d = await tx.get("SELECT status FROM draws WHERE id = ?", [did]);
-        if (!d || d.status !== 'scheduled') throw new Error('A selected draw just closed — please buy again for the next draws.');
+        // R-072: re-check close_at INSIDE the txn, not just status — buys
+        // used to succeed for up to ~60 min after close (hourly settle).
+        const d = await tx.get("SELECT status, close_at FROM draws WHERE id = ?", [did]);
+        if (!d || d.status !== 'scheduled' || Number(d.close_at) <= now()) throw new Error('A selected draw just closed — please buy again for the next draws.');
       }
+      // R-073: per-draw per-player stake cap (setting, minor units, 0 = off),
+      // enforced inside the txn alongside the loss limit.
+      const stakeCap = parseInt(getS(settings, 'per_draw_stake_cap', '0'), 10) || 0;
+      if (stakeCap > 0) {
+        const staked = await tx.get("SELECT COALESCE(SUM(t.total),0) AS s FROM ticket_entries te JOIN tickets t ON t.id = te.ticket_id WHERE te.draw_id IN (" + drawIds.map(() => '?').join(',') + ") AND t.user_id = ?", [...drawIds, req.user.id]);
+        if (Number(staked.s) + total > stakeCap) throw new Error('This purchase would exceed your per-draw stake cap.');
+      }
+      // Daily loss limit also applies to lottery buys (previously scratch
+      // only). Checked inside the transaction so check + debit are atomic.
+      const { enforceLotteryLossLimit } = require('../lib/scratch');
+      await enforceLotteryLossLimit(tx, req.user.id, total, currency);
       // atomic debit
       await postLedger(tx, { userId: req.user.id, currency, type: 'ticket_purchase', amount: -total, refType: 'ticket', refId: publicId, meta: { pops, wager, draws: drawIds.length, bundle_discount: bundleDiscount } });
       const r = await tx.run(
@@ -103,18 +131,24 @@ router.post('/play/buy', requireLogin, async (req, res) => {
         const rate = parseFloat(getS(req.settings, 'referral_rate', '5')) || 0;
         const buyer = await tx.get('SELECT referred_by FROM users WHERE id = ?', [req.user.id]);
         if (buyer && buyer.referred_by && rate > 0) {
+          // R-124: banned/pending_review referrers do not accrue.
+          const ref = await tx.get('SELECT status FROM users WHERE id = ?', [buyer.referred_by]);
           const comm = Math.round(total * rate / 100);
-          if (comm > 0) await tx.run('INSERT INTO referral_credits (referrer_id, referee_id, ticket_id, currency, amount, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          if (ref && ref.status === 'active' && comm > 0) await tx.run('INSERT INTO referral_credits (referrer_id, referee_id, ticket_id, currency, amount, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
             [buyer.referred_by, req.user.id, r.id, currency, comm, 'pending', now()]);
+          else if (ref && ref.status !== 'active') await audit.log(tx, { actorId: req.user.id, actorRole: 'player', action: 'referral.skipped_inactive', entity: 'user', entityId: buyer.referred_by, detail: { status: ref.status }, ip: req.ip });
         }
       }
       // agent commission on purchase
       if (req.user.agent_id) {
         const rate = parseFloat(getS(settings, 'commission_rate', '5')) || 0;
         if (rate > 0) {
-          const amt = Math.round(total * rate / 100);
-          await tx.run('INSERT INTO commissions (agent_id, user_id, ticket_id, currency, amount, rate, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            [req.user.agent_id, req.user.id, r.id, currency, amt, rate, now()]);
+          const ag = await tx.get('SELECT status FROM users WHERE id = ?', [req.user.agent_id]);
+          if (ag && ag.status === 'active') {
+            const amt = Math.round(total * rate / 100);
+            await tx.run('INSERT INTO commissions (agent_id, user_id, ticket_id, currency, amount, rate, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+              [req.user.agent_id, req.user.id, r.id, currency, amt, rate, now()]);
+          } else if (ag && ag.status !== 'active') await audit.log(tx, { actorId: req.user.id, actorRole: 'player', action: 'commission.skipped_inactive', entity: 'user', entityId: req.user.agent_id, detail: { status: ag.status }, ip: req.ip });
         }
       }
       return r.id;
@@ -126,7 +160,7 @@ router.post('/play/buy', requireLogin, async (req, res) => {
     try { await releaseReferralCredits(req.db, req.user.id, req.settings); } catch (e) { console.error('referral release failed:', e.message); }
     res.redirect('/ticket/' + publicId);
   } catch (e) {
-    res.status(400).render('error', { status: 400, message: 'Purchase failed: ' + e.message });
+    console.error('[play/buy] failed:', e.message); res.status(400).render('error', { status: 400, message: 'Purchase failed. Please try again or contact support.' });
   }
 });
 
@@ -203,13 +237,14 @@ router.post('/deposit/new', requireLogin, async (req, res) => {
   if (!methodId) return res.status(400).render('error', { status: 400, message: 'Invalid deposit method.' });
   const method = await req.db.get("SELECT * FROM payment_methods WHERE id = ? AND enabled = 1 AND kind IN ('deposit','both')", [methodId]);
   if (!method) return res.status(400).render('error', { status: 400, message: 'Invalid deposit method.' });
-  const amount = toMinor(req.body.amount);
+  const amount = toMinor(req.body.amount, decimalsFor(method.currency, getCurrencies(req.settings)));
   if (amount === null || amount <= 0) return res.status(400).render('error', { status: 400, message: 'Enter a valid amount.' });
   if (method.min_amount && amount < method.min_amount) return res.status(400).render('error', { status: 400, message: 'Amount is below the minimum for this method.' });
   if (method.max_amount && amount > method.max_amount) return res.status(400).render('error', { status: 400, message: 'Amount exceeds the maximum for this method.' });
   const userData = {};
   for (const f of methodCustomFields(method)) {
-    const v = String(req.body['custom_' + f.key] || '').trim();
+    // R-116: per-field length cap (was unbounded up to the 2MB body limit).
+    const v = String(req.body['custom_' + f.key] || '').trim().slice(0, 2000);
     if (f.required && !v) return res.status(400).render('error', { status: 400, message: `Field "${f.label}" is required.` });
     userData[f.key] = v;
   }
@@ -223,7 +258,7 @@ router.post('/deposit/new', requireLogin, async (req, res) => {
     await req.setFlash('success', 'Deposit request submitted. It will be credited after review.');
     res.redirect('/wallet');
   } catch (e) {
-    res.status(400).render('error', { status: 400, message: 'Deposit failed: ' + e.message });
+    console.error('[deposit] failed:', e.message); res.status(400).render('error', { status: 400, message: 'Deposit failed. Please try again or contact support.' });
   }
 });
 
@@ -259,18 +294,26 @@ router.post('/withdraw/new', requireLogin, async (req, res) => {
   if (!methodId) return res.status(400).render('error', { status: 400, message: 'Invalid withdrawal method.' });
   const method = await req.db.get("SELECT * FROM payment_methods WHERE id = ? AND enabled = 1 AND kind IN ('withdrawal','both')", [methodId]);
   if (!method) return res.status(400).render('error', { status: 400, message: 'Invalid withdrawal method.' });
-  const amount = toMinor(req.body.amount);
+  const amount = toMinor(req.body.amount, decimalsFor(method.currency, getCurrencies(req.settings)));
   if (amount === null || amount <= 0) return res.status(400).render('error', { status: 400, message: 'Enter a valid amount.' });
   if (method.min_amount && amount < method.min_amount) return res.status(400).render('error', { status: 400, message: 'Amount is below the minimum for this method.' });
   if (method.max_amount && amount > method.max_amount) return res.status(400).render('error', { status: 400, message: 'Amount exceeds the maximum for this method.' });
   const userData = {};
   for (const f of methodCustomFields(method)) {
-    const v = String(req.body['custom_' + f.key] || '').trim();
+    // R-116: per-field length cap (was unbounded up to the 2MB body limit).
+    const v = String(req.body['custom_' + f.key] || '').trim().slice(0, 2000);
     if (f.required && !v) return res.status(400).render('error', { status: 400, message: `Field "${f.label}" is required.` });
     userData[f.key] = v;
   }
   // v14 withdrawal rules (turnover, caps, payout lock, same-method) — checked
   // BEFORE the OTP step so a blocked withdrawal never sends a code.
+  // R-114: balance check also happens BEFORE the OTP step, so a player
+  // with insufficient balance is not sent a code for a doomed withdrawal.
+  {
+    const wallets0 = await getBalances(req.db, req.user.id);
+    const bal0 = (wallets0.find(w => w.currency === method.currency) || { balance: 0 }).balance;
+    if (Number(bal0) < amount) return res.status(400).render('error', { status: 400, message: 'Insufficient balance for this withdrawal.' });
+  }
   const ruleCheck = await checkWithdrawalRules(req.db, req.settings, req.user, method, amount, userData);
   if (!ruleCheck.ok) {
     if (ruleCheck.changeDetected) await notePayoutDetails(req.db, req.user.id, ruleCheck.fingerprint, true);
@@ -302,13 +345,13 @@ router.post('/withdraw/new', requireLogin, async (req, res) => {
     });
   }
   try {
-    const { publicId } = await createWithdrawal(req.db, { userId: req.user.id, method, amountMinor: amount, userData });
+    const { publicId } = await createWithdrawal(req.db, { userId: req.user.id, method, amountMinor: amount, userData, settings: req.settings, user: req.user });
     await notePayoutDetails(req.db, req.user.id, ruleCheck.fingerprint, false);
     await audit.log(req.db, { actorId: req.user.id, actorRole: 'player', action: 'withdrawal.create', entity: 'withdrawal', entityId: publicId, detail: { amount, method: method.name }, ip: req.ip });
     await req.setFlash('success', 'Withdrawal request submitted and amount held. It will be processed after review.');
     res.redirect('/wallet');
   } catch (e) {
-    res.status(400).render('error', { status: 400, message: 'Withdrawal failed: ' + e.message });
+    console.error('[withdraw] failed:', e.message); res.status(400).render('error', { status: 400, message: 'Withdrawal failed. Please try again or contact support.' });
   }
 });
 
@@ -323,6 +366,16 @@ router.post('/withdraw/verify', requireLogin, async (req, res) => {
   if (!v.ok) return res.status(400).render('error', { status: 400, message: 'Withdrawal verification failed: ' + v.error });
   const method = await req.db.get("SELECT * FROM payment_methods WHERE id = ? AND enabled = 1 AND kind IN ('withdrawal','both')", [pending.method_id]);
   if (!method) return res.status(400).render('error', { status: 400, message: 'Withdrawal method no longer available.' });
+  // R-113: re-check the global/per-user withdrawal policy at OTP-verify,
+  // not just at OTP-request (admin may have disabled withdrawals since).
+  {
+    const pol = withdrawalPolicy(req.settings, req.user);
+    if (!pol.allowed) {
+      const { touchSession: tsP } = require('../lib/auth');
+      await tsP(req.db, req.sess.id, { pending_withdrawal: null });
+      return res.status(400).render('error', { status: 400, message: pol.reason });
+    }
+  }
   // Re-check v14 rules: state may have changed since the OTP was requested
   // (e.g. a payout-detail change started a lock in the meantime).
   const ruleCheck2 = await checkWithdrawalRules(req.db, req.settings, req.user, method, pending.amount, pending.userData);
@@ -335,13 +388,13 @@ router.post('/withdraw/verify', requireLogin, async (req, res) => {
   const { touchSession } = require('../lib/auth');
   await touchSession(req.db, req.sess.id, { pending_withdrawal: null });
   try {
-    const { publicId } = await createWithdrawal(req.db, { userId: req.user.id, method, amountMinor: pending.amount, userData: pending.userData });
+    const { publicId } = await createWithdrawal(req.db, { userId: req.user.id, method, amountMinor: pending.amount, userData: pending.userData, settings: req.settings, user: req.user });
     await notePayoutDetails(req.db, req.user.id, ruleCheck2.fingerprint, false);
     await audit.log(req.db, { actorId: req.user.id, actorRole: 'player', action: 'withdrawal.create', entity: 'withdrawal', entityId: publicId, detail: { amount: pending.amount, method: method.name, otp_verified: true }, ip: req.ip });
     await req.setFlash('success', 'Withdrawal verified and submitted. Amount held — it will be processed after review.');
     res.redirect('/wallet');
   } catch (e) {
-    res.status(400).render('error', { status: 400, message: 'Withdrawal failed: ' + e.message });
+    console.error('[withdraw] failed:', e.message); res.status(400).render('error', { status: 400, message: 'Withdrawal failed. Please try again or contact support.' });
   }
 });
 
@@ -364,8 +417,22 @@ router.get('/profile', requireLogin, async (req, res) => {
 router.post('/profile', requireLogin, async (req, res) => {
   const { name, phone, country } = req.body;
   if (!name || name.trim().length < 2) { await req.setFlash('error', 'Name is required.'); return res.redirect('/profile'); }
-  await req.db.run('UPDATE users SET name = ?, phone = ?, country = ? WHERE id = ?',
-    [name.trim(), String(phone || '').trim().slice(0, 32), String(country || '').trim().slice(0, 64), req.user.id]);
+  // v17.1: store the canonical form (same normalizePhone as registration)
+  // and refuse a number another account already uses (normalised both sides,
+  // since older rows may hold raw spellings).
+  const rawPhone = String(phone || '').trim();
+  const newPhone = rawPhone ? normalizePhone(rawPhone).slice(0, 32) : '';
+  if (rawPhone && !newPhone) { await req.setFlash('error', 'Enter a valid phone number or leave it blank.'); return res.redirect('/profile'); }
+  if (newPhone) {
+    const others = await req.db.query("SELECT phone FROM users WHERE id != ? AND phone IS NOT NULL AND phone != ''", [req.user.id]);
+    if (others.some(u => normalizePhone(u.phone) === newPhone)) { await req.setFlash('error', 'This phone number is already used by another account.'); return res.redirect('/profile'); }
+  }
+  // Changing the phone number resets mobile_verified: previously a verified
+  // account kept its verified status on a brand-new, never-verified number,
+  // and the deposit/withdrawal verified-contact gate passed on it.
+  const phoneChanged = newPhone !== normalizePhone(req.user.phone || '');
+  await req.db.run('UPDATE users SET name = ?, phone = ?, country = ?, mobile_verified = ? WHERE id = ?',
+    [name.trim(), newPhone, String(country || '').trim().slice(0, 64), phoneChanged ? 0 : (req.user.mobile_verified || 0), req.user.id]);
   await audit.log(req.db, { actorId: req.user.id, actorRole: req.user.role, action: 'user.profile_update', entity: 'user', entityId: req.user.id, detail: {}, ip: req.ip });
   await req.setFlash('success', 'Profile updated.');
   res.redirect('/profile');
@@ -446,6 +513,21 @@ router.get('/security', requireLogin, async (req, res) => {
     totpEnabled: !!u.totp_secret, showSetup: false, showBackup: false,
   });
 });
+router.post('/security/password', requireLogin, async (req, res) => {
+  // R-122: logged-in password change (was only possible logged-out).
+  const u = await req.db.get('SELECT * FROM users WHERE id = ?', [req.user.id]);
+  if (!u || !verifyPassword(req.body.current_password || '', u.password_hash || '')) { await req.setFlash('error', 'Current password is incorrect.'); return res.redirect('/security'); }
+  const { passwordError } = require('../lib/validate');
+  const { isBreached } = require('../lib/breached');
+  const pwErr = passwordError(req.body.password, u.role, getBool(req.settings, 'secure_password', true));
+  if (pwErr || req.body.password !== req.body.password2) { await req.setFlash('error', pwErr || 'Passwords do not match.'); return res.redirect('/security'); }
+  if (getBool(req.settings, 'breached_password_check', true) && await isBreached(req.body.password)) { await req.setFlash('error', 'This password has appeared in a data breach. Please choose a different one.'); return res.redirect('/security'); }
+  await req.db.run('UPDATE users SET password_hash = ? WHERE id = ?', [hashPassword(req.body.password), req.user.id]);
+  await destroyUserSessions(req.db, req.user.id, req.sess ? req.sess.id : null);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: u.role, action: 'user.password_change', entity: 'user', entityId: req.user.id, detail: { other_sessions_revoked: true }, ip: req.ip });
+  await req.setFlash('success', 'Password changed. Other sessions were signed out.');
+  res.redirect('/security');
+});
 router.post('/security/totp/start', requireLogin, async (req, res) => {
   const secret = newTotpSecret();
   const { touchSession } = require('../lib/auth');
@@ -472,14 +554,33 @@ router.post('/security/totp/confirm', requireLogin, async (req, res) => {
 router.post('/security/totp/disable', requireLogin, async (req, res) => {
   const u = await req.db.get('SELECT * FROM users WHERE id = ?', [req.user.id]);
   if (!verifyPassword(req.body.password || '', u.password_hash || '')) { await req.setFlash('error', 'Wrong password.'); return res.redirect('/security'); }
+  // A password alone must not defeat the second factor: require a current
+  // authenticator code (or a backup code, which disable invalidates anyway).
+  const code = String(req.body.totp_code || '').trim();
+  let secondOk = !!(u.totp_secret && verifyTotp(u.totp_secret, code));
+  if (!secondOk && u.backup_codes) secondOk = useBackupCode(u.backup_codes, code) !== null;
+  if (!secondOk) { await req.setFlash('error', 'Invalid authenticator code.'); return res.redirect('/security'); }
   await req.db.run("UPDATE users SET totp_secret = '', backup_codes = '[]' WHERE id = ?", [req.user.id]);
-  await audit.log(req.db, { actorId: req.user.id, actorRole: req.user.role, action: 'user.totp_disable', entity: 'user', entityId: req.user.id, detail: {}, ip: req.ip });
+  // R-123: disabling 2FA revokes other sessions (keep current).
+  await destroyUserSessions(req.db, req.user.id, req.sess ? req.sess.id : null);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: req.user.role, action: 'user.totp_disable', entity: 'user', entityId: req.user.id, detail: { other_sessions_revoked: true }, ip: req.ip });
   await req.setFlash('success', 'Two-factor authentication disabled.');
   res.redirect('/security');
 });
 router.post('/security/totp/backup', requireLogin, async (req, res) => {
+  const u = await req.db.get('SELECT * FROM users WHERE id = ?', [req.user.id]);
+  // Regenerating recovery codes previously required neither password nor a
+  // second factor and wrote no audit entry: anyone holding a session could
+  // replace the user's codes and lock them out of 2FA recovery.
+  if (!u || !verifyPassword(req.body.password || '', u.password_hash || '')) { await req.setFlash('error', 'Wrong password.'); return res.redirect('/security'); }
+  const code = String(req.body.totp_code || '').trim();
+  let secondOk = !!(u.totp_secret && verifyTotp(u.totp_secret, code));
+  if (!secondOk && u.backup_codes) secondOk = useBackupCode(u.backup_codes, code) !== null;
+  if (!secondOk) { await req.setFlash('error', 'Invalid authenticator code.'); return res.redirect('/security'); }
   const codes = newBackupCodes(8);
   await req.db.run('UPDATE users SET backup_codes = ? WHERE id = ?', [hashBackupCodes(codes), req.user.id]);
+  await destroyUserSessions(req.db, req.user.id, req.sess ? req.sess.id : null);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: req.user.role, action: 'user.totp_backup_regen', entity: 'user', entityId: req.user.id, detail: { other_sessions_revoked: true }, ip: req.ip });
   res.render('security', { metaTitle: 'Security', metaDesc: '', totpEnabled: true, showSetup: false, showBackup: true, backupCodes: codes });
 });
 router.post('/security/sessions/revoke', requireLogin, async (req, res) => {
