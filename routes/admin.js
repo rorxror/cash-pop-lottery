@@ -2254,34 +2254,35 @@ router.post('/methods/:id/delete', async (req, res) => {
   await req.setFlash('success', 'Method deleted.');
   res.redirect(R(req, '/methods'));
 });
-/* METHOD-MODE-01: per-method Manual Pay / Auto Pay. Auto is honest or
-   it does not exist (R-044): it can only be SAVED when this rail has a
-   real provider-confirmation path (signed webhooks) AND every field
-   Auto needs is already filled below. Rails without a webhook path
-   (UPI, bank transfer, vouchers, cash agents, PayPal — no PayPal
-   verification client exists in this codebase) stay Manual forever,
-   and the admin is told exactly that, in plain words. */
+/* METHOD-MODE-01 + AUTO-INTEGRATION: per-method Manual Pay / Auto Pay.
+   Auto is honest or it does not exist (R-044): it can only be SAVED
+   when this rail has a real provider-confirmation path AND every field
+   Auto needs is already filled below (lib/rails.autoCapability decides
+   per rail: PayPal -> Client ID + Secret + Webhook ID, verified by
+   lib/paypal.js; Skrill -> Merchant ID + Secret Word, verified by
+   lib/skrill.js; other webhook rails -> the signing secret). Rails
+   with no provider-confirmation path at all (plain UPI ID, bank
+   transfer, vouchers, cash agents, plain QR) stay Manual, and the
+   admin is told exactly that, in plain words. */
 function autoPayBlockReason(rail) {
   if (!rail) return 'Is method ki rail pehchani nahi gayi — Auto band hai, ye Manual hi chalega.';
-  if (rail.key === 'paypal') return 'PayPal ki payment verification integration abhi code me hai hi nahi — Auto band hai, Manual chalega.';
-  return 'Is method me Auto asal me nahi ho sakta — provider ki taraf se koi payment confirmation (webhook) nahi aati, is liye ye Manual hi chalega.';
+  return 'Is method me Auto asal me nahi ho sakta — provider ki taraf se koi payment confirmation (webhook/API) nahi aati, is liye ye Manual hi chalega.';
 }
 async function autoPayMissingFields(req, m, rail) {
   const { loadCredentials } = require('../lib/credentials');
+  const { autoCapability } = require('../lib/rails');
   const saved = await loadCredentials(req.db, m.id).catch(() => ({}));
-  const missing = [];
-  for (const f of (rail ? rail.credentialFields : [])) {
-    const v = String(saved[f.key] || '').trim();
-    if ((f.key === 'webhook_secret' || f.required) && !v) missing.push(f.label);
-  }
-  return missing;
+  if (!rail) return ['(unknown rail)'];
+  return autoCapability(rail, saved).missing;
 }
 function methodModeCard(req, m, rail) {
   const mode = m.processing_mode === 'auto' ? 'auto' : 'manual';
   const canAuto = !!(rail && rail.webhook);
   const autoLimit = getS(req.settings, 'auto_withdrawal_limit', '0');
   const autoLine = canAuto
-    ? 'Auto Pay: deposit provider ki signed confirmation (webhook) aane par khud credit hoga. Withdrawal sirf auto-withdrawal limit tak khud approve hota hai — paisa bhejna aur mark-paid admin hi karega.'
+    ? (rail && rail.key === 'paypal'
+      ? 'Auto Pay: PayPal khud payment ki tasdeeq karega (signed webhook + transaction ID check) — tasdeeq par hi credit hoga, baghair tasdeeq kuch nahi. Withdrawal sirf auto-withdrawal limit tak khud approve hota hai — paisa bhejna aur mark-paid admin hi karega.'
+      : 'Auto Pay: deposit provider ki signed confirmation (webhook) aane par khud credit hoga. Withdrawal sirf auto-withdrawal limit tak khud approve hota hai — paisa bhejna aur mark-paid admin hi karega.')
     : autoPayBlockReason(rail);
   const limitLine = (!autoLimit || autoLimit === '0')
     ? 'Auto-withdrawal limit abhi OFF (0) hai — Auto mode me bhi koi withdrawal khud approve nahi hoga.'

@@ -47,7 +47,15 @@ test.before(async () => { await migrate(db, 'sqlite'); });
 test('U-21 definitions: PayPal is a real rail; ewallet no longer lumps it in; no blob credentials anywhere', () => {
   const paypal = rails.getRail('paypal');
   assert.ok(paypal, 'paypal rail must exist');
-  assert.equal(paypal.webhook, false, 'PayPal webhook verification is not HMAC — rail must not claim it');
+  /* AUTO-INTEGRATION round supersedes the v20/v21 state: PayPal
+     verification is still NOT HMAC — but lib/paypal.js now verifies it
+     for real (OAuth2 + capture lookup + PayPal's verify-webhook-
+     signature API on the dedicated /webhooks/paypal route), so the
+     rail may claim a confirmation path. What must NEVER happen is the
+     generic HMAC verifier being PayPal's gate: rails.autoCapability
+     requires the webhook_id the real verifier reads. */
+  assert.equal(paypal.webhook, true, 'paypal has a real (non-HMAC) verification client since the AUTO-INTEGRATION round');
+  assert.ok(paypal.credentialFields.some(f => f.key === 'webhook_id'), 'paypal must carry the Webhook ID its verifier reads');
   const ppKeys = paypal.credentialFields.map(f => f.key);
   assert.ok(ppKeys.includes('account_email') && ppKeys.includes('client_id') && ppKeys.includes('client_secret'));
   const ew = rails.getRail('ewallet');
@@ -61,9 +69,17 @@ test('U-21 definitions: PayPal is a real rail; ewallet no longer lumps it in; no
   }
 });
 
-test('U-21 definitions: every webhook:true rail can supply webhook_secret (the only key the verifier reads)', () => {
+test('U-21 definitions: every webhook:true rail can supply the credential its verifier reads', () => {
   for (const r of rails.RAILS) {
     if (!r.webhook) continue;
+    /* AUTO-INTEGRATION: PayPal is the one provider-API exception — its
+       verifier (lib/paypal.js) reads client_id/secret + webhook_id,
+       never an HMAC secret. Every other webhook rail's generic
+       verifier reads webhook_secret, so the field must exist. */
+    if (r.key === 'paypal') {
+      assert.ok(r.credentialFields.some(f => f.key === 'webhook_id'), 'paypal verifier reads webhook_id');
+      continue;
+    }
     assert.ok(r.credentialFields.some(f => f.key === 'webhook_secret'), `${r.key} claims webhooks but has no webhook_secret field`);
   }
   // manual-mode honesty: no provider-API field is required on any rail

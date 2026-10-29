@@ -10,7 +10,7 @@ const { requireLogin, rateLimit } = require('../lib/auth');
 const { getBalances, postLedger, depositPolicy, withdrawalPolicy, chargeFor, createDeposit, createWithdrawal, checkWithdrawalRules, notePayoutDetails, notePendingPayoutChange, promotePayoutDetails, releaseReferralCredits, maybeAutoApproveWithdrawal, exchangeCurrency, exchangeQuote } = require('../lib/money');
 const kycLib = require('../lib/kyc');
 const uploadLib = require('../lib/upload');
-const { getRail, getReceivingDetails, getPublicConfig, validateUserProof } = require('../lib/rails');
+const { getRail, getReceivingDetails, validateUserProof } = require('../lib/rails');
 const railByKey = getRail;
 const { newTotpSecret, totpUri, verifyTotp, verifyTotpStep, newBackupCodes, hashBackupCodes, useBackupCode, destroyUserSessions, parseUA } = require('../lib/auth');
 const notify = require('../lib/notify');
@@ -452,10 +452,9 @@ router.get('/deposit/new', requireLogin, async (req, res) => {
   // DS-005: show the player WHERE to pay (receiving details from the
   // method's stored credentials - public payment addresses, never secrets).
   const receiving = await getReceivingDetails(req.db, method);
-  /* U-21 §5.3: non-secret gateway public config (e.g. the cards
-     publishable key, Google Pay gateway parameters) for the view to
-     render — getPublicConfig hard-skips secret/password fields. */
-  const gatewayPublic = await getPublicConfig(req.db, method);
+  /* HOTFIX 2026-10-29: gateway public config is NO LONGER fetched or
+     rendered on the player deposit page (see deposit_new.ejs note) —
+     players see pay-to details only, never credential values. */
   /* INSTR-APPLE-01 + METHOD-MODE-01: the how-to the player reads is
      the AUTO text on an Auto Pay method and the manual steps on a
      Manual Pay method — never mixed. */
@@ -464,13 +463,81 @@ router.get('/deposit/new', requireLogin, async (req, res) => {
     ? (railDef && railDef.autoInstruction) || 'Once the payment provider confirms your payment, your balance is credited automatically.'
     : method.instruction;
   res.render('deposit_new', {
-    metaTitle: 'Deposit', metaDesc: '', methods, receiving, gatewayPublic,
+    metaTitle: 'Deposit', metaDesc: '', methods, receiving,
     method: { ...method, instruction: shownInstruction, custom_fields: methodCustomFields(method) },
     methodDec: decimalsFor(method.currency, req.currencies),
     myCur: req.cur, minEquiv: equivStr(req, method.min_amount, method.currency), maxEquiv: equivStr(req, method.max_amount, method.currency),
     rateNote: rateNote(req, method.currency),
   });
 });
+
+/* AUTO-INTEGRATION: verify-on-submit for Auto Pay methods whose
+   provider offers a real lookup. Returns 'credited' only when the
+   PROVIDER confirms the exact payment; every other outcome leaves the
+   deposit pending and truthful (never a fake success, never a
+   rejection based on an unverified claim either). */
+async function tryPaypalAutoVerify(req, method, depositId, txid) {
+  try {
+    const { loadCredentials } = require('../lib/credentials');
+    const paypal = require('../lib/paypal');
+    const { creditVerifiedDeposit, refAlreadyUsed } = require('../lib/auto-credit');
+    const creds = await loadCredentials(req.db, method.id).catch(() => ({}));
+    if (!creds.client_id || !creds.client_secret) return 'not_configured';
+    const dep = await req.db.get('SELECT * FROM deposits WHERE id = ?', [depositId]);
+    if (!dep || dep.status !== 'pending') return 'unconfirmed';
+    if (await refAlreadyUsed(req.db, txid, dep.id)) {
+      await audit.log(req.db, { actorId: req.user.id, actorRole: 'player', action: 'deposit.auto_verify_refused', entity: 'deposit', entityId: dep.public_id, detail: { provider: 'paypal', reason: 'transaction already used by another deposit' }, ip: req.ip });
+      return 'unconfirmed';
+    }
+    const got = await paypal.getCapture(creds, txid);
+    if (!got.ok) {
+      await audit.log(req.db, { actorId: null, actorRole: 'webhook', action: 'deposit.auto_verify_unconfirmed', entity: 'deposit', entityId: dep.public_id, detail: { provider: 'paypal', reason: got.reason }, ip: req.ip });
+      return 'unconfirmed';
+    }
+    const chk = paypal.checkCaptureAgainstDeposit(got.capture, { amountMinor: dep.amount, currency: dep.currency, accountEmail: creds.account_email });
+    if (!chk.ok) {
+      await audit.log(req.db, { actorId: null, actorRole: 'webhook', action: 'deposit.auto_verify_unconfirmed', entity: 'deposit', entityId: dep.public_id, detail: { provider: 'paypal', reason: chk.reason }, ip: req.ip });
+      return 'unconfirmed';
+    }
+    const r = await creditVerifiedDeposit(req.db, req.settings, dep, { provider: 'paypal', ref: txid });
+    return r.applied ? 'credited' : 'unconfirmed';
+  } catch { return 'unconfirmed'; }
+}
+/* Skrill's status report may arrive BEFORE the player submits the
+   deposit (the report fires when Skrill processes the payment). When
+   the player then submits that Skrill transaction ID on an Auto
+   method, apply the already-verified recorded event — same amount /
+   currency gate as the live path. */
+async function trySkrillRecordedEvent(req, method, depositId, txid) {
+  try {
+    const { loadCredentials } = require('../lib/credentials');
+    const creds = await loadCredentials(req.db, method.id).catch(() => ({}));
+    if (String(creds.provider || '') !== 'Skrill' || !creds.merchant_id || !creds.secret_word) return 'none';
+    const events = await req.db.query("SELECT * FROM webhook_events WHERE provider = 'skrill' AND deposit_id IS NULL AND action = 'payment_success' ORDER BY id ASC LIMIT 50", []);
+    for (const ev of events) {
+      let f = {};
+      try { f = JSON.parse(ev.payload || '{}'); } catch { continue; }
+      if (String(f.mb_transaction_id || '') !== String(txid)) continue;
+      if (String(f.merchant_id || '') !== String(creds.merchant_id)) continue;
+      const dep = await req.db.get('SELECT * FROM deposits WHERE id = ?', [depositId]);
+      if (!dep || dep.status !== 'pending') return 'none';
+      const amtOk = Math.round(Number(f.mb_amount) * 100) === Number(dep.amount);
+      const curOk = String(f.mb_currency || '').toUpperCase() === String(dep.currency).toUpperCase();
+      if (!amtOk || !curOk) {
+        await audit.log(req.db, { actorId: null, actorRole: 'webhook', action: 'deposit.auto_verify_unconfirmed', entity: 'deposit', entityId: dep.public_id, detail: { provider: 'skrill', reason: amtOk ? 'currency mismatch' : 'amount mismatch' }, ip: req.ip });
+        return 'none';
+      }
+      const { creditVerifiedDeposit } = require('../lib/auto-credit');
+      const r = await creditVerifiedDeposit(req.db, req.settings, dep, { provider: 'skrill', ref: txid });
+      if (r.applied) {
+        try { await req.db.run('UPDATE webhook_events SET deposit_id = ? WHERE id = ?', [dep.id, ev.id]); } catch {}
+        return 'credited';
+      }
+      return 'none';
+    }
+  } catch {}
+  return 'none';
+}
 
 router.post('/deposit/new', requireLogin, rateLimit({ windowMs: 60000, max: 10, keyFn: req => `deposit:${req.user.id}` }), async (req, res) => { // DS-050: pending-deposit spam cap
   // U-02: submission failures return the player to the form (or the
@@ -511,13 +578,27 @@ router.post('/deposit/new', requireLogin, rateLimit({ windowMs: 60000, max: 10, 
     userData[f.key] = v;
   }
   try {
-    const { publicId } = await createDeposit(req.db, { userId: req.user.id, method, amountMinor: amount, userData, settings: req.settings });
+    const createdDep = await createDeposit(req.db, { userId: req.user.id, method, amountMinor: amount, userData, settings: req.settings });
+    const publicId = createdDep.publicId;
     await audit.log(req.db, { actorId: req.user.id, actorRole: 'player', action: 'deposit.create', entity: 'deposit', entityId: publicId, detail: { amount, method: method.name }, ip: req.ip });
-    // NO auto-approve: a deposit is credited ONLY by a verified provider
-    // webhook or an admin approving against a bank statement entry. The old
-    // code approved small "auto" deposits with zero payment verification —
-    // free money for anyone who submitted a request.
-    await req.setFlash('success', 'Deposit request submitted. It will be credited after review.');
+    // NO unverified auto-approve: a deposit is credited ONLY by a
+    // verified provider confirmation or an admin approving against a
+    // statement entry. The old code approved small "auto" deposits with
+    // zero payment verification — free money for anyone who submitted.
+    // AUTO-INTEGRATION: on an Auto Pay method we now ASK THE PROVIDER
+    // about the reference the player just submitted (PayPal capture
+    // lookup / an already-received signed Skrill status report) and
+    // credit only on its exact confirmation.
+    let flashMsg = 'Deposit request submitted. It will be credited after review.';
+    if (method.processing_mode === 'auto' && method.rail === 'paypal' && userData.paypal_txid) {
+      const r = await tryPaypalAutoVerify(req, method, createdDep.id, userData.paypal_txid);
+      if (r === 'credited') flashMsg = 'Deposit credited — PayPal confirmed your payment automatically.';
+      else flashMsg = 'Deposit request submitted. PayPal has not confirmed this payment yet — if PayPal confirms it, your balance is credited automatically; otherwise our team will review it.';
+    } else if (method.processing_mode === 'auto' && method.rail === 'ewallet' && userData.ewallet_txid) {
+      const r = await trySkrillRecordedEvent(req, method, createdDep.id, userData.ewallet_txid);
+      if (r === 'credited') flashMsg = 'Deposit credited — Skrill confirmed your payment automatically.';
+    }
+    await req.setFlash('success', flashMsg);
     res.redirect('/wallet');
   } catch (e) {
     console.error('[deposit] failed:', e.message);

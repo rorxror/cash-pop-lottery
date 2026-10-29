@@ -24,7 +24,7 @@ const VALUES = {
   upi: { upi_id: 'owner@okhdfcbank', merchant_name: 'Cash Pop' },
   pix: { pix_key: 'owner@bank.com.br', pix_key_type: 'email', provider: 'Test PSP', mode: 'live', api_token: 'pix_token_test', webhook_secret: 'whsec_pix_test' },
   mobile_money: { provider: 'M-Pesa', account_number: '+254712345678', account_name: 'Owner Name', api_key: 'mm_key_test', webhook_secret: 'whsec_mm_test' },
-  ewallet: { provider: 'Skrill', account_email: 'owner@skrill.test', client_id: 'ew_client_test', client_secret: 'ew_secret_test', webhook_secret: 'whsec_ew_test' },
+  ewallet: { provider: 'Skrill', account_email: 'owner@skrill.test', client_id: 'ew_client_test', client_secret: 'ew_secret_test', merchant_id: '987654321', secret_word: 'ew_secret_word_test', webhook_secret: 'whsec_ew_test' },
   apple_pay: { merchant_id: 'merchant.test.example', processor: 'Stripe', api_key: 'ap_key_test', webhook_secret: 'whsec_ap_test' },
   google_pay: { merchant_id: '12345678901234567890', merchant_name: 'Cash Pop', gateway: 'Stripe', gateway_merchant_id: 'gw_test', environment: 'PRODUCTION', webhook_secret: 'whsec_gp_test' },
   samsung_pay: { merchant_id: 'sp_merchant_test', service_id: 'sp_service_test', api_key: 'sp_key_test', webhook_secret: 'whsec_sp_test' },
@@ -32,7 +32,7 @@ const VALUES = {
   qr_pay: { provider: 'PromptPay', qr_image_url: 'https://example.com/qr.png', account_label: 'Owner 0812345678' },
   voucher: { issuer: 'Test Voucher Co', api_key: 'vch_key_test' },
   cash_agent: { agent_network: 'Test Agents', instructions: 'Pay at any Test Agent shop.' },
-  paypal: { account_email: 'owner@paypal.test', account_name: 'Owner Name', mode: 'live', client_id: 'pp_client_test', client_secret: 'pp_secret_test' },
+  paypal: { account_email: 'owner@paypal.test', account_name: 'Owner Name', mode: 'live', client_id: 'pp_client_test', client_secret: 'pp_secret_test', webhook_id: 'WH-PP-TEST-123' },
 };
 
 class Jar {

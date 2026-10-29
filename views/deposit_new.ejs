@@ -30,20 +30,15 @@
         <% }) %>
       </div>
       <% } %>
-      <% /* U-21 §5.3 chain leg (v20, U-24 wave): the gateway's PUBLIC,
-            non-secret configuration for this method (e.g. the card
-            processor's publishable key) — getPublicConfig hard-skips
-            secret/password fields and, post U-28.9, the sandbox/live
-            mode. Each value renders with its plain-word label, like
-            the receiving details above. */ %>
-      <% if (typeof gatewayPublic !== 'undefined' && gatewayPublic && gatewayPublic.length) { %>
-      <div class="instruction">
-        <p><strong>Payment gateway details:</strong></p>
-        <% gatewayPublic.forEach(function(g){ %>
-        <p class="muted"><%= g.label %>: <strong class="code"><%= g.value %></strong></p>
-        <% }) %>
-      </div>
-      <% } %>
+      <% /* HOTFIX 2026-10-29 (owner-reported on live v21): the U-21
+            "Payment gateway details" block that used to render here is
+            REMOVED. It displayed gateway configuration values (incl.
+            the PayPal Client ID, whitelisted in PUBLIC_CONFIG_FIELDS)
+            to players although nothing on this page consumes them —
+            no checkout button, no JS. Player pages show pay-to
+            (receiving) details and instructions ONLY; every credential
+            value stays admin-side. Regression test:
+            test/player-credential-leak.test.js */ %>
       <form action="/deposit/new" method="POST" id="depositForm">
         <input type="hidden" name="_csrf" value="<%= csrf %>">
         <input type="hidden" name="method_id" value="<%= method.id %>">

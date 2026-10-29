@@ -60,6 +60,165 @@ function parseEvent(body) {
   return { ref: String(ref), eventId: String(eventId), typeRaw, action, raw: j, amount: Number.isFinite(amtNum) ? amtNum : null, currency };
 }
 
+/* ================= AUTO-INTEGRATION: provider-specific routes =======
+   PayPal and Skrill do NOT sign with an HMAC shared secret, so the
+   generic HMAC route below can never verify them. These dedicated
+   routes are registered BEFORE '/:rail' and verify the way each
+   provider actually signs: PayPal via PayPal's own
+   verify-webhook-signature API (lib/paypal.js), Skrill via the Secret
+   Word md5sig on its status report (lib/skrill.js). Both fail closed:
+   unverifiable => 401, recorded, never credited. Crediting goes
+   through lib/auto-credit (decideDeposit's guarded transition), so a
+   replayed or duplicated event can never credit twice. */
+const paypal = require('../lib/paypal');
+const skrill = require('../lib/skrill');
+const { creditVerifiedDeposit, revokeVerifiedDeposit, findDepositForRef } = require('../lib/auto-credit');
+
+router.post('/paypal', rateLimit({ windowMs: 60000, max: 60, keyFn: r => 'webhook:' + r.ip }), express.raw({ type: '*/*' }), async (req, res) => {
+  const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(String(req.body || ''));
+  let event = null;
+  try { event = JSON.parse(rawBody.toString('utf8')); } catch {}
+  if (!event || typeof event !== 'object' || !event.event_type)
+    return res.status(400).json({ ok: false, error: 'bad event' });
+  const eventId = String(event.id || sha256(rawBody.toString('utf8')));
+  const methods = await req.db.query("SELECT * FROM payment_methods WHERE rail = 'paypal' AND enabled = 1", []);
+  /* The delivery is authentic only if PayPal's verification API says
+     SUCCESS against one configured method's Webhook ID + app creds. */
+  let method = null, creds = null;
+  for (const m of methods) {
+    const c = await loadCredentials(req.db, m.id).catch(() => ({}));
+    if (!c.client_id || !c.client_secret || !c.webhook_id) continue;
+    const v = await paypal.verifyWebhookSignature(c, { webhookId: c.webhook_id, headers: req.headers, rawBody });
+    if (v.ok) { method = m; creds = c; break; }
+  }
+  await audit.log(req.db, { actorId: null, actorRole: 'webhook', action: 'webhook.received', entity: 'rail', entityId: 'paypal', detail: { ok: !!method, eventType: event.event_type, methodId: method ? method.id : null }, ip: req.ip });
+  if (!method) return res.status(401).json({ ok: false, error: 'signature verification failed' });
+
+  const dup = await req.db.get('SELECT id FROM webhook_events WHERE event_id = ? AND provider = ?', [eventId, 'paypal']);
+  if (dup) return res.json({ ok: true, rail: 'paypal', note: 'duplicate event ignored' });
+
+  const settings = await getSettings(req.db, req.driver, true);
+  const methodAuto = method.processing_mode === 'auto';
+  let depositId = null, note = 'event recorded, no action', action = 'unknown';
+
+  const applyCapture = async (capture) => {
+    action = 'payment_success';
+    const dep = await findDepositForRef(req.db, { methodId: method.id, ref: capture.id, proofKey: 'paypal_txid' });
+    if (!dep) { note = 'event recorded, no matching deposit'; return; }
+    depositId = dep.id;
+    const chk = paypal.checkCaptureAgainstDeposit(capture, { amountMinor: dep.amount, currency: dep.currency, accountEmail: creds.account_email });
+    if (!chk.ok) {
+      await audit.log(req.db, { actorId: null, actorRole: 'webhook', action: 'webhook.verification_mismatch', entity: 'deposit', entityId: dep.public_id, detail: { provider: 'paypal', ref: capture.id, reason: chk.reason }, ip: req.ip });
+      note = 'webhook NOT auto-applied (' + chk.reason + ') — manual review required';
+      return;
+    }
+    if (!methodAuto) {
+      await audit.log(req.db, { actorId: null, actorRole: 'webhook', action: 'webhook.manual_mode_recorded', entity: 'deposit', entityId: dep.public_id, detail: { provider: 'paypal', ref: capture.id, note: 'method is Manual Pay — event recorded, no auto action' }, ip: req.ip });
+      note = 'event recorded — method is Manual Pay, deposit stays for admin review';
+      return;
+    }
+    if (dep.status !== 'pending') { note = 'deposit already ' + dep.status + ', no action taken'; return; }
+    const r = await creditVerifiedDeposit(req.db, settings, dep, { provider: 'paypal', ref: capture.id });
+    note = r.applied ? 'deposit approved via PayPal webhook' : ('approve failed: ' + r.reason);
+  };
+
+  if (event.event_type === 'PAYMENT.CAPTURE.COMPLETED') {
+    const capture = paypal.normalizeCapture(event.resource);
+    if (capture) await applyCapture(capture); else note = 'event recorded, unparseable capture resource';
+  } else if (event.event_type === 'CHECKOUT.ORDER.APPROVED' || event.event_type === 'CHECKOUT.ORDER.COMPLETED') {
+    /* We never create PayPal orders (players pay the account directly),
+       so an order event can only credit when it already carries a
+       COMPLETED capture; an APPROVED-but-uncaptured order is recorded
+       and never credited. */
+    const order = event.resource || {};
+    const units = Array.isArray(order.purchase_units) ? order.purchase_units : [];
+    const captures = units.flatMap(u => (u.payments && Array.isArray(u.payments.captures)) ? u.payments.captures : []);
+    if (String(order.status || '') === 'COMPLETED' && captures.length) {
+      const capture = paypal.normalizeCapture(captures[0]);
+      if (capture) await applyCapture(capture);
+    } else note = 'order event recorded — no completed capture, no credit';
+  } else if (event.event_type === 'PAYMENT.CAPTURE.REFUNDED' || event.event_type === 'PAYMENT.CAPTURE.REVERSED') {
+    action = 'refund';
+    const r = event.resource || {};
+    const up = (Array.isArray(r.links) ? r.links : []).find(l => l && l.rel === 'up' && /\/captures\/([A-Za-z0-9_-]+)/.test(String(l.href || '')));
+    const captureId = up ? /\/captures\/([A-Za-z0-9_-]+)/.exec(String(up.href))[1] : '';
+    const refundValue = r.amount && r.amount.value !== null && r.amount.value !== undefined ? Number(r.amount.value) : NaN;
+    const refundMinor = Number.isFinite(refundValue) ? Math.round(refundValue * 100) : null;
+    const refundCur = String((r.amount && r.amount.currency_code) || '').toUpperCase() || null;
+    const dep = captureId ? await findDepositForRef(req.db, { methodId: method.id, ref: captureId, proofKey: 'paypal_txid' }) : null;
+    if (!dep) note = 'refund recorded, no matching deposit';
+    else {
+      depositId = dep.id;
+      if (!methodAuto) note = 'refund recorded — method is Manual Pay, no auto action';
+      else if (dep.status !== 'approved') note = 'refund recorded — deposit is ' + dep.status;
+      else if (refundMinor === null || refundMinor !== Number(dep.amount) || (refundCur && refundCur !== String(dep.currency).toUpperCase())) {
+        await audit.log(req.db, { actorId: null, actorRole: 'webhook', action: 'webhook.verification_mismatch', entity: 'deposit', entityId: dep.public_id, detail: { provider: 'paypal', ref: captureId, reason: 'refund amount/currency does not match the full deposit — partial refunds stay manual' }, ip: req.ip });
+        note = 'refund NOT auto-applied (not a full-amount match) — manual review required';
+      } else {
+        const rr = await revokeVerifiedDeposit(req.db, settings, dep, { provider: 'paypal', ref: captureId });
+        note = rr.applied ? 'deposit revoked via PayPal refund webhook' : ('revoke failed: ' + rr.reason);
+      }
+    }
+  }
+
+  try {
+    await req.db.run('INSERT INTO webhook_events (provider, event_id, deposit_id, action, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      ['paypal', eventId, depositId, action, JSON.stringify(event).slice(0, 2000), now()]);
+  } catch (e) { if (/UNIQUE|duplicate/i.test(e.message)) return res.json({ ok: true, rail: 'paypal', note: 'duplicate event ignored' }); throw e; }
+  res.json({ ok: true, rail: 'paypal', note });
+});
+
+router.post('/skrill', rateLimit({ windowMs: 60000, max: 60, keyFn: r => 'webhook:' + r.ip }), express.urlencoded({ extended: false }), async (req, res) => {
+  const fields = {};
+  for (const [k, v] of Object.entries(req.body || {})) fields[k] = String(v);
+  const parsed = skrill.parseStatusReport(fields);
+  const methods = await req.db.query("SELECT * FROM payment_methods WHERE rail = 'ewallet' AND enabled = 1", []);
+  let method = null;
+  for (const m of methods) {
+    const c = await loadCredentials(req.db, m.id).catch(() => ({}));
+    if (String(c.provider || '') !== 'Skrill') continue;
+    if (skrill.verifyStatusReport(c, fields).ok) { method = m; break; }
+  }
+  await audit.log(req.db, { actorId: null, actorRole: 'webhook', action: 'webhook.received', entity: 'rail', entityId: 'skrill', detail: { ok: !!method, status: parsed.status, methodId: method ? method.id : null }, ip: req.ip });
+  if (!method) return res.status(401).send('verification failed');
+
+  const settings = await getSettings(req.db, req.driver, true);
+  const methodAuto = method.processing_mode === 'auto';
+  const eventId = 'skrill:' + (parsed.mbTransactionId || sha256(JSON.stringify(fields))) + ':' + parsed.status;
+  const existing = await req.db.get('SELECT id, deposit_id FROM webhook_events WHERE event_id = ? AND provider = ?', [eventId, 'skrill']);
+
+  let depositId = existing && existing.deposit_id ? Number(existing.deposit_id) : null;
+  if (!depositId && (parsed.action === 'payment_success' || parsed.action === 'chargeback')) {
+    const dep = await findDepositForRef(req.db, { methodId: method.id, ref: parsed.mbTransactionId, proofKey: 'ewallet_txid' });
+    if (dep) {
+      const amountOk = parsed.amountMinor !== null && parsed.amountMinor === Number(dep.amount);
+      const currencyOk = !!parsed.currency && parsed.currency === String(dep.currency).toUpperCase();
+      if (!amountOk || !currencyOk) {
+        await audit.log(req.db, { actorId: null, actorRole: 'webhook', action: 'webhook.verification_mismatch', entity: 'deposit', entityId: dep.public_id, detail: { provider: 'skrill', ref: parsed.mbTransactionId, reason: amountOk ? 'currency mismatch' : 'amount mismatch' }, ip: req.ip });
+      } else if (!methodAuto) {
+        await audit.log(req.db, { actorId: null, actorRole: 'webhook', action: 'webhook.manual_mode_recorded', entity: 'deposit', entityId: dep.public_id, detail: { provider: 'skrill', ref: parsed.mbTransactionId, note: 'method is Manual Pay — event recorded, no auto action' }, ip: req.ip });
+        depositId = dep.id; // recorded against the deposit, not applied
+      } else if (parsed.action === 'payment_success' && dep.status === 'pending') {
+        const r = await creditVerifiedDeposit(req.db, settings, dep, { provider: 'skrill', ref: parsed.mbTransactionId });
+        if (r.applied) depositId = dep.id;
+      } else if (parsed.action === 'chargeback' && dep.status === 'approved') {
+        const r = await revokeVerifiedDeposit(req.db, settings, dep, { provider: 'skrill', ref: parsed.mbTransactionId });
+        if (r.applied) depositId = dep.id;
+      } else depositId = dep.id;
+    }
+  }
+  if (existing) {
+    if (depositId && !existing.deposit_id) { try { await req.db.run('UPDATE webhook_events SET deposit_id = ? WHERE id = ?', [depositId, existing.id]); } catch {} }
+  } else {
+    try {
+      await req.db.run('INSERT INTO webhook_events (provider, event_id, deposit_id, action, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        ['skrill', eventId, depositId, parsed.action, JSON.stringify(fields).slice(0, 2000), now()]);
+    } catch (e) { if (!/UNIQUE|duplicate/i.test(e.message)) throw e; }
+  }
+  /* Skrill requires a plain 200 answer to stop retrying the report. */
+  res.status(200).send('OK');
+});
+
 router.post('/:rail', rateLimit({ windowMs: 60000, max: 60, keyFn: r => 'webhook:' + r.ip }), express.raw({ type: '*/*' }), async (req, res) => { // R-090: per-IP rate limit
   const rail = getRail(req.params.rail);
   if (!rail) return res.status(404).json({ ok: false });

@@ -19,7 +19,7 @@ jhuti setting nahi.
 
 ---
 
-## PayPal (Manual ke liye sirf pehli cheez kaafi hai)
+## PayPal ★ (Manual ke liye sirf pehli cheez kaafi hai — Auto ke liye 3, 4, 5, 6 bhi)
 
 1. **PayPal account email (receiving)** — Manual
    - Kahan: aapka apna PayPal account (paypal.com ya PayPal app).
@@ -32,23 +32,50 @@ jhuti setting nahi.
      waqt yehi naam dikhta hai, taake use tasalli ho sahi jagah bhej raha hai.
    - Khana: `Account name shown to sender`
 
-3. **Client ID** — sirf Auto/API (Manual ke liye NAHI chahiye)
+3. **Mode (Live / Sandbox)** — Auto ke liye
+   - Pehle test karna ho to **Sandbox** chunein (nakli/test paisa), asal
+     paisa ke liye **Live**. Neeche wali teeno cheezein USI tab se leni
+     hain jo yahan chuna hai — Sandbox ki cheezein Live tab me nahi
+     chaltin, aur Live ki Sandbox me nahi.
+   - Khana: `Mode (Live / Sandbox)`
+
+4. **Client ID** — Auto ke liye
    - Kahan jana hai: developer.paypal.com → Log in → **Apps & Credentials**
-     → **Live** wala tab → apni app kholein (na ho to Create App).
+     → **Sandbox** ya **Live** wala tab (jo Mode upar chuna) → apni app
+     kholein (na ho to Create App).
    - Kis naam se milega: **Client ID**
    - Khana: `Client ID`
 
-4. **Secret** — sirf Auto/API
+5. **Secret** — Auto ke liye
    - Kahan: wohi app wali page, Client ID ke bilkul neeche.
    - Kis naam se milega: **Secret** (Show daba kar dikhta hai)
    - Khana: `Secret (client secret)`
 
+6. **Webhook ID** — Auto ke liye (bhoolna mat — is ke bagair Auto ON nahi hoga)
+   - Kahan: wohi app wali page, neeche **Webhooks** wala hissa.
+   - Agar webhook pehle se na ho: **Add Webhook** → URL me ye dalen:
+     `https://cash-pop-lottery.onrender.com/webhooks/paypal`
+     → Event types me **Payment captures completed** aur
+     **Payment captures refunded** tick karein → Save.
+   - Kis naam se milega: us webhook ki line par uska **Webhook ID** (WH-
+     se shuru hota hai).
+   - Khana: `Webhook ID`
+
+**Ye sab bharne ke baad kya hoga (Auto ka asal flow):** method ki page
+par upar **Processing mode → Auto Pay** select karke Save karein. Phir:
+player paisa bhej kar apna PayPal **Transaction ID** site par dalega →
+site khud PayPal se pooch kar tasdeeq karegi (payment COMPLETED hai,
+rakam + currency bilkul wohi hai, paisa AAP ke account ko gaya hai) →
+tasdeeq par paisa khud credit. Agar player ID na bhi dale to PayPal ka
+webhook aane par bhi wohi tasdeeq ho kar credit hota hai. Galat rakam,
+galat currency, ya kisi aur ko gaya paisa — credit NAHI hoga, request
+review queue me rahegi. Test pehle Sandbox se karein: Sandbox tab ki
+Client ID/Secret/Webhook ID + Mode = Sandbox — site asal me PayPal ke
+Sandbox server se hi baat karegi.
+
 Note: PayPal ki purani "API Username / API Password / API Signature"
 wali cheezein hamare kaam ki NAHI hain — wo purane (Classic) system ki
-hain, unhein dhoondhne ki zarurat nahi. Aur sach ye hai: PayPal ka Auto
-abhi hamare code me hai hi nahi (PayPal ki payment khud verify karne
-wala hissa bana hi nahi) — PayPal Manual hi chalega, ye jhuti Auto
-setting nahi di gayi.
+hain, unhein dhoondhne ki zarurat nahi.
 
 ## Crypto ★
 
@@ -153,6 +180,28 @@ bharni. Player ko kabhi apna card number site par NAHI dalna.
      **API Keys**. Wahan **Client ID** aur **Client Secret** milte hain.
    - Skrill me ye dono cheezein hoti hi NAHI (Skrill Merchant ID +
      Secret Word istemal karta hai) — Skrill ho to khali chhorein.
+4. **Merchant ID (Customer ID)** — sirf Skrill, Auto ke liye
+   - Kahan: skrill.com par login → upar right corner me **apne naam par
+     click** karein — wahan aapka **Customer ID** number dikhta hai
+     (Skrill isi ko Merchant ID kehta hai; mobile app me profile icon
+     ke neeche milta hai).
+   - Khana: `Merchant ID (Customer ID)`
+5. **Secret Word** — sirf Skrill, Auto ke liye (is ke bagair Skrill Auto ON nahi hoga)
+   - Kahan: Skrill merchant account → **Settings → Developer Settings**
+     → **Secret Word** (na set ho to wahan apna secret word set karein —
+     ye aapke Skrill password se ALAG cheez hai).
+   - Khana: `Secret Word`
+   - Sath me ek kaam aur: jahan se aap Skrill payment link/session banate
+     hain wahan **status_url** (notification URL) ye deni hai:
+     `https://cash-pop-lottery.onrender.com/webhooks/skrill`
+     Skrill har payment ki report isi URL par bhejta hai, Secret Word ki
+     signature ke sath — site signature check kiye bagair credit nahi
+     karti.
+   - Ek sach ye bhi hai: jo player seedha apne Skrill wallet se aapke
+     email par "send money" kare ga, us ki koi report Skrill NAHI bhejta
+     (report sirf payment link/session wali payment par aati hai) — aisi
+     deposit hamesha ki tarah manual queue me rahe gi, wahan aap apne
+     Skrill account me dekh kar approve karein ge.
 
 ## Apple Pay ★
 

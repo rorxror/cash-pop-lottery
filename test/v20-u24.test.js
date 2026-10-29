@@ -398,10 +398,19 @@ test('U-28.7: admin CSS is split out — admin pages link it, player/agent pages
 });
 
 /* ---------- Part B: U-28.9 + chain leg ---------- */
-test('U-28.9 + chain leg: gatewayPublic renders labelled public config only — mode never surfaces', async () => {
+/* SUPERSEDED 2026-10-29 by the owner-reported credential-display
+   hotfix: the U-21/U-28.9 "gatewayPublic renders on the deposit page"
+   behavior is REMOVED (owner rule: player pages show pay-to details
+   only; the PayPal Client ID was displayed under "Payment gateway
+   details" on live v21). This test now asserts the NEW contract with
+   the same planted values: no gateway config of any kind renders on
+   the player deposit page — not the publishable key, not the mode,
+   and (as before) never the secrets. The lib-level projections are
+   covered by test/player-credential-leak.test.js. */
+test('U-28.9 + chain leg: NO gateway config renders on the player deposit page — mode and secrets never surface', async () => {
   const { PUBLIC_CONFIG_FIELDS } = require('../lib/rails');
   assert.ok(!PUBLIC_CONFIG_FIELDS.cards.includes('mode'), 'cards public fields exclude mode');
-  assert.ok(!PUBLIC_CONFIG_FIELDS.paypal.includes('mode'), 'paypal public fields exclude mode');
+  assert.equal(PUBLIC_CONFIG_FIELDS.paypal, undefined, 'paypal has no public-config fields at all (2026-10-29 hotfix)');
   // Plant a cards method with a publishable key + sandbox mode via the real admin form.
   const cards = await db.get("SELECT id FROM payment_methods WHERE rail = 'cards' LIMIT 1");
   assert.ok(cards, 'a cards method exists');
@@ -415,8 +424,8 @@ test('U-28.9 + chain leg: gatewayPublic renders labelled public config only — 
   assert.equal(save.status, 302, 'credentials saved: ' + save.location);
   const dep = await jarA.get('/deposit/new?m=' + cards.id);
   assert.equal(dep.status, 200);
-  assert.ok(dep.text.includes(PUBKEY), 'the publishable key renders for the client flow (chain leg)');
-  assert.ok(dep.text.includes('Publishable key'), 'it renders with its plain-word label');
+  assert.ok(!dep.text.includes(PUBKEY), 'the publishable key no longer renders on the deposit page (hotfix)');
+  assert.ok(!dep.text.includes('Payment gateway details'), 'the gateway details block is removed');
   assert.ok(!dep.text.includes('sandbox'), 'the sandbox/live mode never reaches the player');
   assert.ok(!dep.text.includes('sk_test_U24SECRETKEY999') && !dep.text.includes('whsec_U24SECRET999'), 'secrets never render');
 });
