@@ -114,6 +114,19 @@ img, video, svg { max-width: 100%; }
 .muted { color: var(--muted); }
 .right { text-align: right; }
 .code { font-family: var(--font-mono); font-size: var(--fs-sm); overflow-wrap: anywhere; word-break: break-word; }
+/* MESH-ID-01: inside TABLES, .code marks an identifier — a public ID,
+   hash, reference, token or event id. It is ONE token and must never
+   wrap mid-token. The prose rule above (overflow-wrap: anywhere) let
+   the browser shrink an ID column to a single character per line
+   under width pressure (owner's live screenshot: the withdrawal ID
+   WMVT7JW3Y86FBCF stacked vertically, one letter per line). In tables
+   the token now stays on one line at its natural width and .tbl-wrap
+   scrolls horizontally, exactly as designed. Prose .code OUTSIDE
+   tables is unchanged — long reset links in flash messages still wrap. */
+.tbl .code { white-space: nowrap; overflow-wrap: normal; word-break: normal; }
+/* Dates in tables: one value, one line (wrapping may only ever happen
+   between cells, never inside a date or an amount). */
+.dt { white-space: nowrap; }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-5); }
 .inline-form { display: inline; }
 .pre { white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -446,6 +459,9 @@ img, video, svg { max-width: 100%; }
 .method-list li.sel { border-color: var(--gold-border); background: var(--gold-soft); }
 .method-name { flex: 1; font-weight: 700; min-width: 0; overflow-wrap: anywhere; }
 .instruction { background: var(--navy-800); border: 1px solid var(--line-dark); border-radius: var(--r-md); padding: var(--sp-4) var(--sp-5); margin-bottom: var(--sp-4); }
+/* INSTR-APPLE-01: numbered how-to card steps — clear hierarchy, generous spacing, gold step numbers. */
+.howto-steps { margin: 0; padding-left: 1.5em; display: grid; gap: 10px; line-height: 1.55; }
+.howto-steps li::marker { color: var(--gold); font-weight: 800; }
 /* ---------- Support ---------- */
 .ticket-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--sp-3); }
 .ticket-list li {
@@ -1738,3 +1754,6 @@ img, svg, video, iframe, embed, table { max-width: 100%; }
    a 48px minimum height. */
 #registerForm .field.check label { min-height: 48px; }
 #registerForm .field.check .agree-text { flex: 1 1 auto; min-width: 0; }
+
+/* CURRENCY-SYSTEM-01: method picker group heading */
+.method-list .method-group { font-weight: 700; color: var(--ink-2); padding: 12px 2px 4px; border: none; background: none; }

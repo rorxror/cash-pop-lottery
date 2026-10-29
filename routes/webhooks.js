@@ -14,7 +14,9 @@ const { getRail, verifyWebhookSignature } = require('../lib/rails');
 const { rateLimit } = require('../lib/auth');
 const { decideDeposit, releaseReferralCredits } = require('../lib/money');
 const { loadCredentials } = require('../lib/credentials');
-const { getSettings } = require('../lib/settings');
+const { getSettings, getCurrencies } = require('../lib/settings');
+const notify = require('../lib/notify');
+const { fmtMoney } = require('../lib/util');
 const audit = require('../lib/audit');
 
 /* Generic event parser: providers disagree on field names, so try the common
@@ -122,6 +124,13 @@ router.post('/:rail', rateLimit({ windowMs: 60000, max: 60, keyFn: r => 'webhook
     }
     if (dep) {
       depositId = dep.id;
+      /* METHOD-MODE-01: a signed webhook only AUTO-applies when the
+         matched deposit's method is in Auto Pay mode. On a Manual Pay
+         method the event is still verified + recorded (below), but the
+         deposit stays in the admin queue — a webhook must never
+         silently credit a method the operator set to manual review. */
+      const depMethod = await req.db.get('SELECT processing_mode FROM payment_methods WHERE id = ?', [dep.method_id]);
+      const methodAuto = !!(depMethod && depMethod.processing_mode === 'auto');
       // v16: AMOUNT VERIFICATION. The old code approved any pending deposit
       // whose reference matched, regardless of amount — a small real payment
       // whose reference was pasted into a large deposit's proof (or echoed
@@ -147,10 +156,22 @@ router.post('/:rail', rateLimit({ windowMs: 60000, max: 60, keyFn: r => 'webhook
       } else {
         amountNote = 'no amount in webhook payload';
       }
-      if (ev.action === 'payment_success' && dep.status === 'pending' && amountOk) {
+      if (!methodAuto && amountOk && ((ev.action === 'payment_success' && dep.status === 'pending') || (ev.action === 'refund' && dep.status === 'approved'))) {
+        await audit.log(req.db, { actorId: null, actorRole: 'webhook', action: 'webhook.manual_mode_recorded', entity: 'deposit', entityId: dep.public_id, detail: { provider: rail.key, ref: ev.ref, action: ev.action, note: 'method is Manual Pay — event recorded, no auto action' }, ip: req.ip });
+        note = 'event recorded — method is Manual Pay, deposit stays for admin review';
+      } else if (ev.action === 'payment_success' && dep.status === 'pending' && amountOk) {
         try {
           const settings = await getSettings(req.db, req.driver, true);
           await decideDeposit(req.db, dep.id, 'approve', null, settings); // v17.1: webhook is not an admin; NULL, not a fake admin id 0
+          /* AUTO-VISIBILITY-01 (manual-payments round): the admin
+             decide path emails the player 'deposit_approved'; the
+             webhook auto path credited silently, so an auto deposit
+             flipped in the wallet with no notification. Send the SAME
+             template here — visibility must not depend on the path. */
+          try {
+            const u = await req.db.get('SELECT email, name FROM users WHERE id = ?', [dep.user_id]);
+            if (u && u.email) notify.send(req.db, settings, 'email', 'deposit_approved', u.email, { name: u.name, amount: fmtMoney(dep.net, dep.currency, getCurrencies(settings)) }).catch(() => {});
+          } catch {}
           await req.db.run('UPDATE deposits SET provider_txn_id = ? WHERE id = ?', [ev.ref, dep.id]);
           try { await releaseReferralCredits(req.db, dep.user_id, settings); } catch {}
           await audit.log(req.db, { actorId: null, actorRole: 'webhook', action: 'webhook.deposit_approved', entity: 'deposit', entityId: dep.public_id, detail: { provider: rail.key, ref: ev.ref }, ip: req.ip });
@@ -158,7 +179,16 @@ router.post('/:rail', rateLimit({ windowMs: 60000, max: 60, keyFn: r => 'webhook
         } catch (e) { note = 'approve failed: ' + e.message; }
       } else if (ev.action === 'refund' && dep.status === 'approved' && amountOk) {
         try {
-          await decideDeposit(req.db, dep.id, 'revoke', null, await getSettings(req.db, req.driver, true)); // v17.1: see approve above
+          const rSettings = await getSettings(req.db, req.driver, true);
+          await decideDeposit(req.db, dep.id, 'revoke', null, rSettings); // v17.1: see approve above
+          /* AUTO-VISIBILITY-01: a reversal must be just as visible as
+             the credit — notify with the dedicated revoked template
+             (never 'deposit_rejected': its text claims the amount was
+             never credited, which is false for a reversal). */
+          try {
+            const u = await req.db.get('SELECT email, name FROM users WHERE id = ?', [dep.user_id]);
+            if (u && u.email) notify.send(req.db, rSettings, 'email', 'deposit_revoked', u.email, { name: u.name, amount: fmtMoney(dep.net, dep.currency, getCurrencies(rSettings)) }).catch(() => {});
+          } catch {}
           await audit.log(req.db, { actorId: null, actorRole: 'webhook', action: 'webhook.deposit_revoked', entity: 'deposit', entityId: dep.public_id, detail: { provider: rail.key, ref: ev.ref }, ip: req.ip });
           note = 'deposit revoked via webhook (refund/chargeback)';
         } catch (e) { note = 'revoke failed: ' + e.message; }

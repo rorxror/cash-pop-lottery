@@ -4,13 +4,14 @@
 const express = require('express');
 const router = express.Router();
 const QRCode = require('qrcode');
-const { now, randHex, hmac, sha256, hashPassword, verifyPassword, toMinor, decimalsFor, esc, signTicket, normalizePhone, fmtMoney } = require('../lib/util');
+const { now, randHex, hmac, sha256, hashPassword, verifyPassword, toMinor, decimalsFor, esc, signTicket, normalizePhone, fmtMoney, convertMinor } = require('../lib/util');
 const { getS, getBool, getCurrencies, getSettings } = require('../lib/settings');
 const { requireLogin, rateLimit } = require('../lib/auth');
-const { getBalances, postLedger, depositPolicy, withdrawalPolicy, chargeFor, createDeposit, createWithdrawal, checkWithdrawalRules, notePayoutDetails, notePendingPayoutChange, promotePayoutDetails, releaseReferralCredits, maybeAutoApproveWithdrawal } = require('../lib/money');
+const { getBalances, postLedger, depositPolicy, withdrawalPolicy, chargeFor, createDeposit, createWithdrawal, checkWithdrawalRules, notePayoutDetails, notePendingPayoutChange, promotePayoutDetails, releaseReferralCredits, maybeAutoApproveWithdrawal, exchangeCurrency, exchangeQuote } = require('../lib/money');
 const kycLib = require('../lib/kyc');
 const uploadLib = require('../lib/upload');
 const { getRail, getReceivingDetails, getPublicConfig, validateUserProof } = require('../lib/rails');
+const railByKey = getRail;
 const { newTotpSecret, totpUri, verifyTotp, verifyTotpStep, newBackupCodes, hashBackupCodes, useBackupCode, destroyUserSessions, parseUA } = require('../lib/auth');
 const notify = require('../lib/notify');
 const audit = require('../lib/audit');
@@ -307,7 +308,35 @@ async function enabledMethods(db, kind) {
   return all.filter(m => kind === 'deposit' ? true : true);
 }
 
-router.get('/wallet', requireLogin, async (req, res) => {
+
+/* ================= CURRENCY-SYSTEM-01 =================
+   The player's selected currency (req.cur) is primary on money pages:
+   methods in his currency list first, foreign methods are grouped
+   under "Other currencies" and always carry their currency name, and
+   amounts shown in a foreign currency get a marked equivalent in his
+   currency. Equivalents are DISPLAY-ONLY (convertMinor via the
+   admin-set rates, always with the approx sign, never booked); a
+   missing/zero rate yields NO equivalent rather than a wrong one. */
+function sortMethodsForPlayer(methods, cur) {
+  return [...methods].sort((a, b) => ((b.currency === cur) ? 1 : 0) - ((a.currency === cur) ? 1 : 0));
+}
+function equivStr(req, minor, code) {
+  if (!minor || !code || code === req.cur) return '';
+  try { return req.fmt(convertMinor(minor, code, req.cur, req.currencies), req.cur); } catch { return ''; }
+}
+function rateNote(req, code) {
+  const base = getS(req.settings, 'base_currency', 'USD');
+  const entry = (c) => (req.currencies || []).find(x => x.code === c);
+  const perBase = (c) => { const e = entry(c), b = entry(base); return (e && b && Number(b.rate)) ? (Number(e.rate) / Number(b.rate)) : null; };
+  const parts = [];
+  const pc = perBase(code);
+  if (code && code !== req.cur && pc) parts.push(`Amounts on this method are in ${code}. Admin-set rate: 1 ${base} = ${pc.toFixed(4)} ${code}.`);
+  const pu = perBase(req.cur);
+  if (req.cur !== base && pu) parts.push(`Your currency is ${req.cur}: 1 ${base} = ${pu.toFixed(4)} ${req.cur} (admin-set rate).`);
+  return parts.join(' ');
+}
+
+async function walletPage(req, res) {
   const wallets = await getBalances(req.db, req.user.id);
   // DS-054: a brand-new player has no wallet rows yet - show a real $0.00
   // base-currency row instead of an empty Balances section.
@@ -339,7 +368,57 @@ router.get('/wallet', requireLogin, async (req, res) => {
   const kycSt = kycLib.kycStatusOf(req.user);
   const kycNotice = (kycW.required || kycD.required || kycSt !== 'none')
     ? { status: kycSt, statusLabel: kycLib.STATUS_LABELS[kycSt], withdrawBlocked: kycW.blocked, depositBlocked: kycD.blocked, note: req.user.kyc_note || '' } : null;
-  res.render('wallet', { metaTitle: 'Wallet', metaDesc: 'Your balances, deposits and withdrawals.', wallets, depositMethods, withdrawMethods, pending, requests, kycNotice });
+  /* CURRENCY-SYSTEM-01: converted TOTAL in the player's currency,
+     labelled approx. Shown only when EVERY wallet converts — a
+     partial total would be a wrong number (everything-real rule). */
+  let totalApprox = null;
+  if (wallets.length) {
+    try {
+      let sum = 0;
+      for (const w of wallets) sum += convertMinor(w.balance, w.currency, req.cur, req.currencies);
+      totalApprox = req.fmt(sum, req.cur);
+    } catch { totalApprox = null; }
+  }
+  const exchangeFeePercent = parseFloat(getS(req.settings, 'exchange_fee_percent', '0')) || 0;
+  res.render('wallet', { metaTitle: 'Wallet', metaDesc: 'Your balances, deposits and withdrawals.', wallets, depositMethods, withdrawMethods, pending, requests, kycNotice, totalApprox, myCur: req.cur, baseCur: baseCurrency(req), exchangeFeePercent, exchangePreview: req.__exchangePreview || null });
+}
+router.get('/wallet', requireLogin, walletPage);
+
+/* CURRENCY-SYSTEM-01: wallet Exchange — preview (shows the exact
+   give/receive at the ADMIN-SET rate, fee included) then execute. */
+router.post('/wallet/exchange/preview', requireLogin, async (req, res) => {
+  const from = String(req.body.from_currency || '').toUpperCase();
+  const to = String(req.body.to_currency || '').toUpperCase();
+  const dec = decimalsFor(from, req.currencies);
+  const amount = toMinor(req.body.amount, dec);
+  const back = async (msg) => { await req.setFlash('error', msg); return res.redirect('/wallet'); };
+  if (!from || !to || from === to) return back('Pick two different currencies to exchange.');
+  if (amount === null || amount <= 0) return back('Enter a valid amount.');
+  const wallets = await getBalances(req.db, req.user.id);
+  const src = wallets.find(w => w.currency === from);
+  if (!src || src.balance < amount) return back('You do not have enough balance in that currency.');
+  let q;
+  try { q = exchangeQuote(req.currencies, from, to, amount, parseFloat(getS(req.settings, 'exchange_fee_percent', '0')) || 0); }
+  catch (e) { return back(e.message); }
+  if (q.credit <= 0) return back('That amount is too small to exchange at the current rate.');
+  // Re-render the wallet with the confirmation card (same locals as GET).
+  req.__exchangePreview = { from, to, amount, amountMajor: String(req.body.amount), credit: q.credit, fee: q.fee, feePercent: parseFloat(getS(req.settings, 'exchange_fee_percent', '0')) || 0, rateFrom: q.rateFrom, rateTo: q.rateTo };
+  return walletPage(req, res);
+});
+router.post('/wallet/exchange', requireLogin, async (req, res) => {
+  const from = String(req.body.from_currency || '').toUpperCase();
+  const to = String(req.body.to_currency || '').toUpperCase();
+  const dec = decimalsFor(from, req.currencies);
+  const amount = toMinor(req.body.amount, dec);
+  const back = async (msg) => { await req.setFlash('error', msg); return res.redirect('/wallet'); };
+  if (!from || !to || from === to) return back('Pick two different currencies to exchange.');
+  if (amount === null || amount <= 0) return back('Enter a valid amount.');
+  try {
+    const r = await exchangeCurrency(req.db, { userId: req.user.id, from, to, amountMinor: amount, settings: req.settings });
+    await audit.log(req.db, { actorId: req.user.id, actorRole: 'player', action: 'wallet.exchange', entity: 'wallet', entityId: r.pairRef, detail: { from, to, amount, credited: r.credit, fee: r.fee, fee_percent: r.feePercent !== undefined ? r.feePercent : (parseFloat(getS(req.settings, 'exchange_fee_percent', '0')) || 0) }, ip: req.ip });
+    await req.setFlash('success', `Exchanged ${req.fmt(amount, from)} → ${req.fmt(r.credit, to)} at the admin-set rate.`);
+    return res.redirect('/wallet');
+  } catch (e) { return back(e.message); }
 });
 
 /* U-21 §5.3: the rail field set depends on the flow — deposits ask for
@@ -363,8 +442,12 @@ router.get('/deposit/new', requireLogin, async (req, res) => {
   catch (e) { return res.status(403).render('error', { status: 403, message: 'Deposits are unavailable during your self-exclusion or cooling-off period.' }); }
   // BP-21: KYC gate (only bites when the operator's gate scope covers deposits).
   if (kycLib.kycBlock(req.settings, req.user, 'deposit').blocked) return res.status(403).render('error', { status: 403, message: kycLib.KYC_MESSAGES.deposit, cta: { href: '/kyc', label: 'Go to the KYC page' } });
-  const methods = await req.db.query("SELECT * FROM payment_methods WHERE enabled = 1 AND kind IN ('deposit','both') ORDER BY sort");
-  if (!methods.length) return res.render('deposit_new', { metaTitle: 'Deposit', metaDesc: '', methods: [], method: null, noMethods: true });
+  const methodsRaw = await req.db.query("SELECT * FROM payment_methods WHERE enabled = 1 AND kind IN ('deposit','both') ORDER BY sort");
+  if (!methodsRaw.length) return res.render('deposit_new', { metaTitle: 'Deposit', metaDesc: '', methods: [], method: null, noMethods: true });
+  /* CURRENCY-SYSTEM-01: the player's currency group comes first and is
+     the default selection; foreign methods follow under their own
+     heading in the view. */
+  const methods = sortMethodsForPlayer(methodsRaw, req.cur);
   const method = methods.find(m => m.id === parseInt(req.query.m, 10)) || methods[0];
   // DS-005: show the player WHERE to pay (receiving details from the
   // method's stored credentials - public payment addresses, never secrets).
@@ -373,10 +456,19 @@ router.get('/deposit/new', requireLogin, async (req, res) => {
      publishable key, Google Pay gateway parameters) for the view to
      render — getPublicConfig hard-skips secret/password fields. */
   const gatewayPublic = await getPublicConfig(req.db, method);
+  /* INSTR-APPLE-01 + METHOD-MODE-01: the how-to the player reads is
+     the AUTO text on an Auto Pay method and the manual steps on a
+     Manual Pay method — never mixed. */
+  const railDef = railByKey(method.rail);
+  const shownInstruction = method.processing_mode === 'auto'
+    ? (railDef && railDef.autoInstruction) || 'Once the payment provider confirms your payment, your balance is credited automatically.'
+    : method.instruction;
   res.render('deposit_new', {
     metaTitle: 'Deposit', metaDesc: '', methods, receiving, gatewayPublic,
-    method: { ...method, custom_fields: methodCustomFields(method) },
+    method: { ...method, instruction: shownInstruction, custom_fields: methodCustomFields(method) },
     methodDec: decimalsFor(method.currency, req.currencies),
+    myCur: req.cur, minEquiv: equivStr(req, method.min_amount, method.currency), maxEquiv: equivStr(req, method.max_amount, method.currency),
+    rateNote: rateNote(req, method.currency),
   });
 });
 
@@ -419,7 +511,7 @@ router.post('/deposit/new', requireLogin, rateLimit({ windowMs: 60000, max: 10, 
     userData[f.key] = v;
   }
   try {
-    const { publicId } = await createDeposit(req.db, { userId: req.user.id, method, amountMinor: amount, userData });
+    const { publicId } = await createDeposit(req.db, { userId: req.user.id, method, amountMinor: amount, userData, settings: req.settings });
     await audit.log(req.db, { actorId: req.user.id, actorRole: 'player', action: 'deposit.create', entity: 'deposit', entityId: publicId, detail: { amount, method: method.name }, ip: req.ip });
     // NO auto-approve: a deposit is credited ONLY by a verified provider
     // webhook or an admin approving against a bank statement entry. The old
@@ -430,6 +522,7 @@ router.post('/deposit/new', requireLogin, rateLimit({ windowMs: 60000, max: 10, 
   } catch (e) {
     console.error('[deposit] failed:', e.message);
     const msg = e.message === 'Invalid deposit amount' ? 'Enter a valid amount.'
+      : /deposit limit of/i.test(e.message) ? e.message // ADMIN-CLARITY-01: cap refusals are already plain player language — pass them through
       : 'Your deposit request could not be submitted and no money was taken. Please contact support if this keeps happening.';
     return backToForm(msg, methodId);
   }
@@ -441,7 +534,14 @@ router.get('/withdraw/new', requireLogin, async (req, res) => {
   // BP-21: KYC gate — honest, specific message, never a generic error.
   if (kycLib.kycBlock(req.settings, req.user, 'withdraw').blocked) return res.status(403).render('error', { status: 403, message: kycLib.KYC_MESSAGES.withdraw, cta: { href: '/kyc', label: 'Go to the KYC page' } });
   let methods = await req.db.query("SELECT * FROM payment_methods WHERE enabled = 1 AND kind IN ('withdrawal','both') ORDER BY sort");
-  if (!methods.length) return res.render('withdraw_new', { metaTitle: 'Withdraw', metaDesc: '', methods: [], method: null, balance: 0, noMethods: true });
+  /* MANUAL-PAYMENTS round note: rails with no payout-destination
+     fields of their own (cards, Apple/Google/Samsung Pay, vouchers)
+     stay withdrawable BY DESIGN (v20-tested behaviour): the operator
+     arranges the payout destination with the player off-platform, and
+     the rail's withdrawal how-to says exactly that. An earlier draft
+     of this round refused such withdrawals outright; that broke the
+     established manual loop and was reverted — see FIX-LOG. */
+  if (!methods.length) return res.render('withdraw_new', { metaTitle: 'Withdraw', metaDesc: '', methods: [], method: null, balance: 0, noMethods: true, noMethodsReason: 'No payout method is available right now. Please contact support.' });
   // Same-method preference (v14): when withdrawal_same_method is ON, only
   // methods the player has deposited with are offered; otherwise
   // deposit-used methods are simply listed first (preference, not a rule).
@@ -453,13 +553,18 @@ router.get('/withdraw/new', requireLogin, async (req, res) => {
   } else {
     methods.sort((a, b) => (usedIds.has(b.id) ? 1 : 0) - (usedIds.has(a.id) ? 1 : 0) || (a.sort - b.sort));
   }
+  /* CURRENCY-SYSTEM-01: player's currency group first (stable sort —
+     the deposit-used preference above survives inside each group). */
+  methods = sortMethodsForPlayer(methods, req.cur);
   const method = methods.find(m => m.id === parseInt(req.query.m, 10)) || methods[0];
   const wallets = await getBalances(req.db, req.user.id);
   const balance = (wallets.find(w => w.currency === method.currency) || { balance: 0 }).balance;
   res.render('withdraw_new', {
     metaTitle: 'Withdraw', metaDesc: '', methods,
-    method: { ...method, custom_fields: methodCustomFields(method, 'withdrawal') }, balance,
+    method: { ...method, instruction: (method.withdraw_instruction && String(method.withdraw_instruction).trim()) ? method.withdraw_instruction : method.instruction, custom_fields: methodCustomFields(method, 'withdrawal') }, balance,
     methodDec: decimalsFor(method.currency, req.currencies),
+    myCur: req.cur, minEquiv: equivStr(req, method.min_amount, method.currency), maxEquiv: equivStr(req, method.max_amount, method.currency),
+    rateNote: rateNote(req, method.currency),
   });
 });
 
@@ -526,7 +631,7 @@ router.post('/withdraw/new', requireLogin, rateLimit({ windowMs: 60000, max: 10,
     const sent = await otpLib.sendOtp(req.db, req.settings, identifier, channel, code);
     // Fail closed: if the code could not be delivered, do NOT park the user
     // on a verify screen for a code that will never arrive.
-    if (!sent.sent) return backToForm('Could not send the verification code, so this withdrawal was not started. Please contact support if this keeps happening.', methodId);
+    if (!sent.sent) { await otpLib.expireLiveOtps(req.db, identifier, channel); return backToForm('Could not send the verification code, so this withdrawal was not started. Please contact support if this keeps happening.', methodId); } // AUTH-CHANNELS-01
     const { touchSession } = require('../lib/auth');
     await touchSession(req.db, req.sess.id, { pending_withdrawal: { method_id: method.id, amount, userData } });
     return res.render('withdraw_verify', {
@@ -567,7 +672,7 @@ router.post('/withdraw/verify/resend', requireLogin, async (req, res) => {
   try { code = await otpLib.createOtp(req.db, identifier, channel); }
   catch (e) { return res.status(429).render('error', { status: 429, message: e.message }); }
   const sent = await otpLib.sendOtp(req.db, req.settings, identifier, channel, code);
-  if (!sent.sent) return res.status(503).render('error', { status: 503, message: 'Could not send the verification code. Please try again later or contact support.' });
+  if (!sent.sent) { await otpLib.expireLiveOtps(req.db, identifier, channel); return res.status(503).render('error', { status: 503, message: 'Could not send the verification code. Please try again later or contact support.' }); } // AUTH-CHANNELS-01
   await req.setFlash('success', 'A new verification code was sent.');
   return res.render('withdraw_verify', {
     metaTitle: 'Verify Withdrawal', metaDesc: '',
@@ -805,7 +910,10 @@ router.post('/profile/verify-email', requireLogin, rateLimit({ windowMs: 3600000
   const link = (process.env.BASE_URL || (req.protocol + '://' + req.get('host'))) + '/verify-email/' + token;
   const sent = await notify.send(req.db, req.settings, 'email', 'email_verification', email, { name: req.user.name, link });
   if (sent.status === 'sent') await req.setFlash('success', 'Verification link sent to ' + email + '.');
-  else await req.setFlash('error', 'Could not send the verification email right now. Please try again later.');
+  else { // AUTH-CHANNELS-01: burn the undelivered link token
+    await req.db.run('UPDATE email_verifications SET used = 1 WHERE token_hash = ?', [sha256('verify:' + token)]);
+    await req.setFlash('error', 'Could not send the verification email right now. Please try again later.');
+  }
   res.redirect('/profile');
 });
 router.post('/profile/verify-phone', requireLogin, async (req, res) => {
@@ -815,7 +923,7 @@ router.post('/profile/verify-phone', requireLogin, async (req, res) => {
   let code;
   try { code = await otpLib.createOtp(req.db, phone, 'phone'); } catch (e) { await req.setFlash('error', e.message); return res.redirect('/profile'); }
   const sent = await otpLib.sendOtp(req.db, req.settings, phone, 'phone', code);
-  if (!sent.sent) { await req.setFlash('error', 'Could not send the verification code. Try again later.'); return res.redirect('/profile'); }
+  if (!sent.sent) { await otpLib.expireLiveOtps(req.db, phone, 'phone'); await req.setFlash('error', 'Could not send the verification code. Try again later.'); return res.redirect('/profile'); } // AUTH-CHANNELS-01: undelivered code invalidated
   await req.setFlash('success', 'Verification code sent to ' + phone + '. Enter it below.');
   res.redirect('/profile?verify_phone=1');
 });
@@ -869,13 +977,16 @@ router.post('/force-reset', requireLogin, playerSecurityLimiter, async (req, res
 async function securityViewModel(req, extra = {}) {
   const u = await req.db.get('SELECT password_hash, totp_secret FROM users WHERE id = ?', [req.user.id]);
   const rawSessions = await req.db.query(
-    'SELECT id, ip, user_agent, created_at, expires_at FROM sessions WHERE user_id = ? AND expires_at > ? ORDER BY created_at DESC',
+    'SELECT id, ip, user_agent, created_at, expires_at, scope FROM sessions WHERE user_id = ? AND expires_at > ? ORDER BY created_at DESC',
     [req.user.id, now()]);
   /* U-04(a): the view receives HUMAN session fields only — the raw
      user-agent never leaves the server. Each item: { id, ip,
      created_at, expires_at, device, browser, os, deviceLabel } with
      deviceLabel = "Device · Browser" and the fallbacks
-     "Unknown device · Unknown browser" for an unrecognised UA. */
+     "Unknown device · Unknown browser" for an unrecognised UA.
+     SESSION-TAB-01: scopeLabel states truthfully WHERE each session
+     signs in (Website vs Admin panel) — with dual scopes one account
+     can hold one of each, and revoking one never touches the other. */
   const sessions = rawSessions.map(s => {
     const p = parseUA(s.user_agent);
     const browser = p.browser === 'Unknown' ? 'Unknown browser' : p.browser;
@@ -883,6 +994,8 @@ async function securityViewModel(req, extra = {}) {
       id: s.id, ip: s.ip, created_at: s.created_at, expires_at: s.expires_at,
       device: p.device, browser, os: p.os,
       deviceLabel: p.device + ' · ' + browser,
+      scope: s.scope || 'site',
+      scopeLabel: (s.scope === 'admin') ? 'Admin panel' : 'Website',
     };
   });
   return Object.assign({

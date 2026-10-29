@@ -160,3 +160,29 @@
 /* DS-066: admin list filter bars */
 .filter-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 12px 0; }
 .filter-form input, .filter-form select { min-height: 40px; padding: 6px 10px; border: 1px solid rgba(23,32,58,.25); border-radius: 10px; background: #fff; color: #1b2340; font: inherit; font-size: 14px; }
+
+/* AUDIT-DETAIL-01: humanized audit detail lines (admin.css) */
+.aud-lines { display: grid; gap: 2px; min-width: 180px; }
+.aud-line { line-height: 1.45; }
+.aud-k { color: var(--ink-3); font-size: var(--fs-xs); font-weight: 600; text-transform: none; }
+.aud-v { color: var(--ink); font-weight: 500; }
+.aud-arr { overflow-wrap: break-word; }
+.aud-ent { color: var(--ink-2); font-size: var(--fs-sm); font-weight: 600; }
+.aud-more > summary, .aud-rawwrap > summary { cursor: pointer; color: var(--gold-2); font-size: var(--fs-sm); font-weight: 600; padding: 6px 0; min-height: 32px; }
+.aud-raw { font-family: var(--font-mono); font-size: var(--fs-xs); background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 8px 10px; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; max-width: 520px; }
+.aud-txt { overflow-wrap: break-word; }
+
+/* ADMIN-CLARITY-01: page purpose line under every admin H1 */
+.adm-sub { color: var(--ink-3); margin: 2px 0 0; font-size: var(--fs-sm); }
+.adm-top { margin-bottom: 14px; }
+.task-links { display: flex; flex-wrap: wrap; gap: 10px; }
+.task-links .btn { min-height: 48px; display: inline-flex; align-items: center; }
+
+/* USER-DETAIL-01: summary band */
+.user-summary { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+.us-avatar { width: 56px; height: 56px; border-radius: 50%; background: linear-gradient(135deg, #fdf6e0, #f0d98c); border: 1px solid var(--line); display: flex; align-items: center; justify-content: center; font-size: 24px; font-weight: 700; color: var(--ink); flex: none; }
+.us-main { flex: 1 1 260px; min-width: 0; }
+.us-name { font-size: 20px; font-weight: 700; }
+.us-badges { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0; }
+.us-wallets { display: flex; gap: 8px; flex-wrap: wrap; }
+.us-chip { background: var(--bg-2); border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; font-size: var(--fs-sm); }

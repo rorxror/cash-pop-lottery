@@ -5,7 +5,7 @@ const express = require('express');
 const router = express.Router();
 const { validEmail, hashPassword, verifyPassword, sha256, randHex, now, strongPassword, normalizeEmail, normalizePhone } = require('../lib/util');
 const { getS, getBool, getCurrencies } = require('../lib/settings');
-const { createSession, getSession, destroySession, rateLimit, verifyTotp, useBackupCode, parseUA, csrfToken, touchSession, ANON_TTL, PREAUTH_TTL } = require('../lib/auth');
+const { createSession, getSession, destroySession, rateLimit, verifyTotp, useBackupCode, parseUA, csrfToken, touchSession, ANON_TTL, PREAUTH_TTL, scopeForRole, cookieForScope, setSessionCookie, ADMIN_COOKIE } = require('../lib/auth');
 const { getExtension, extEnabled } = require('../lib/extensions');
 const notify = require('../lib/notify');
 const otpLib = require('../lib/otp');
@@ -146,13 +146,29 @@ async function recordLogin(req, userId, email, success) {
 
 /* ---------- login ---------- */
 router.get('/login', async (req, res) => {
-  if (req.user) return res.redirect('/');
+  /* SESSION-TAB-01: an admin-scope session in this browser goes
+     straight to the panel (the admin entry rule, unchanged). A
+     site-scope sign-in no longer hard-redirects away from this form:
+     with dual scopes the same browser may legitimately need to sign
+     in to the OTHER scope (player in one tab, admin in another), and
+     blocking the form made the second sign-in impossible without
+     destroying the first. The form renders with a notice instead. */
+  const adminSid = req.cookies && req.cookies[ADMIN_COOKIE];
+  if (adminSid) {
+    const as = await getSession(req.db, adminSid);
+    if (as && as.user_id && (as.scope || 'site') === 'admin' && !(as.data && as.data.pre_auth)) {
+      const au = await req.db.get('SELECT role, status FROM users WHERE id = ?', [as.user_id]);
+      if (au && au.role === 'admin' && au.status !== 'banned' && au.status !== 'pending_review') return res.redirect(req.adminPath || '/');
+    }
+  }
+  if (req.user && req.user.role === 'admin') return res.redirect(req.adminPath || '/');
   // R-036: ALWAYS create the anon session (not only when custom captcha
   // is on) so logged-out forms carry a CSRF token.
   await anonSession(req, res);
   res.render('login', {
     phoneCountries: require('../lib/phone-countries').allowedCountries(req.settings),
     metaTitle: 'Sign In', metaDesc: 'Sign in to your account.',
+    signedInAs: req.user ? (req.user.name || req.user.email) : '',
     totpRequired: false, emailPrefill: '',
     captchaHtml: await captchaHtml(req), recaptchaHtml: await recaptchaHtml(req),
     googleOn: getBool(req.settings, 'google_oauth_enabled', false) && !!process.env.GOOGLE_CLIENT_ID,
@@ -171,9 +187,14 @@ router.get('/login', async (req, res) => {
 const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30, keyFn: r => 'login:' + r.ip });
 
 router.post('/login', loginLimiter, async (req, res) => {
+  /* SESSION-TAB-01: a pending TOTP challenge may be carried by THIS
+     request's session (site scope) or by the other scope's anon
+     pre-auth session (admin logins — see lib/auth loadSession). */
+  const pendSess = (req.sessionData && req.sessionData.pending_user_id) ? req.sess : (req.pendingSess || null);
+  const pendingUid = pendSess && pendSess.data ? pendSess.data.pending_user_id : null;
   const render = async (vars = {}) => res.render('login', {
     metaTitle: 'Sign In', metaDesc: 'Sign in to your account.',
-    totpRequired: !!req.sessionData.pending_user_id, emailPrefill: req.body.email || '',
+    totpRequired: !!pendingUid, emailPrefill: req.body.email || '',
     captchaHtml: await captchaHtml(req), recaptchaHtml: await recaptchaHtml(req),
     // DS-045: pass the SAME method vars as GET /login - the re-render after
     // a failed attempt used to drop the Facebook button and the OTP UI.
@@ -189,12 +210,12 @@ router.post('/login', loginLimiter, async (req, res) => {
   });
   // R-002: the TOTP second step is exempt from the captcha re-check — the
   // password step already passed captcha, and the TOTP render carries none.
-  const isTotpStep = !!(req.body.totp_code && req.sessionData.pending_user_id);
+  const isTotpStep = !!(req.body.totp_code && pendingUid);
   if (!isTotpStep && !(await verifyCaptcha(req))) return render({ formError: 'Captcha verification failed.' });
 
   // TOTP challenge step
-  if (req.body.totp_code && req.sessionData.pending_user_id) {
-    const u = await req.db.get('SELECT * FROM users WHERE id = ?', [req.sessionData.pending_user_id]);
+  if (req.body.totp_code && pendingUid) {
+    const u = await req.db.get('SELECT * FROM users WHERE id = ?', [pendingUid]);
     if (!u) return render({ formError: 'Session expired. Please sign in again.' });
     // v16: per-user TOTP fail limit. The IP limiter (30/15min) does not stop
     // a distributed attack against ONE account; login_history already records
@@ -226,8 +247,16 @@ router.post('/login', loginLimiter, async (req, res) => {
     }
     if (!ok) { await recordLogin(req, u.id, u.email, false); return render({ formError: 'Invalid authenticator code.' });
     }
-    const { touchSession } = require('../lib/auth');
-    await touchSession(req.db, req.sess.id, { pending_user_id: null, pre_auth: null });
+    if (pendSess && req.sess && pendSess.id === req.sess.id) {
+      await touchSession(req.db, req.sess.id, { pending_user_id: null, pre_auth: null });
+    } else if (pendSess) {
+      /* The challenge lived in the OTHER scope's pre-auth session:
+         retire it (finishLogin sets the fresh real session cookie);
+         this request's own session — possibly a live player login —
+         is not touched. */
+      await destroySession(req.db, pendSess.id);
+      res.clearCookie(cookieForScope(req.pendingScope || 'admin'));
+    }
     await recordLogin(req, u.id, u.email, true); // R-094: TOTP successes are now logged
     return finishLogin(req, res, u);
   }
@@ -267,6 +296,22 @@ router.post('/login', loginLimiter, async (req, res) => {
   if (u.status === 'pending_review') { await recordLogin(req, u.id, identifier, false); return jsonErr('Invalid credentials.'); }
 
   if (u.totp_secret) {
+    if (scopeForRole(u.role) === 'admin') {
+      /* SESSION-TAB-01: an admin's pending-TOTP session is created in
+         the ADMIN scope (sid_admin cookie). It is NEVER stashed into
+         the site session this request carried — that session may be a
+         live player login in another tab of the same browser, and
+         mutating it (pre_auth + pending flags) was the tab-swap bug
+         in TOTP form: the player's tab silently lost its login. */
+      const preSid = await createSession(req.db, 0, { ip: req.ip, ua: req.headers['user-agent'], extra: { pending_user_id: u.id, pre_auth: true }, ttlMs: PREAUTH_TTL, scope: 'admin' });
+      const { touchSession: tsAdmin } = require('../lib/auth'); // aliased: the site branch below declares its own block-scoped touchSession (TDZ)
+      const preTok = csrfToken({}); await tsAdmin(req.db, preSid, { _csrf: preTok }); req.csrfToken = preTok;
+      setSessionCookie(res, 'admin', preSid, PREAUTH_TTL, req.secure || getBool(req.settings, 'force_ssl', false));
+      return res.render('login', {
+        metaTitle: 'Two-Factor', metaDesc: '', totpRequired: true, emailPrefill: email,
+        captchaHtml: '', recaptchaHtml: '', googleOn: false,
+      });
+    }
     // stash pending auth; need a session to hold it — create temp session
     const { touchSession } = require('../lib/auth');
     let sess = req.sess;
@@ -301,15 +346,29 @@ router.post('/login', loginLimiter, async (req, res) => {
 async function finishLogin(req, res, u, welcomeMsg) {
   // kill pre-auth flag if present
   const extra = welcomeMsg ? { _flash: { type: 'success', msg: welcomeMsg } } : {};
-  const sid = await createSession(req.db, u.id, { ip: req.ip, ua: req.headers['user-agent'], extra });
-  if (req.sess) await destroySession(req.db, req.sess.id);
+  /* SESSION-TAB-01: the new session lives in the scope of the account
+     being signed in (admin → admin scope + sid_admin cookie; everyone
+     else → site scope + sid cookie). The session this request carried
+     is destroyed ONLY when it is an anon/pre-auth session or belongs
+     to the SAME scope — a live session of the OTHER scope (e.g. the
+     player's, in another tab of the same browser) is never touched,
+     which is the whole point of the dual scope. Same-scope destruction
+     keeps the old session-fixation protection per scope. */
+  const scope = scopeForRole(u.role);
+  const sid = await createSession(req.db, u.id, { ip: req.ip, ua: req.headers['user-agent'], extra, scope });
+  if (req.sess) {
+    const prevScope = req.sess.user_id === 0 ? scope : (req.sess.scope || 'site');
+    if (req.sess.user_id === 0 || (req.sess.data && req.sess.data.pre_auth) || prevScope === scope) {
+      await destroySession(req.db, req.sess.id);
+    }
+  }
   await req.db.run('UPDATE users SET last_login_at = ?, last_login_ip = ? WHERE id = ?', [now(), req.ip, u.id]);
   // Device/IP duplicate detection (v14): flags only, never blocks login.
   try {
     const { checkSharedDevice } = require('../lib/flags');
     await checkSharedDevice(req.db, u.id, req.ip, req.headers['user-agent'] || '');
   } catch {}
-  res.cookie('sid', sid, { httpOnly: true, sameSite: 'lax', secure: req.secure || getBool(req.settings, 'force_ssl', false), maxAge: 7 * 24 * 3600 * 1000 });
+  setSessionCookie(res, scope, sid, 7 * 24 * 3600 * 1000, req.secure || getBool(req.settings, 'force_ssl', false));
   const dest = u.role === 'admin' ? (req.adminPath || '/') : (u.role === 'agent' ? '/agent' : '/');
   res.redirect(dest);
 }
@@ -487,7 +546,12 @@ router.post('/forgot', rateLimit({ windowMs: 3600000, max: 10, keyFn: r => 'forg
        without BASE_URL the old link was a bare relative path and the
        reset email was unusable. */
     const link = baseUrl(req) + '/reset/' + token;
-    await notify.send(req.db, req.settings, 'email', 'password_reset', email, { name: u.name, link }).catch(() => {});
+    /* AUTH-CHANNELS-01: the page stays the generic anti-enumeration text,
+       but an UNDELIVERED reset token must not stay live — burn it when the
+       send did not actually go out. */
+    const resetSend = await notify.send(req.db, req.settings, 'email', 'password_reset', email, { name: u.name, link }).catch(() => ({ status: 'failed' }));
+    if (!resetSend || resetSend.status !== 'sent')
+      await req.db.run('UPDATE password_resets SET used = 1 WHERE token_hash = ?', [sha256('reset:' + token)]);
   }
   res.render('forgot', { metaTitle: 'Reset Password', metaDesc: '', sent: true });
 });
@@ -587,7 +651,7 @@ router.post('/login/otp/request', loginLimiter, async (req, res) => {
   await audit.log(req.db, { actorId: 0, actorRole: 'anon', action: 'otp.requested', entity: 'otp', entityId: '', detail: { idType, sent: result.sent }, ip: req.ip });
   // NEVER return the code: if no provider sent it, the user must see an
   // error, not a code that logs them in (previous demo-mode takeover hole).
-  if (!result.sent) return res.status(503).json({ ok: false, error: 'Could not send the code. Please try again later or use your password.' });
+  if (!result.sent) { await otpLib.expireLiveOtps(req.db, identifier, idType); return res.status(503).json({ ok: false, error: 'Could not send the code. Please try again later or use your password.' }); } // AUTH-CHANNELS-01: undelivered code dies here
   res.json({ ok: true, via: result.via });
 });
 
@@ -918,3 +982,9 @@ router.get('/auth/google/callback', async (req, res) => {
 
 module.exports = router;
 module.exports.captchaHtml = captchaHtml;
+/* ADMIN-LOGIN-01: the dedicated admin login (routes/admin.js) reuses
+   the EXACT sign-in completion + history recording of the public flow
+   — one implementation of session creation/lockout bookkeeping, two
+   entrances. */
+module.exports.finishLogin = finishLogin;
+module.exports.recordLogin = recordLogin;

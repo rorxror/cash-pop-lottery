@@ -157,13 +157,18 @@ before(async () => {
 });
 after(async () => { await killServer(); try { fs.rmSync(TMP, { recursive: true, force: true }); } catch {} });
 
-test('stealth: console 404s for anon and players, probes audited', async () => {
+test('stealth: console subpaths 404 for anon and players, probes audited (root = ADMIN-LOGIN-01 login page)', async () => {
   const anon = new Jar('anon');
-  assert.strictEqual((await anon.text(AP)).status, 404);
+  // ADMIN-LOGIN-01 (owner order, 2026-10-29): the EXACT root serves the
+  // dedicated admin login page; stealth 404 + probe logging unchanged
+  // for every other admin path.
+  const root = await anon.text(AP);
+  assert.strictEqual(root.status, 200, 'root serves the admin login page');
+  assert.ok(root.body.includes('Control Room'), 'admin-branded login');
   assert.strictEqual((await anon.text(AP + '/settings')).status, 404);
-  assert.strictEqual((await pA.text(AP)).status, 404);
+  assert.strictEqual((await pA.text(AP + '/settings')).status, 404, 'player subpath still 404');
   const probes = await qq("SELECT id FROM audit_log WHERE action = 'admin.probe'");
-  assert.ok(probes.length >= 3, 'probe audit rows: ' + probes.length);
+  assert.ok(probes.length >= 2, 'probe audit rows: ' + probes.length);
 });
 
 test('U-20.1 regression: reports with invalid dates renders the error, not a 500', async () => {

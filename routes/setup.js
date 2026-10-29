@@ -52,8 +52,10 @@ router.post('/setup', async (req, res) => {
     await setSetting(req.db, req.driver, 'site_name', site_name.trim());
     if (base_currency) await setSetting(req.db, req.driver, 'base_currency', String(base_currency).toUpperCase().slice(0, 8));
     await audit.log(req.db, { actorId: userId, actorRole: 'admin', action: 'setup.complete', entity: 'user', entityId: userId, detail: { site: site_name }, ip: req.ip });
-    const sid = await createSession(req.db, userId, { ip: req.ip, ua: req.headers['user-agent'] });
-    res.cookie('sid', sid, { httpOnly: true, sameSite: 'lax', secure: req.secure || process.env.FORCE_SSL === '1', maxAge: 7 * 24 * 3600 * 1000 });
+    // SESSION-TAB-01: the first account is the admin — its session is
+    // admin-scope and rides the sid_admin cookie from the very start.
+    const sid = await createSession(req.db, userId, { ip: req.ip, ua: req.headers['user-agent'], scope: 'admin' });
+    res.cookie('sid_admin', sid, { httpOnly: true, sameSite: 'lax', secure: req.secure || process.env.FORCE_SSL === '1', maxAge: 7 * 24 * 3600 * 1000 });
     res.redirect(req.adminPath || '/');
   } catch (e) {
     res.render('setup', { metaTitle: 'Setup', metaDesc: 'First-run setup', formError: 'Setup failed: ' + e.message });

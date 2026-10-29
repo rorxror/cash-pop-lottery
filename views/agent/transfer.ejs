@@ -12,6 +12,9 @@
   <div class="form-card">
     <h1>Transfer to Player</h1>
     <p class="muted">Move funds from your agent float to a player's wallet.</p>
+    <% if (typeof floatEmpty !== 'undefined' && floatEmpty) { %>
+    <div class="flash f-err">Your float has no money in any currency yet, so transfers cannot be sent. Ask the admin to fund your float first — once it is funded, your balance will show next to each currency below.</div>
+    <% } %>
     <form action="/agent/transfer" method="POST">
       <input type="hidden" name="_csrf" value="<%= csrf %>">
       <input type="hidden" name="transfer_token" value="<%= typeof transferToken !== 'undefined' ? transferToken : '' %>">
@@ -32,9 +35,20 @@
         </select>
       </div>
       <div class="field">
-        <label for="amount">Amount (USD)</label>
+        <% /* AGENT-CURRENCY-01: the amount label follows the SELECTED
+              currency (it was hardcoded "Amount (USD)"). Server renders
+              the first listed currency; the nonce script keeps it in
+              sync when the selection changes. */ %>
+        <label for="amount">Amount (<span id="amtCur"><%= (floats && floats.length) ? floats[0].currency : '' %></span>)</label>
         <input type="number" id="amount" name="amount" min="0.01" step="0.01" required>
       </div>
+      <script nonce="<%= cspNonce %>">
+        (function () {
+          var sel = document.getElementById('currency');
+          var lab = document.getElementById('amtCur');
+          if (sel && lab) sel.addEventListener('change', function () { lab.textContent = sel.value; });
+        })();
+      </script>
       <div class="field">
         <label for="note">Note (optional)</label>
         <input type="text" id="note" name="note" maxlength="140">

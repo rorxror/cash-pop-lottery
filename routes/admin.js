@@ -6,9 +6,9 @@
 const express = require('express');
 const router = express.Router();
 const QRCode = require('qrcode');
-const { now, randHex, sha256, hashPassword, validEmail, toMinor, esc, fromMinor, fmtMoney, decimalsFor, validSlug } = require('../lib/util');
+const { now, randHex, sha256, hashPassword, verifyPassword, normalizeEmail, validEmail, toMinor, esc, fromMinor, fmtMoney, decimalsFor, validSlug } = require('../lib/util');
 const { getS, getBool, setSetting, getCurrencies, getSettings, keyCol } = require('../lib/settings');
-const { requireLogin, requireRole, createSession, destroySession, destroyUserSessions, verifyTotp, rateLimit } = require('../lib/auth');
+const { requireLogin, requireRole, createSession, destroySession, destroyUserSessions, verifyTotp, rateLimit, getSession, csrfToken, touchSession, useBackupCode, verifyTotpStep, setSessionCookie, ANON_TTL, PREAUTH_TTL } = require('../lib/auth');
 const { decideDeposit, decideWithdrawal, getBalances, postLedger, markWithdrawalPaid, settleAgentCommissions, releaseReferralCredits, decodeUserData } = require('../lib/money');
 const { RAILS, getRail, isBlockedRail, validateRailCredentials } = require('../lib/rails');
 const { getExtensions, setExtension, EXTENSION_FIELDS } = require('../lib/extensions');
@@ -25,6 +25,141 @@ const { runReconciliation } = require('../lib/reconcile');
 const { encryptField, decryptField, keyConfigured } = require('../lib/credentials');
 const { isBreached, breachedCheckFailedRecently } = require('../lib/breached');
 const { passwordError } = require('../lib/validate');
+
+/* ================= ADMIN-LOGIN-01: dedicated admin entrance =======
+   Owner's explicit order (2026-10-29, ViserLab pattern): the EXACT
+   admin root serves a dedicated admin-branded login page instead of
+   the plain 404 it used to give. The secrecy model changes at this
+   ONE point only: the path itself is the secret (same model as the
+   reference scripts). EVERY other admin path keeps the stealth 404 +
+   probe logging below, the public site still carries zero references
+   to this path, and the public /login remains a working fallback
+   entrance for admins (finishLogin auto-redirects them here).
+   The login creates sessions in the ADMIN scope only (SESSION-TAB-01)
+   and reuses the public flow's finishLogin/recordLogin so lockout,
+   one-time TOTP claims and session rules stay identical. Captcha is
+   deliberately not used here: the controls are the secret path, the
+   IP rate limit and the per-account lockout (both mirrored from the
+   public flow), plus TOTP where enrolled. */
+function adminLoginPage(req, { formError = '', totpRequired = false, emailPrefill = '' } = {}) {
+  const siteName = getS(req.settings, 'site_name', 'Cash Pop');
+  const csrf = req.csrfToken || (req.sessionData ? csrfToken(req.sessionData) : '');
+  /* Layout reference (2026-10-29 observation of the RaffleLab demo
+     LOGIN page only — its inner pages were not entered): full-screen
+     bare page, ONE narrow centered card, a header band with a welcome
+     heading + one-line subline, Username/Email -> Password -> one
+     full-width button, "Forgot Password?" right-aligned on the
+     Password label row, labels above fields with required asterisks,
+     nothing else. Content, words and colors are OURS (Apple light
+     premium, gold band) — never their dark vendor theme. */
+  const band = (h, sub) => `<div class="alogin-band"><h1 class="alogin-h">${h}</h1><p class="alogin-sub">${sub}</p></div>`;
+  const inner = totpRequired
+    ? band('Two-factor authentication', `Enter the 6-digit code from your authenticator app${emailPrefill ? ` for <strong>${esc(emailPrefill)}</strong>` : ''}.`) + `
+       ${formError ? `<div class="alert a-err">${esc(formError)}</div>` : ''}
+       <form method="post" action="${req.adminPath}/login">
+         <input type="hidden" name="_csrf" value="${esc(csrf)}">
+         <div class="field"><label for="al-code">Authenticator code *</label><input class="input" id="al-code" name="totp_code" inputmode="numeric" autocomplete="one-time-code" required autofocus></div>
+         <button class="btn btn-p alogin-btn" type="submit">Verify &amp; sign in</button>
+       </form>`
+    : band('Welcome to the Control Room', `Sign in to the ${esc(siteName)} operator console.`) + `
+       ${formError ? `<div class="alert a-err">${esc(formError)}</div>` : ''}
+       <form method="post" action="${req.adminPath}/login">
+         <input type="hidden" name="_csrf" value="${esc(csrf)}">
+         <div class="field"><label for="al-email">Email *</label><input class="input" id="al-email" name="email" type="email" autocomplete="username" value="${esc(emailPrefill)}" required autofocus></div>
+         <div class="field"><div class="alogin-labelrow"><label for="al-pass">Password *</label><a href="/forgot">Forgot password?</a></div><input class="input" id="al-pass" name="password" type="password" autocomplete="current-password" required></div>
+         <button class="btn btn-p alogin-btn" type="submit">Sign in</button>
+       </form>`;
+  return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>Control Room — ${esc(siteName)}</title>
+<link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/admin.css">
+<style>
+  body.alogin-body { display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }
+  .alogin-card { width: 100%; max-width: 400px; background: var(--card); border: 1px solid var(--line); border-radius: var(--r-lg); padding: 0 26px 26px; box-shadow: 0 12px 40px rgba(60,45,10,.10); overflow: hidden; }
+  .alogin-band { margin: 0 -26px 20px; padding: 22px 26px 16px; background: linear-gradient(135deg, #fdf6e0, #f7e7bd); border-bottom: 1px solid var(--line); }
+  .alogin-h { font-size: 22px; margin: 0 0 4px; }
+  .alogin-sub { color: var(--ink-2); margin: 0; }
+  .alogin-btn { width: 100%; min-height: 48px; margin-top: 6px; }
+  .alogin-labelrow { display: flex; justify-content: space-between; align-items: baseline; }
+  .alogin-labelrow a { font-size: var(--fs-sm); }
+  .alogin-card .field { margin-bottom: 14px; }
+  .alogin-card .input { min-height: 48px; }
+</style></head>
+<body class="alogin-body"><main class="alogin-card">${inner}</main></body></html>`;
+}
+async function adminAnonSession(req, res) {
+  if (req.sess) return;
+  const sid = await createSession(req.db, 0, { ip: req.ip, ua: req.headers['user-agent'] || '', ttlMs: ANON_TTL, scope: 'admin' });
+  setSessionCookie(res, 'admin', sid, ANON_TTL, req.secure || getBool(req.settings, 'force_ssl', false));
+  const sess = await getSession(req.db, sid);
+  req.sess = sess; req.sessionData = sess ? sess.data : {};
+  req.csrfToken = csrfToken(req.sessionData);
+  await touchSession(req.db, sid, { _csrf: req.sessionData._csrf });
+}
+const { finishLogin, recordLogin } = require('./auth');
+async function auditAdminLogin(req, u, ok, via) {
+  try { await audit.log(req.db, { actorId: u ? u.id : null, actorRole: ok ? 'admin' : 'anonymous', action: 'admin.login', entity: 'user', entityId: u ? String(u.id) : '', detail: { ok, via }, ip: req.ip }); } catch {}
+}
+router.get('/', async (req, res, next) => {
+  if (req.user && req.user.role === 'admin') return next(); // dashboard handler below
+  await adminAnonSession(req, res);
+  const pending = req.sessionData && req.sessionData.pending_user_id;
+  res.send(adminLoginPage(req, { totpRequired: !!pending }));
+});
+const adminLoginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30, keyFn: r => 'admin-login:' + r.ip });
+router.post('/login', adminLoginLimiter, async (req, res) => {
+  const render = (vars) => res.send(adminLoginPage(req, vars));
+  const pendSess = (req.sessionData && req.sessionData.pending_user_id) ? req.sess : null;
+  const pendingUid = pendSess ? pendSess.data.pending_user_id : null;
+  /* --- TOTP second step (mirrors the public flow's one-time claim) --- */
+  if (req.body.totp_code && pendingUid) {
+    const u = await req.db.get('SELECT * FROM users WHERE id = ?', [pendingUid]);
+    if (!u || u.role !== 'admin') return render({ formError: 'Session expired. Please sign in again.' });
+    try {
+      const fails = await req.db.get('SELECT COUNT(*) AS c FROM login_history WHERE user_id = ? AND success = 0 AND created_at > ?', [u.id, now() - 15 * 60 * 1000]);
+      if (fails && Number(fails.c) >= 10) return render({ totpRequired: true, formError: 'Too many failed sign-in attempts. Please wait 15 minutes and try again.' });
+    } catch { return render({ totpRequired: true, formError: 'Sign-in temporarily unavailable. Please try again.' }); }
+    let ok = false;
+    const matchedStep = verifyTotpStep(u.totp_secret, req.body.totp_code);
+    if (matchedStep !== null && matchedStep > Number(u.totp_last_step == null ? -1 : u.totp_last_step)) {
+      const claim = await req.db.run('UPDATE users SET totp_last_step = ? WHERE id = ? AND COALESCE(totp_last_step, -1) < ?', [matchedStep, u.id, matchedStep]);
+      if (claim.changes === 1) ok = true;
+    }
+    if (!ok && u.backup_codes) {
+      const remaining = useBackupCode(u.backup_codes, req.body.totp_code);
+      if (remaining !== null) {
+        const upd = await req.db.run('UPDATE users SET backup_codes = ? WHERE id = ? AND backup_codes = ?', [remaining, u.id, u.backup_codes]);
+        if (upd.changes === 1) ok = true;
+      }
+    }
+    if (!ok) { await recordLogin(req, u.id, u.email, false); await auditAdminLogin(req, u, false, 'totp'); return render({ totpRequired: true, formError: 'Invalid authenticator code.' }); }
+    await recordLogin(req, u.id, u.email, true);
+    await auditAdminLogin(req, u, true, 'totp');
+    return finishLogin(req, res, u);
+  }
+  /* --- password step: ONE generic failure for everything (no account,
+     player account, wrong password, banned — indistinguishable) --- */
+  const email = normalizeEmail(String(req.body.email || ''));
+  const fail = async (u) => { await recordLogin(req, u ? u.id : null, email, false); await auditAdminLogin(req, u, false, 'password'); return render({ formError: 'Invalid credentials.', emailPrefill: email }); };
+  const u = email ? await req.db.get('SELECT * FROM users WHERE email = ?', [email]) : null;
+  if (!u || u.role !== 'admin') return fail(u);
+  try {
+    const fails = await req.db.get('SELECT COUNT(*) AS c FROM login_history WHERE user_id = ? AND success = 0 AND created_at > ?', [u.id, now() - 15 * 60 * 1000]);
+    if (fails && Number(fails.c) >= 10) return fail(u);
+  } catch { return fail(u); }
+  if (!u.password_hash || !verifyPassword(req.body.password || '', u.password_hash)) return fail(u);
+  if (u.status === 'banned' || u.status === 'pending_review') return fail(u);
+  if (u.totp_secret) {
+    await adminAnonSession(req, res);
+    await touchSession(req.db, req.sess.id, { pending_user_id: u.id, pre_auth: true }, { ttlMs: PREAUTH_TTL });
+    setSessionCookie(res, 'admin', req.sess.id, PREAUTH_TTL, req.secure || getBool(req.settings, 'force_ssl', false));
+    return render({ totpRequired: true, emailPrefill: email });
+  }
+  await recordLogin(req, u.id, email, true);
+  await auditAdminLogin(req, u, true, 'password');
+  return finishLogin(req, res, u);
+});
 
 /* STEALTH: the admin panel must not exist for anyone but a logged-in admin.
    Logged-out visitors used to be redirected to /login and logged-in players
@@ -43,6 +178,17 @@ router.use(async (req, res, next) => {
   next();
 });
 router.use(requireLogin, requireRole('admin'));
+
+/* SESSION-TAB-01: panel sign-out. The panel's Sign out posts HERE (not
+   to the site /logout): this request runs on an admin path, so
+   loadSession loaded the ADMIN-scope session — destroying it and
+   clearing sid_admin leaves any player/site session in the same
+   browser completely untouched, and vice versa. */
+router.post('/logout', async (req, res) => {
+  if (req.sess) await destroySession(req.db, req.sess.id);
+  res.clearCookie('sid_admin');
+  res.redirect('/login');
+});
 /* v14 RBAC: views (GET) are readable by all staff roles; ACTIONS enforce the
    role map in lib/rbac.js (finance = money, support = tickets, risk = user
    safety + draws + flags, super = everything). Stealth above still runs
@@ -78,7 +224,77 @@ function dateRange(req) {
   return { from, to, error, capped };
 }
 function fmtDateInput(ms) { const d = new Date(ms); return Number.isNaN(d.getTime()) ? '' : d.toISOString().slice(0, 10); }
-function d(ms) { return ms ? new Date(ms).toLocaleString() : '—'; }
+function d(ms) { return ms ? `<span class="dt">${new Date(ms).toLocaleString()}</span>` : '—'; } // MESH-ID-01: dates never split mid-value
+function dPlain(ms) { return ms ? new Date(ms).toLocaleString() : '—'; } // plain-text twin of d() for ESCAPED contexts (card titles are esc()'d by ui.card)
+
+/* ================= AUDIT-DETAIL-01: readable audit details =======
+   The audit Detail cell used to be the raw stored JSON string,
+   blindly slice(0,120)'d and wrapped mid-token by the prose .code
+   rule — unreadable, and silently LOSSY past 120 chars (which breaks
+   the everything-real rule: an audit row the operator cannot read is
+   a broken audit). Now the detail is parsed and rendered as compact
+   humanized key–value lines, LOSSLESS (every key appears), with the
+   original JSON kept one click away under a "raw" toggle.
+   Money formatting: ONLY the keys below, each verified at its
+   audit.log call site to be minor units (cents) — ticket.buy
+   wager/total, deposit/withdrawal decision amount (= net), balance
+   adjust amount + old/new_balance, BP-22 limit_minor, scratch/draw
+   liability + cap. A key not on this list stays a plain number: a
+   unit is never guessed. Currency comes from the detail's own
+   currency key when present, else the base currency. */
+const AUDIT_MONEY_KEYS = new Set(['amount', 'wager', 'total', 'net', 'old_balance', 'new_balance', 'limit_minor', 'liability', 'max_liability', 'expected_liability', 'cap']);
+function humanKey(k) {
+  const spaced = String(k).replace(/_/g, ' ').replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/\s+/g, ' ').trim().toLowerCase();
+  return spaced.replace(/^./, c => c.toUpperCase()); // sentence case: drawType -> "Draw type"
+}
+function auditScalar(req, key, v, currency) {
+  if (v === null || v === undefined) return '—';
+  if (typeof v === 'boolean') return v ? 'Yes' : 'No';
+  if (typeof v === 'number') {
+    if (AUDIT_MONEY_KEYS.has(key)) return esc(money(req, v, currency));
+    if (/_at$/.test(key) && v > 1e11) return d(v);
+    if (/pct|percent/i.test(key)) return esc(String(v)) + '%';
+    return esc(String(v));
+  }
+  return esc(String(v));
+}
+function auditLines(req, obj, currency, prefix, out) {
+  for (const [k, v] of Object.entries(obj)) {
+    const label = prefix ? prefix + ' — ' + humanKey(k) : humanKey(k);
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const keys = Object.keys(v);
+      if (keys.length === 2 && keys.includes('from') && keys.includes('to')) {
+        out.push([label, auditScalar(req, k, v.from, currency) + ' → ' + auditScalar(req, k, v.to, currency)]);
+      } else {
+        auditLines(req, v, currency, label, out);
+      }
+    } else if (Array.isArray(v)) {
+      out.push([label, `<span class="aud-arr">${v.map(x => auditScalar(req, k, x, currency)).join(', ')}</span>`]);
+    } else {
+      out.push([label, auditScalar(req, k, v, currency)]);
+    }
+  }
+  return out;
+}
+function auditDetailHtml(req, raw) {
+  const text = raw === null || raw === undefined ? '' : String(raw);
+  if (!text) return '<span class="muted">—</span>';
+  let obj = null;
+  try { const p = JSON.parse(text); if (p && typeof p === 'object' && !Array.isArray(p)) obj = p; } catch {}
+  if (!obj) return `<span class="aud-txt">${esc(text)}</span>`; // legacy non-JSON detail: full text, escaped, never truncated
+  const currency = obj.currency || getS(req.settings, 'base_currency', 'USD');
+  const lines = auditLines(req, obj, currency, '', []);
+  const render = ls => ls.map(([k, v]) => `<div class="aud-line"><span class="aud-k">${esc(k)}</span> <span class="aud-v">${v}</span></div>`).join('');
+  if (lines.length <= 5) return `<div class="aud-lines">${render(lines)}</div>`; // <=5 lines (the common rows, e.g. ticket.buy) read fully with no click
+  const n = Object.keys(obj).length;
+  return `<div class="aud-lines">${render(lines.slice(0, 3))}</div>` +
+    `<details class="aud-more"><summary>View detail (${n} fields)</summary><div class="aud-lines">${render(lines)}</div>` +
+    `<details class="aud-rawwrap"><summary>raw</summary><pre class="aud-raw">${esc(JSON.stringify(obj))}</pre></details></details>`;
+}
+function auditEntityHtml(a) {
+  const ref = a.entity_id === null || a.entity_id === undefined || a.entity_id === '' ? '—' : String(a.entity_id);
+  return `<div class="aud-ent">${esc(humanKey(a.entity || ''))}</div><span class="code">${esc(ref)}</span>`;
+}
 function money(req, minor, cur) { return req.fmt(minor, cur); }
 /* R-055: corrupt JSON in one row must never crash a whole admin page (the
    ticket detail page already guarded this; list/dashboard/report did not). */
@@ -131,11 +347,13 @@ async function notifyDrawCancelled(db, settings, drawId) {
 }
 async function csrf(req) { return req.csrfToken; }
 
-function shell(req, section, title, body) {
+function shell(req, section, title, body, subtitle = '') {
   /* U-26: the sidebar is grouped and filtered by staff role (see
-     lib/admin-ui.js NAV_GROUPS). Rendering only — rbac.js is untouched. */
+     lib/admin-ui.js NAV_GROUPS). Rendering only — rbac.js is untouched.
+     ADMIN-CLARITY-01: optional one-line page purpose under the title,
+     so the panel explains itself at a glance. */
   const role = (req.user && (req.user.admin_role || 'super')) || 'super';
-  return ui.layout({ adminPath: adminPath(req), section, title, body, csrf: req.csrfToken, flash: req.flashData || {}, assetV: req.app.locals.assetV || '1', role });
+  return ui.layout({ adminPath: adminPath(req), section, title, body, csrf: req.csrfToken, flash: req.flashData || {}, assetV: req.app.locals.assetV || '1', role, subtitle });
 }
 const isSuperReq = (req) => ((req.user && (req.user.admin_role || 'super')) || 'super') === 'super';
 const notFound = (req, res, msg) => res.status(404).send(shell(req, '', 'Not found', `<div class="alert a-err">${esc(msg)}</div>`));
@@ -147,7 +365,8 @@ router.get('/', async (req, res) => {
   const t = now(), day = t - 86400000;
   const users = await req.db.get("SELECT COUNT(*) AS c FROM users WHERE role = 'player'");
   const ticketsToday = await req.db.get('SELECT COUNT(*) AS c, COALESCE(SUM(total),0) AS s FROM tickets WHERE created_at > ?', [day]);
-  const winsToday = await req.db.get("SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE type IN ('win','scratch_prize') AND created_at > ?", [day]);
+  const winsToday = await req.db.query("SELECT currency, COALESCE(SUM(amount),0) AS s FROM transactions WHERE type IN ('win','scratch_prize') AND created_at > ? GROUP BY currency", [day]); // CURRENCY-SYSTEM-01: per-currency
+  const stakedToday = await req.db.query('SELECT currency, COALESCE(SUM(total),0) AS s FROM tickets WHERE created_at > ? GROUP BY currency', [day]);
   const pendDep = await req.db.get("SELECT COUNT(*) AS c FROM deposits WHERE status = 'pending'");
   const pendWd = await req.db.get("SELECT COUNT(*) AS c FROM withdrawals WHERE status = 'pending'");
   const openSup = await req.db.get("SELECT COUNT(*) AS c FROM support_tickets WHERE status = 'open' AND deleted_at IS NULL");
@@ -203,9 +422,16 @@ router.get('/', async (req, res) => {
       <p class="muted">Exposure per number — nearest draw: ${dr.draw_type} ${esc(dr.draw_date)}</p>`;
   }
 
-  // Operator P&L (ViserLab-style): all-time sold vs given prize vs profit/loss
-  const soldAll = await req.db.get('SELECT COALESCE(SUM(total),0) AS s FROM tickets');
-  const prizeAll = await req.db.get("SELECT COALESCE(SUM(amount),0) AS s FROM transactions WHERE type IN ('win','scratch_prize')");
+  // Operator P&L (ViserLab-style): all-time sold vs given prize vs profit/loss.
+  // CURRENCY-SYSTEM-01: these aggregates are PER CURRENCY — summing
+  // different currencies into one number (as the old single SUM did)
+  // is a false number the moment a second currency carries money.
+  const soldAll = await req.db.query('SELECT currency, COALESCE(SUM(total),0) AS s FROM tickets GROUP BY currency');
+  const prizeAll = await req.db.query("SELECT currency, COALESCE(SUM(amount),0) AS s FROM transactions WHERE type IN ('win','scratch_prize') GROUP BY currency");
+  const soldMap = Object.fromEntries(soldAll.map(r => [r.currency, Number(r.s)]));
+  const prizeMap = Object.fromEntries(prizeAll.map(r => [r.currency, Number(r.s)]));
+  const profitRows = [...new Set([...Object.keys(soldMap), ...Object.keys(prizeMap)])].map(c => ({ currency: c, s: (soldMap[c] || 0) - (prizeMap[c] || 0) }));
+  const moneyRows = (rows) => rows.length ? rows.map(r => money(req, r.s, r.currency)).join(' · ') : money(req, 0, getS(req.settings, 'base_currency', 'USD'));
   const overdueDraws = await req.db.get("SELECT COUNT(*) AS c FROM draws WHERE status = 'scheduled' AND close_at < ?", [now()]);
   // Settled-only RTP: never show a projected percentage as if it were real.
   // Until a draw has actually settled with real stakes, the honest value is "—".
@@ -251,18 +477,30 @@ router.get('/', async (req, res) => {
         ['withdrawals_enabled', 'Withdrawals (global)', 'Master kill switch for withdrawals.']]
        .map(([k, label, help]) => `<div class="field"><label class="check"><input type="checkbox" name="${esc(k)}" value="1" ${getS(req.settings, k, '0') === '1' ? 'checked' : ''}> ${esc(label)}</label><small class="muted">${esc(help)}</small></div>`).join('')}
      <div class="mt"><button class="btn btn-p" type="submit">Save site status</button></div></form>`);
+  /* ADMIN-CLARITY-01: Common tasks — the daily jobs one click away,
+     with REAL pending counts (everything-real rule; zero shows as 0). */
+  const kycOn = getBool(req.settings, 'kyc_enabled', false);
+  const pendKyc = kycOn ? await req.db.get("SELECT COUNT(*) AS c FROM kyc_documents WHERE status = 'pending'") : { c: 0 };
+  const commonTasks = ui.card('Common tasks', `<div class="task-links">
+      <a class="btn btn-g" href="${R(req, '/deposits?status=pending')}">Review pending deposits (${pendDep.c})</a>
+      <a class="btn btn-g" href="${R(req, '/withdrawals?status=pending')}">Review pending withdrawals (${pendWd.c})</a>
+      ${kycOn ? `<a class="btn btn-g" href="${R(req, '/kyc')}">Review KYC (${pendKyc.c} waiting)</a>` : ''}
+      <a class="btn btn-g" href="${R(req, '/methods')}">Add a payment method</a>
+      <a class="btn btn-g" href="${R(req, '/limits')}">Set limits</a>
+    </div>`);
   const body = `
     ${reconBanner}
     ${siteStatusCard}
+    ${commonTasks}
     ${ui.kpis([
-      { n: money(req, soldAll.s, getS(req.settings, 'base_currency', 'USD')), l: 'Sold amount (all time)', href: R(req, '/reports?type=business') },
-      { n: money(req, prizeAll.s, getS(req.settings, 'base_currency', 'USD')), l: 'Given prize (all time)', href: R(req, '/reports?type=business') },
-      { n: money(req, soldAll.s - prizeAll.s, getS(req.settings, 'base_currency', 'USD')), l: (soldAll.s - prizeAll.s) >= 0 ? 'Profit (sold − prize)' : 'Loss (sold − prize)', href: R(req, '/reports?type=business') },
+      { n: moneyRows(soldAll), l: 'Sold amount (all time)', href: R(req, '/reports?type=business') },
+      { n: moneyRows(prizeAll), l: 'Given prize (all time)', href: R(req, '/reports?type=business') },
+      { n: moneyRows(profitRows), l: 'Profit (sold − prize, per currency)', href: R(req, '/reports?type=business') },
       { n: overdueDraws.c, l: 'Overdue draws — settle now', href: R(req, '/draws') },
       { n: users.c, l: 'Players', href: R(req, '/users') },
       { n: ticketsToday.c, l: 'Tickets (24h)', href: R(req, '/tickets') },
-      { n: money(req, ticketsToday.s, getS(req.settings, 'base_currency', 'USD')), l: 'Staked (24h)', href: R(req, '/reports?type=business') },
-      { n: money(req, winsToday.s, getS(req.settings, 'base_currency', 'USD')), l: 'Paid out (24h)', href: R(req, '/reports?type=business') },
+      { n: moneyRows(stakedToday), l: 'Staked (24h)', href: R(req, '/reports?type=business') },
+      { n: moneyRows(winsToday), l: 'Paid out (24h)', href: R(req, '/reports?type=business') },
       { n: pendDep.c, l: 'Pending deposits', href: R(req, '/deposits?status=pending') },
       { n: pendWd.c, l: 'Pending withdrawals', href: R(req, '/withdrawals?status=pending') },
       { n: pendAppr.c, l: 'Pending second approvals', href: R(req, '/approvals') },
@@ -274,8 +512,8 @@ router.get('/', async (req, res) => {
     ${ui.card('Exposure & profit projection', heat + expTable)}
     ${ui.card('Recent audit activity', ui.table(['Time', 'Actor', 'Action', 'Detail'],
       (await req.db.query('SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 8')).map(a =>
-        [d(a.created_at), esc(a.actor_role) + ' #' + (a.actor_id || '—'), esc(a.action), `<span class="code">${esc(String(a.detail).slice(0, 80))}</span>`])))}`;
-  res.send(shell(req, '', 'Dashboard', body));
+        [d(a.created_at), esc(a.actor_role) + ' #' + (a.actor_id || '—'), esc(a.action), auditDetailHtml(req, a.detail)])))}`;
+  res.send(shell(req, '', 'Dashboard', body, 'Money in, money out, and everything waiting for your decision.'));
 });
 
 /* ============================================================ DRAWS */
@@ -333,7 +571,7 @@ router.get('/draws', async (req, res) => {
         `<span class="ball-sm">${dr.winning_number}</span>`,
         dr.is_test ? ui.badge('TEST', 'warn') : '—',
       ])) + ui.paginate(R(req, '/draws'), page, PER, settledTotal))}`;
-  res.send(shell(req, '/draws', 'Draws', body));
+  res.send(shell(req, '/draws', 'Draws', body, 'Scheduled draws, live exposure and settlement.'));
 });
 
 router.post('/draws/test', async (req, res) => {
@@ -369,25 +607,35 @@ router.get('/draws/:id', async (req, res) => {
   /* SCAN fix (C-02): "Sold amount" is stake = wager × pops per entry,
      summed in JS (wager alone is per-pop and understated the truth). */
   const soldRows = await req.db.query(
-    `SELECT t.wager AS wager, t.pops AS pops, te.ticket_id AS ticket_id
+    `SELECT t.wager AS wager, t.pops AS pops, t.currency AS currency, te.ticket_id AS ticket_id
      FROM ticket_entries te JOIN tickets t ON t.id = te.ticket_id WHERE te.draw_id = ?`, [dr.id]);
-  const sold = { s: soldRows.reduce((a, r) => a + safeJsonArray(r.pops).length * Number(r.wager || 0), 0), tickets: new Set(soldRows.map(r => r.ticket_id)).size };
-  const paid = await req.db.get(
-    `SELECT COALESCE(SUM(win_amount),0) AS s, COUNT(*) AS c FROM ticket_entries WHERE draw_id = ? AND status = 'won'`, [dr.id]);
+  /* CURRENCY-SYSTEM-01 audit completion: a draw's entries can span
+     currencies (players buy in their wallet currency), so the KPIs are
+     per-currency — never summed into one base-currency number. */
+  const soldByCur = {};
+  for (const r of soldRows) soldByCur[r.currency] = (soldByCur[r.currency] || 0) + safeJsonArray(r.pops).length * Number(r.wager || 0);
+  const soldTickets = new Set(soldRows.map(r => r.ticket_id)).size;
+  const paidRows = await req.db.query(
+    `SELECT t.currency AS currency, COALESCE(SUM(te.win_amount),0) AS s, COUNT(*) AS c
+     FROM ticket_entries te JOIN tickets t ON t.id = te.ticket_id WHERE te.draw_id = ? AND te.status = 'won' GROUP BY t.currency`, [dr.id]);
+  const paidByCur = {}; let paidCount = 0;
+  for (const r of paidRows) { paidByCur[r.currency] = Number(r.s); paidCount += Number(r.c); }
+  const perCurJoin = (map, sign) => { const ks = Object.keys(map); return ks.length ? ks.map(c => money(req, sign ? sign(map[c], c) : map[c], c)).join(' · ') : money(req, 0, getS(req.settings, 'base_currency', 'USD')); };
+  const profitByCur = {}; for (const c of new Set([...Object.keys(soldByCur), ...Object.keys(paidByCur)])) profitByCur[c] = (soldByCur[c] || 0) - (paidByCur[c] || 0);
   const winners = await req.db.query(
-    `SELECT te.win_amount, te.id AS entry_id, t.public_id, t.pops, u.email, u.name
+    `SELECT te.win_amount, te.id AS entry_id, t.public_id, t.pops, t.currency, u.email, u.name
      FROM ticket_entries te JOIN tickets t ON t.id = te.ticket_id JOIN users u ON u.id = t.user_id
      WHERE te.draw_id = ? AND te.status = 'won' ORDER BY te.win_amount DESC`, [dr.id]);
   const body = `
     ${ui.kpis([
-      { n: money(req, sold.s, getS(req.settings, 'base_currency', 'USD')), l: 'Sold amount' },
-      { n: money(req, paid.s, getS(req.settings, 'base_currency', 'USD')), l: 'Given prize' },
-      { n: money(req, sold.s - paid.s, getS(req.settings, 'base_currency', 'USD')), l: (sold.s - paid.s) >= 0 ? 'Profit' : 'Loss' },
-      { n: paid.c + ' / ' + sold.tickets, l: 'Winning tickets / tickets' },
+      { n: perCurJoin(soldByCur), l: 'Sold amount (per currency)' },
+      { n: perCurJoin(paidByCur), l: 'Given prize (per currency)' },
+      { n: perCurJoin(profitByCur), l: 'Profit (per currency)' },
+      { n: paidCount + ' / ' + soldTickets, l: 'Winning tickets / tickets' },
     ])}
     ${ui.card('Draw — ' + esc(dr.draw_type) + ' ' + esc(dr.draw_date), `<p class="muted">Status: ${ui.statusBadge(dr.status)} · Winning number: <strong>${dr.winning_number || '—'}</strong> · Seed hash: <span class="code">${esc(String(dr.seed_hash || '').slice(0, 32))}…</span></p>`)}
     ${ui.card('Winners — per-ticket breakdown', ui.table(['Player', 'Ticket', 'Pops picked', 'Prize'],
-      winners.map(w => [esc(w.name || w.email), `<span class="code">${esc(w.public_id)}</span>`, esc(w.pops), money(req, w.win_amount, getS(req.settings, 'base_currency', 'USD'))])))}`;
+      winners.map(w => [esc(w.name || w.email), `<span class="code">${esc(w.public_id)}</span>`, esc(w.pops), money(req, w.win_amount, w.currency)])))}`;
   res.send(shell(req, '/draws', 'Draw #' + dr.id, body));
 });
 router.post('/draws/:id/settle', async (req, res) => {
@@ -450,7 +698,7 @@ router.get('/tickets', async (req, res) => {
       `${t.draw_type} ×${t.num_draws}`, money(req, t.total, t.currency),
       ui.statusBadge(t.status), `<span class="code">${esc(t.hmac.slice(0, 10))}…</span>`, d(t.created_at),
     ])) + ui.paginate(R(req, '/tickets'), page, PER, total);
-  res.send(shell(req, '/tickets', 'Tickets', body));
+  res.send(shell(req, '/tickets', 'Tickets', body, 'Lottery tickets bought by players.'));
 });
 
 /* Ticket detail (v15: the tickets list previously had no drill-down — an
@@ -614,7 +862,7 @@ router.get('/automation', async (req, res) => {
   /* U-26: Automation and Cron Jobs control the same scheduled jobs —
      say so on both pages so neither looks like a separate system. */
   body += `<p class="muted">The processes above are the same scheduled jobs listed under <a href="${R(req, '/cron')}">Cron Jobs</a> — pausing or running a job in either place changes the same job.</p>`;
-  res.send(shell(req, '/automation', 'Automation Console', body));
+  res.send(shell(req, '/automation', 'Automation Console', body, 'Automatic processes that run the site — their status and failures.'));
 });
 
 router.post('/automation/master', async (req, res) => {
@@ -758,7 +1006,7 @@ router.get('/bonuses', async (req, res) => {
     grants.map((g) => [d(g.created_at), esc(g.campaign_name), esc(g.user_email), money(g.amount, g.currency), esc(BONUS_TRIGGER_LABELS[g.trigger_type] || humanLabel(g.trigger_type || '')),
       g.wagering_required > 0 ? money(g.wagered, g.currency) + ' / ' + money(g.wagering_required, g.currency) : '—']))
     : '<p class="muted">No grants yet.</p>');
-  res.send(shell(req, '/bonuses', 'Bonus Campaigns', body));
+  res.send(shell(req, '/bonuses', 'Bonus Campaigns', body, 'Promotional credit campaigns — never outcome control.'));
 });
 
 router.post('/bonuses/master', async (req, res) => {
@@ -876,7 +1124,7 @@ router.get('/users', async (req, res) => {
         u.agent_id ? '#' + u.agent_id : '<span class="muted">unassigned</span>', d(u.created_at),
         `<a class="btn btn-sm" href="${R(req, '/users/' + u.id)}">Manage</a>`,
       ])) + ui.paginate(`${R(req, '/users')}?f=${f}&q=${encodeURIComponent(q)}${req.query.agent ? '&agent=' + encodeURIComponent(req.query.agent) : ''}`, page, PER, total);
-  res.send(shell(req, '/users', 'Users', body));
+  res.send(shell(req, '/users', 'Users', body, 'Every account — players, agents and staff.'));
 });
 
 router.get('/users/:id', async (req, res) => {
@@ -887,37 +1135,64 @@ router.get('/users/:id', async (req, res) => {
   const logins = await req.db.query('SELECT * FROM login_history WHERE user_id = ? ORDER BY created_at DESC LIMIT 10', [u.id]);
   const acts = await req.db.query('SELECT * FROM audit_log WHERE actor_id = ? ORDER BY created_at DESC LIMIT 15', [u.id]);
   const tickets = await req.db.query('SELECT * FROM tickets WHERE user_id = ? ORDER BY created_at DESC LIMIT 10', [u.id]);
+  /* USER-DETAIL-01: money snapshot additions — latest deposits and
+     withdrawals for this user (the old page never showed them here). */
+  const deps = await req.db.query('SELECT d.*, m.name AS method_name FROM deposits d LEFT JOIN payment_methods m ON m.id = d.method_id WHERE d.user_id = ? ORDER BY d.id DESC LIMIT 5', [u.id]);
+  const wds = await req.db.query('SELECT w.*, m.name AS method_name FROM withdrawals w LEFT JOIN payment_methods m ON m.id = w.method_id WHERE w.user_id = ? ORDER BY w.id DESC LIMIT 5', [u.id]);
   const agents = await req.db.query("SELECT id, name FROM users WHERE role = 'agent' ORDER BY name");
+  const agentOf = u.agent_id ? agents.find(a => a.id === u.agent_id) : null;
   const flags = await req.db.query('SELECT * FROM account_flags WHERE user_id = ? ORDER BY created_at DESC LIMIT 20', [u.id]);
   const kycDocs = await req.db.query('SELECT * FROM kyc_documents WHERE user_id = ? ORDER BY id DESC LIMIT 10', [u.id]);
   const refCredits = await req.db.query('SELECT * FROM referral_credits WHERE referrer_id = ? ORDER BY created_at DESC LIMIT 20', [u.id]);
   const referrer = u.referred_by ? await req.db.get('SELECT id, email FROM users WHERE id = ?', [u.referred_by]) : null;
-  const body = `
-  <div class="grid2">
-    <div>${ui.card('Biodata', ui.formHtml(R(req, '/users/' + u.id), [
-        { key: 'name', label: 'Name', type: 'text', value: u.name, required: true },
-        { key: 'email', label: 'Email', type: 'text', value: u.email },
-        { key: 'phone', label: 'Phone', type: 'text', value: u.phone },
-        { key: 'address', label: 'Address', type: 'text', value: u.address },
-        { key: 'city', label: 'City', type: 'text', value: u.city },
-        { key: 'state', label: 'State', type: 'text', value: u.state },
-        { key: 'zip', label: 'Zip / Postal code', type: 'text', value: u.zip },
-        { key: 'country', label: 'Country', type: 'text', value: u.country },
-        /* SCAN fix (C-06): kyc_status is NOT a biodata field anymore —
-           it changes only through the KYC queue decision or the
-           manual-verify attestation below (which requires a note). The
-           old dropdown let any editor set 'verified' unattested. */
-        { key: 'kyc_override', label: 'KYC requirement for this user', type: 'select', options: ['default', 'required', 'exempt'], value: u.kyc_override || 'default', help: 'default = follows the global KYC switch (Settings → KYC). required = this user must be KYC-approved before gated actions even when the global switch is off. exempt = never gated.' },
-        { key: 'auto_withdrawal_limit', label: 'Auto-withdrawal limit', type: 'text', value: u.auto_withdrawal_limit === null || u.auto_withdrawal_limit === undefined ? '' : String(u.auto_withdrawal_limit), help: 'Blank = follow the global limit in Settings → Withdrawal & risk controls. A value (major units, e.g. 25.50) is this user\'s own ceiling; 0 = never auto-approve for this user. Auto-approval never pays out by itself.' },
-        { key: 'agent_id', label: 'Agent', type: 'select', options: [{ v: '', l: 'Unassigned' }].concat(agents.map(a => ({ v: String(a.id), l: '#' + a.id + ' — ' + a.name }))), value: u.agent_id ? String(u.agent_id) : '' },
-        { key: 'notes', label: 'Notes', type: 'textarea', value: u.notes },
-      ], { csrf: req.csrfToken, submit: 'Save biodata' }) + `<p class="muted">KYC status: <strong>${esc(u.kyc_status)}</strong> — changes only through the KYC review queue or the manual-verification attestation (see the KYC card).</p>` +
-      ui.card('Controls', `
+  /* USER-DETAIL-01: the page used to open as a two-column wall —
+     the 13-field biodata FORM first, Controls jammed beside it, and
+     the facts an operator actually needs scattered below. Nothing is
+     dropped; the page is re-assembled in operator order: summary band
+     (who/what state/how much, at a glance) -> account facts -> money
+     snapshot -> grouped Controls -> KYC -> fraud -> history -> and
+     the EDIT form LAST (viewing is the daily job; editing is rare). */
+  const initial = esc(String(u.name || u.email || '?').trim().charAt(0).toUpperCase() || '?');
+  const summaryBand = `<div class="card user-summary">
+    <div class="us-avatar">${initial}</div>
+    <div class="us-main">
+      <div class="us-name">${esc(u.name || '—')}</div>
+      <div class="muted">${esc(u.email || '—')}${u.phone ? ' · ' + esc(u.phone) : ''}</div>
+      <div class="us-badges">
+        ${ui.badge(u.role, 'info')}
+        ${u.status === 'banned' ? ui.badge('banned', 'bad') : ui.badge(u.status || 'active', 'ok')}
+        ${ui.badge(u.email_verified ? 'email verified' : 'email not verified', u.email_verified ? 'ok' : 'warn')}
+        ${ui.badge(u.mobile_verified ? 'phone verified' : 'phone not verified', u.mobile_verified ? 'ok' : 'warn')}
+        ${ui.badge('KYC: ' + (u.kyc_status || 'none'), u.kyc_status === 'verified' ? 'ok' : 'muted')}
+      </div>
+      <div class="muted">Joined ${d(u.created_at)} · Last login ${u.last_login_at ? d(u.last_login_at) : 'never'}</div>
+    </div>
+    <div class="us-wallets">${wallets.length ? wallets.map(w => `<span class="us-chip">${esc(w.currency)} <strong>${money(req, w.balance, w.currency)}</strong></span>`).join('') : '<span class="muted">No wallets yet</span>'}</div>
+  </div>`;
+  const factsCard = ui.card('Account facts', ui.table(['Field', 'Value'], [
+        ['Email verified', u.email_verified ? '✓ Yes' : '✗ No'],
+        ['Phone verified', u.mobile_verified ? '✓ Yes' : '✗ No'],
+        ['Referral code', esc(u.referral_code || '—')],
+        ['Referred by', referrer ? ('#' + referrer.id + ' — ' + esc(referrer.email)) : '—'],
+        ['Agent', agentOf ? ('#' + agentOf.id + ' — ' + esc(agentOf.name)) : 'Unassigned'],
+        ['Two-factor (TOTP)', u.totp_secret ? '✓ Enabled' : '✗ Off'],
+        ['Forced password reset', u.force_password_reset ? 'Yes — user must reset on next sign-in' : 'No'],
+        ['Forced TOTP enrollment', u.force_totp_enroll ? 'Yes' : 'No'],
+        ['Payout details last changed', u.payout_updated_at ? d(u.payout_updated_at) : 'Never'],
+        ['Profile completed', (u.profile_completed === 0) ? '✗ Pending (signed up via OTP, name/terms not yet collected)' : '✓ Yes'],
+      ]));
+  const moneyCard = ui.card('Money snapshot',
+      ui.table(['Currency', 'Balance'], wallets.map(w => [w.currency, money(req, w.balance, w.currency)])) +
+      `<h4 class="mt">Recent deposits</h4>` + (deps.length ? ui.table(['When', 'ID', 'Method', 'Amount', 'Status'], deps.map(x => [d(x.created_at), `<span class="code">${esc(x.public_id)}</span>`, esc(x.method_name || '—'), money(req, x.net, x.currency), ui.statusBadge(x.status)])) : '<p class="muted">No deposits yet.</p>') +
+      `<h4 class="mt">Recent withdrawals</h4>` + (wds.length ? ui.table(['When', 'ID', 'Method', 'Amount', 'Status'], wds.map(x => [d(x.created_at), `<span class="code">${esc(x.public_id)}</span>`, esc(x.method_name || '—'), money(req, x.net, x.currency), ui.statusBadge(x.status)])) : '<p class="muted">No withdrawals yet.</p>') +
+      `<h4 class="mt">Recent tickets</h4>` + ui.table(['Ticket', 'Total', 'Status', 'When'], tickets.map(t =>
+        [`<span class="code">${esc(t.public_id)}</span>`, money(req, t.total, t.currency), ui.statusBadge(t.status), d(t.created_at)])) + `<p class="mt"><a class="btn btn-sm" href="${R(req, '/tickets')}?q=${encodeURIComponent(u.email)}">View all tickets for this player →</a></p>`);
+  const controlsCard = ui.card('Controls', `
+        <h4>Access</h4>
+        <p class="muted">Block stops sign-in and play. Revoke sessions signs the user out everywhere. Login as user opens their account in a new tab.</p>
         <div class="btn-row">
           <form method="POST" action="${R(req, '/users/' + u.id + '/block')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}">
             <button class="btn ${u.status === 'banned' ? 'btn-p' : 'btn-d'}">${u.status === 'banned' ? 'Unblock' : 'Block'}</button></form>
-          <form method="POST" action="${R(req, '/users/' + u.id + '/reset-password')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}">
-            <button class="btn">Reset password</button></form>
           <form method="POST" action="${R(req, '/users/' + u.id + '/revoke-sessions')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}">
             <button class="btn">Revoke sessions</button></form>
           <form method="POST" action="${R(req, '/users/' + u.id + '/login-as')}" style="display:inline" target="_blank"><input type="hidden" name="_csrf" value="${req.csrfToken}">
@@ -925,7 +1200,21 @@ router.get('/users/:id', async (req, res) => {
           <form method="POST" action="${R(req, '/users/' + u.id + '/verify-contact')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}">
             <button class="btn">Mark contact verified</button></form>
         </div>
-        <h4 class="mt">Balance adjustment (manual correction, audit-logged)</h4>
+        <h4 class="mt">Password</h4>
+        <p class="muted">Reset password emails a link and lets the user choose privately. Set a new password is the opposite: YOU choose it here — for test or support cases. Either way the user is signed out everywhere, and a set password is never shown again after you submit.</p>
+        <div class="btn-row">
+          <form method="POST" action="${R(req, '/users/' + u.id + '/reset-password')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}">
+            <button class="btn">Reset password (send link)</button></form>
+        </div>
+        <form method="POST" action="${R(req, '/users/' + u.id + '/set-password')}" class="adm-form">
+          <input type="hidden" name="_csrf" value="${req.csrfToken}">
+          <div class="field"><label for="setpw1">New password</label><input type="password" id="setpw1" name="new_password" required autocomplete="new-password"></div>
+          <div class="field"><label for="setpw2">Confirm new password</label><input type="password" id="setpw2" name="new_password_confirm" required autocomplete="new-password"></div>
+          <div class="field"><label><input type="checkbox" name="force_change" checked> User must change this password at next sign-in</label></div>
+          <div class="mt"><button class="btn btn-p" type="submit">Set password</button></div>
+        </form>
+        <h4 class="mt">Money controls</h4>
+        <p class="muted">Balance adjustment is a manual correction — audit-logged, with your remark. The matrix blocks this user's deposits or withdrawals only.</p>
         <form method="POST" action="${R(req, '/users/' + u.id + '/adjust')}" class="adm-form" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;">
           <input type="hidden" name="_csrf" value="${req.csrfToken}">
           <div class="field"><label>Direction</label><select name="direction"><option value="add">+ Add balance</option><option value="subtract">− Subtract balance</option></select></div>
@@ -939,40 +1228,50 @@ router.get('/users/:id', async (req, res) => {
           { key: 'withdrawal_blocked', label: 'Block withdrawals', type: 'checkbox', value: u.withdrawal_blocked },
           { key: 'deposit_mode', label: 'Deposit mode (blank = global)', type: 'select', options: ['', 'manual'], value: u.deposit_mode, help: 'Auto mode was removed: deposits are always manually reviewed, so an auto option would imply an approval that never happens.' },
           { key: 'withdrawal_mode', label: 'Withdrawal mode (blank = global)', type: 'select', options: ['', 'manual'], value: u.withdrawal_mode, help: 'Auto mode was removed: withdrawals are always manually reviewed.' },
-        ], { csrf: req.csrfToken, submit: 'Save matrix' })}`))}
-    </div>
-    <div>
-      ${ui.card('Wallets', ui.table(['Currency', 'Balance'], wallets.map(w => [w.currency, money(req, w.balance, w.currency)])))}
-      ${ui.card('Verification & account flags (v16: registration data the old detail page never showed)', ui.table(['Field', 'Value'], [
-        ['Email verified', u.email_verified ? '✓ Yes' : '✗ No'],
-        ['Phone verified', u.mobile_verified ? '✓ Yes' : '✗ No'],
-        ['Referral code', esc(u.referral_code || '—')],
-        ['Referred by', referrer ? ('#' + referrer.id + ' — ' + esc(referrer.email)) : '—'],
-        ['Two-factor (TOTP)', u.totp_secret ? '✓ Enabled' : '✗ Off'],
-        ['Forced password reset', u.force_password_reset ? 'Yes — user must reset on next sign-in' : 'No'],
-        ['Forced TOTP enrollment', u.force_totp_enroll ? 'Yes' : 'No'],
-        ['Payout details last changed', u.payout_updated_at ? d(u.payout_updated_at) : 'Never'],
-        ['Profile completed', (u.profile_completed === 0) ? '✗ Pending (signed up via OTP, name/terms not yet collected)' : '✓ Yes'],
-      ]))}
-      ${ui.card('KYC documents', (kycDocs.length ? ui.table(['#', 'Type', 'File', 'Status', 'Submitted', ''], kycDocs.map(doc => ['#' + doc.id, esc(({ national_id: 'National ID card', passport: 'Passport', driving_licence: 'Driving licence' }[doc.doc_type]) || doc.doc_type), esc(doc.original_name), ui.statusBadge(doc.status === 'approved' ? 'verified' : doc.status), d(doc.created_at), `<a class="btn btn-sm" href="${R(req, '/kyc/' + doc.id)}">Review</a>`])) : '<p class="muted">No documents submitted.</p>') + (u.kyc_status !== 'verified' ? `<h4 class="mt">Mark verified manually (off-platform verification)</h4>
+        ], { csrf: req.csrfToken, submit: 'Save matrix' })}`);
+  const kycCard = ui.card('KYC documents', (kycDocs.length ? ui.table(['#', 'Type', 'File', 'Status', 'Submitted', ''], kycDocs.map(doc => ['#' + doc.id, esc(({ national_id: 'National ID card', passport: 'Passport', driving_licence: 'Driving licence' }[doc.doc_type]) || doc.doc_type), esc(doc.original_name), ui.statusBadge(doc.status === 'approved' ? 'verified' : doc.status), d(doc.created_at), `<a class="btn btn-sm" href="${R(req, '/kyc/' + doc.id)}">Review</a>`])) : '<p class="muted">No documents submitted.</p>') + (u.kyc_status !== 'verified' ? `<h4 class="mt">Mark verified manually (off-platform verification)</h4>
         <form method="POST" action="${R(req, '/users/' + u.id + '/kyc-verify')}" class="adm-form">
           <input type="hidden" name="_csrf" value="${req.csrfToken}">
           <div class="field"><label>Attestation note (required — recorded in the audit log)</label><textarea name="note" required maxlength="500" placeholder="What was verified, where, and by whom"></textarea></div>
           <div class="mt"><button class="btn btn-p" type="submit">Mark verified manually</button></div>
-        </form>` : '<p class="muted">This user is KYC-verified.</p>'))}
-      ${ui.card('Fraud flags', flags.length ? ui.table(['When', 'Flag', 'Detail', 'Reviewed'], flags.map(f => [d(f.created_at), esc(FLAG_LABELS[f.flag_type] || String(f.flag_type || '').replace(/_/g, ' ')), esc(flagDetailText(f.detail)), f.reviewed_at ? '✓ ' + d(f.reviewed_at) : `<a class="btn btn-sm" href="${R(req, '/flags')}">Review</a>`])) : '<p class="muted">No flags.</p>')}
-      ${ui.card('Referral credits (pending = awaiting referee deposit + wagering)', ui.table(['When', 'Referee', 'Amount', 'Status'], refCredits.map(c => [d(c.created_at), '#' + c.referee_id, money(req, c.amount, c.currency), ui.statusBadge(c.status)])))}
-      ${ui.card('Recent tickets', ui.table(['Ticket', 'Total', 'Status', 'When'], tickets.map(t =>
-        [`<span class="code">${esc(t.public_id)}</span>`, money(req, t.total, t.currency), ui.statusBadge(t.status), d(t.created_at)]))) + `<p class="mt"><a class="btn btn-sm" href="${R(req, '/tickets')}?q=${encodeURIComponent(u.email)}">View all tickets for this player →</a></p>`}
+        </form>` : '<p class="muted">This user is KYC-verified.</p>'));
+  const fraudCard = ui.card('Fraud flags', flags.length ? ui.table(['When', 'Flag', 'Detail', 'Reviewed'], flags.map(f => [d(f.created_at), esc(FLAG_LABELS[f.flag_type] || String(f.flag_type || '').replace(/_/g, ' ')), esc(flagDetailText(f.detail)), f.reviewed_at ? '✓ ' + d(f.reviewed_at) : `<a class="btn btn-sm" href="${R(req, '/flags')}">Review</a>`])) : '<p class="muted">No flags.</p>');
+  const historyCards = `
       ${ui.card('Recent transactions', ui.table(['When', 'Type', 'Amount', 'Balance after'], txs.map(t =>
         [d(t.created_at), esc(txLabel(t.type)), `<span class="${t.amount >= 0 ? 'pos' : 'neg'}">${money(req, t.amount, t.currency)}</span>`, money(req, t.balance_after, t.currency)]))) + `<p class="mt"><a class="btn btn-sm" href="${R(req, '/reports')}?type=transaction&q=${encodeURIComponent(u.email)}">View all transactions for this player →</a></p>`}
+      ${ui.card('Referral credits (pending = awaiting referee deposit + wagering)', ui.table(['When', 'Referee', 'Amount', 'Status'], refCredits.map(c => [d(c.created_at), '#' + c.referee_id, money(req, c.amount, c.currency), ui.statusBadge(c.status)])))}
       ${ui.card('Login history', ui.table(['When', 'IP', 'Browser', 'OS', 'OK'], logins.map(l =>
         [d(l.created_at), esc(l.ip), esc(l.browser), esc(l.os), l.success ? '✓' : '✗']))) + `<p class="mt"><a class="btn btn-sm" href="${R(req, '/login-history')}?q=${encodeURIComponent(u.email)}">View full login history →</a></p>`}
       ${ui.card('Activity timeline', ui.table(['When', 'Action', 'Detail'], acts.map(a =>
-        [d(a.created_at), esc(a.action), `<span class="code">${esc(String(a.detail).slice(0, 100))}</span>`]))) + `<p class="mt"><a class="btn btn-sm" href="${R(req, '/audit')}?actor=${u.id}">View full audit trail for this user →</a></p>`}
-    </div>
-  </div>`;
-  res.send(shell(req, '/users', 'User #' + u.id + ' — ' + u.name, body));
+        [d(a.created_at), esc(a.action), auditDetailHtml(req, a.detail)]))) + `<p class="mt"><a class="btn btn-sm" href="${R(req, '/audit')}?actor=${u.id}">View full audit trail for this user →</a></p>`}`;
+  const biodataCard = ui.card('Edit details', ui.formHtml(R(req, '/users/' + u.id), [
+        { key: 'name', label: 'Name', type: 'text', value: u.name, required: true },
+        { key: 'email', label: 'Email', type: 'text', value: u.email },
+        { key: 'phone', label: 'Phone', type: 'text', value: u.phone },
+        { key: 'address', label: 'Address', type: 'text', value: u.address },
+        { key: 'city', label: 'City', type: 'text', value: u.city },
+        { key: 'state', label: 'State', type: 'text', value: u.state },
+        { key: 'zip', label: 'Zip / Postal code', type: 'text', value: u.zip },
+        { key: 'country', label: 'Country', type: 'text', value: u.country },
+        { key: 'kyc_override', label: 'KYC requirement for this user', type: 'select', options: ['default', 'required', 'exempt'], value: u.kyc_override || 'default', help: 'default = follows the global KYC switch (Settings → KYC). required = this user must be KYC-approved before gated actions even when the global switch is off. exempt = never gated.' },
+        { key: 'auto_withdrawal_limit', label: 'Auto-withdrawal limit', type: 'text', value: u.auto_withdrawal_limit === null || u.auto_withdrawal_limit === undefined ? '' : String(u.auto_withdrawal_limit), help: 'Blank = follow the global limit in Settings → Withdrawal & risk controls. A value (major units, e.g. 25.50) is this user\'s own ceiling; 0 = never auto-approve for this user. Auto-approval never pays out by itself.' },
+        { key: 'agent_id', label: 'Agent', type: 'select', options: [{ v: '', l: 'Unassigned' }].concat(agents.map(a => ({ v: String(a.id), l: '#' + a.id + ' — ' + a.name }))), value: u.agent_id ? String(u.agent_id) : '' },
+        { key: 'notes', label: 'Notes', type: 'textarea', value: u.notes },
+      ], { csrf: req.csrfToken, submit: 'Save details' }) + `<p class="muted">KYC status: <strong>${esc(u.kyc_status)}</strong> — changes only through the KYC review queue or the manual-verification attestation (see the KYC card).</p>`);
+  const body = `
+  ${summaryBand}
+  <div class="grid2">
+    <div>${factsCard}</div>
+    <div>${moneyCard}</div>
+  </div>
+  ${controlsCard}
+  <div class="grid2">
+    <div>${kycCard}</div>
+    <div>${fraudCard}</div>
+  </div>
+  ${historyCards}
+  ${biodataCard}`;
+  res.send(shell(req, '/users', 'User #' + u.id + ' — ' + u.name, body, 'Who this is, what they hold, and everything you can do — in that order.'));
 });
 
 router.post('/users/:id', async (req, res) => {
@@ -1121,6 +1420,34 @@ router.post('/users/:id/reset-password', async (req, res) => {
   res.redirect(R(req, '/users/' + u.id));
 });
 
+/* USER-PASS-SET-01: admin DIRECTLY sets a non-admin user's password
+   (the reset-link flow above stays untouched). Same validation as a
+   self-set password for that role + breached screening; all sessions
+   destroyed; unused reset tokens invalidated; the audit detail carries
+   ONLY the forced flag — never the password or its hash. */
+router.post('/users/:id/set-password', async (req, res) => {
+  const u = await req.db.get('SELECT * FROM users WHERE id = ?', [req.params.id]);
+  if (!u || u.role === 'admin') return notFound(req, res, 'User not found.');
+  const back = R(req, '/users/' + u.id);
+  const { passwordError } = require('../lib/validate');
+  const { isBreached } = require('../lib/breached');
+  const pw = String(req.body.new_password || '');
+  const pw2 = String(req.body.new_password_confirm || '');
+  let err = passwordError(pw, u.role, getBool(req.settings, 'secure_password', true));
+  if (!err && pw !== pw2) err = 'Passwords do not match.';
+  if (!err && getBool(req.settings, 'breached_password_check', true) && await isBreached(pw)) err = 'This password has appeared in a data breach. Please choose a different one.';
+  if (err) { await req.setFlash('error', 'Password NOT set: ' + err); return res.redirect(back); }
+  const forced = req.body.force_change ? 1 : 0;
+  await req.db.run('UPDATE users SET password_hash = ?, force_password_reset = ? WHERE id = ?', [hashPassword(pw), forced, u.id]);
+  await req.db.run('UPDATE password_resets SET used = 1 WHERE user_id = ? AND used = 0', [u.id]);
+  await destroyUserSessions(req.db, u.id);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'user.password_set_admin', entity: 'user', entityId: u.id, detail: { forced: !!forced }, ip: req.ip });
+  await req.setFlash('success', forced
+    ? 'Password set for ' + u.name + '. They are signed out everywhere and must choose their own password at next sign-in.'
+    : 'Password set for ' + u.name + '. They are signed out everywhere and can sign in with the new password right away.');
+  res.redirect(back);
+});
+
 router.post('/users/:id/revoke-sessions', async (req, res) => {
   const tgt = await req.db.get('SELECT role FROM users WHERE id = ?', [req.params.id]);
   if (!tgt || tgt.role === 'admin') return notFound(req, res, 'User not found.');
@@ -1211,7 +1538,7 @@ router.get('/otp', async (req, res) => {
       codes.map(c => [c.id, esc(c.label), `${c.uses}/${c.max_uses}`, c.expires_at ? d(c.expires_at) : 'never',
         c.revoked ? ui.badge('revoked', 'err') : ui.badge('live', 'ok'), d(c.created_at),
         c.revoked ? '' : `<form method="POST" action="${R(req, '/otp/' + c.id + '/revoke')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm btn-d">Revoke</button></form>`]))) + ui.paginate(R(req, '/otp'), page, PER, otpTotal);
-  res.send(shell(req, '/otp', 'OTP Signup Codes', body));
+  res.send(shell(req, '/otp', 'OTP Signup Codes', body, 'One-time codes issued for sign-up and verification.'));
 });
 
 router.post('/otp', async (req, res) => {
@@ -1241,16 +1568,16 @@ router.get('/agents', async (req, res) => {
   const total = (await req.db.get("SELECT COUNT(*) AS c FROM users WHERE role = 'agent'")).c;
   const agents = await req.db.query("SELECT * FROM users WHERE role = 'agent' ORDER BY created_at DESC LIMIT ? OFFSET ?", [PER, (page - 1) * PER]);
   const playerCounts = await req.db.query("SELECT agent_id, COUNT(*) AS c FROM users WHERE role = 'player' AND agent_id IS NOT NULL GROUP BY agent_id");
-  const commSums = await req.db.query('SELECT agent_id, COALESCE(SUM(amount),0) AS s FROM commissions GROUP BY agent_id');
+  const commSums = await req.db.query('SELECT agent_id, currency, COALESCE(SUM(amount),0) AS s FROM commissions GROUP BY agent_id, currency'); // CURRENCY-SYSTEM-01: per-currency, never one mixed sum
   const allFloats = await req.db.query('SELECT agent_id, currency, balance FROM agent_floats');
   const pcMap = Object.fromEntries(playerCounts.map(r => [r.agent_id, r.c]));
-  const csMap = Object.fromEntries(commSums.map(r => [r.agent_id, r.s]));
+  const csMap = {}; for (const r of commSums) (csMap[r.agent_id] = csMap[r.agent_id] || []).push(r);
   const flMap = {};
   for (const f of allFloats) (flMap[f.agent_id] = flMap[f.agent_id] || []).push(f);
   for (const a of agents) {
     a.players = pcMap[a.id] || 0;
     a.floats = flMap[a.id] || [];
-    a.comm = csMap[a.id] || 0;
+    a.comm = csMap[a.id] || [];
   }
   const body = ui.card('Create agent', ui.formHtml(R(req, '/agents'), [
     { key: 'name', label: 'Name', type: 'text', required: true },
@@ -1260,9 +1587,9 @@ router.get('/agents', async (req, res) => {
     ui.card('Agents', ui.table(['ID', 'Name', 'Email', 'Players', 'Float', 'Commissions', 'Status', ''],
       agents.map(a => [a.id, esc(a.name), esc(a.email), a.players,
         a.floats.map(f => `${f.currency} ${money(req, f.balance, f.currency)}`).join('<br>') || '—',
-        money(req, a.comm, getS(req.settings, 'base_currency', 'USD')), ui.statusBadge(a.status),
+        (a.comm.length ? a.comm.map(r => money(req, r.s, r.currency)).join('<br>') : money(req, 0, getS(req.settings, 'base_currency', 'USD'))), ui.statusBadge(a.status),
         `<a class="btn btn-sm" href="${R(req, '/agents/' + a.id)}">Manage</a>`])) + ui.paginate(R(req, '/agents'), page, PER, total));
-  res.send(shell(req, '/agents', 'Agents', body));
+  res.send(shell(req, '/agents', 'Agents', body, 'Cash agents, their floats and commissions.'));
 });
 
 router.post('/agents', async (req, res) => {
@@ -1409,14 +1736,39 @@ router.get('/deposits', async (req, res) => {
       money(req, x.amount, x.currency), money(req, x.charge, x.currency), money(req, x.net, x.currency),
       ui.statusBadge(x.status), d(x.created_at), `<a class="btn btn-sm" href="${R(req, '/deposits/' + x.id)}">Review</a>`])) +
     ui.paginate(R(req, '/deposits') + (qsParts.length ? '?' + qsParts.join('&') : ''), page, PER, total);
-  res.send(shell(req, '/deposits', 'Deposits', body));
+  res.send(shell(req, '/deposits', 'Deposits', body, 'Review deposit requests and credit players.'));
 });
 
+/* MANUAL-PAYMENTS ease: player-submitted data (proof / payout
+   destination) is stored under rail field KEYS (tx_hash, utr, ...).
+   Admin detail pages must show the field's real LABEL, not the raw
+   key, so the operator can act without decoding anything. */
+function railFieldLabel(railKey, kind, key) {
+  const rail = getRail(railKey);
+  if (!rail) return key;
+  const sets = kind === 'withdrawal' ? [rail.withdrawUserFields || [], rail.credentialFields || []] : [rail.userFields || [], rail.credentialFields || []];
+  for (const set of sets) { const f = set.find(x => x.key === key); if (f) return f.label; }
+  return key;
+}
+function labelledUserData(railKey, kind, userData) {
+  return Object.entries(userData || {}).map(([k, v]) => [railFieldLabel(railKey, kind, k), v]);
+}
+
 router.get('/deposits/:id', async (req, res) => {
-  const x = await req.db.get(`SELECT d.*, u.email, u.name AS user_name, m.name AS method_name FROM deposits d JOIN users u ON u.id = d.user_id LEFT JOIN payment_methods m ON m.id = d.method_id WHERE d.id = ?`, [req.params.id]);
+  const x = await req.db.get(`SELECT d.*, u.email, u.name AS user_name, m.name AS method_name, m.rail AS method_rail FROM deposits d JOIN users u ON u.id = d.user_id LEFT JOIN payment_methods m ON m.id = d.method_id WHERE d.id = ?`, [req.params.id]);
   if (!x) return notFound(req, res, 'Deposit not found.');
   let userData = {};
   try { userData = decodeUserData(x.user_data); } catch {}
+  /* MANUAL-PAYMENTS ease: show the pay-to details the player was told
+     to pay (the method's configured receiving details) on the SAME
+     screen as the proof, so the admin verifies proof against the
+     destination without opening the method's credentials page. */
+  let receivingRows = [];
+  try {
+    const { getReceivingDetails } = require('../lib/rails');
+    const mRow = await req.db.get('SELECT * FROM payment_methods WHERE id = ?', [x.method_id]);
+    if (mRow) receivingRows = await getReceivingDetails(req.db, mRow);
+  } catch {}
   const events = await req.db.query('SELECT * FROM webhook_events WHERE deposit_id = ? ORDER BY created_at DESC LIMIT 20', [x.id]);
   const pendAppr = await req.db.get("SELECT id FROM pending_approvals WHERE entity = 'deposit' AND entity_id = ? AND status = 'open'", [x.id]);
   const actions = pendAppr
@@ -1437,8 +1789,10 @@ router.get('/deposits/:id', async (req, res) => {
         ['Created', d(x.created_at)], ['Decided', x.decided_at ? d(x.decided_at) : '—'],
       ])}
     </div><div>
-      <h4>Player-submitted proof</h4>
-      ${ui.table(['Field', 'Value'], Object.entries(userData).map(([k, v]) => [esc(k), esc(v)]))}
+      <h4>Player was told to pay to (configured receiving details)</h4>
+      ${receivingRows.length ? ui.table(['Detail', 'Value'], receivingRows.map(r => [esc(r.label), esc(r.value)])) : '<p class="muted">No receiving details are configured on this method.</p>'}
+      <h4 class="mt">Player-submitted proof</h4>
+      ${ui.table(['Field', 'Value'], labelledUserData(x.method_rail, 'deposit', userData).map(([k, v]) => [esc(k), esc(v)]))}
       <h4 class="mt">Admin note (internal — never shown to the player)</h4>
       ${ui.formHtml(R(req, '/deposits/' + x.id + '/note'), [{ key: 'admin_note', label: 'Note', type: 'textarea', value: x.admin_note }], { csrf: req.csrfToken, submit: 'Save note', grid: false })}
     </div></div>
@@ -1485,7 +1839,7 @@ const FLAG_LABELS = { shared_device: 'Shared device / IP' };
 /* U-24 (v20): ledger types and bonus enums render as human labels in
    admin tables/selects — never the raw snake_case value. The fallback
    is the CSV humaniser (spaced + capitalised), never the raw value. */
-const TX_LABELS = { deposit: 'Deposit', deposit_revoke: 'Deposit reversed', bonus: 'Bonus', bonus_revoke: 'Bonus reversed', withdrawal: 'Withdrawal', withdrawal_hold: 'Withdrawal hold', withdrawal_release: 'Withdrawal released', withdrawal_revoke: 'Withdrawal reversed', ticket_purchase: 'Lottery ticket', win: 'Lottery win', draw_refund: 'Draw refund', scratch_purchase: 'Scratch ticket', scratch_prize: 'Scratch prize', referral_commission: 'Referral commission', agent_commission: 'Agent commission', agent_funding: 'Agent funding', adjustment: 'Adjustment', transfer_in: 'Transfer in', transfer_out: 'Transfer out', commission: 'Commission' };
+const TX_LABELS = { deposit: 'Deposit', deposit_revoke: 'Deposit reversed', bonus: 'Bonus', bonus_revoke: 'Bonus reversed', withdrawal: 'Withdrawal', withdrawal_hold: 'Withdrawal hold', withdrawal_release: 'Withdrawal released', withdrawal_revoke: 'Withdrawal reversed', ticket_purchase: 'Lottery ticket', win: 'Lottery win', draw_refund: 'Draw refund', scratch_purchase: 'Scratch ticket', scratch_prize: 'Scratch prize', referral_commission: 'Referral commission', agent_commission: 'Agent commission', agent_funding: 'Agent funding', adjustment: 'Adjustment', transfer_in: 'Transfer in', transfer_out: 'Transfer out', commission: 'Commission', exchange_in: 'Exchange in', exchange_out: 'Exchange out' };
 const BONUS_AUDIENCE_LABELS = { all: 'All players', new: 'New players', first_n: 'First N', random_n: 'Random N' };
 const BONUS_TRIGGER_LABELS = { manual: 'Manual', signup: 'Sign-up', first_deposit: 'First deposit', scheduled: 'Scheduled' };
 function flagDetailText(raw) {
@@ -1606,16 +1960,37 @@ router.get('/withdrawals', async (req, res) => {
          <div class="field"><label for="wd_auto_limit">Auto-withdrawal limit (e.g. 50.00; 0 = OFF — everything manual)</label><input id="wd_auto_limit" type="text" name="auto_withdrawal_limit" value="${esc(autoWdNow)}"></div>
          <div class="mt"><button class="btn btn-p" type="submit">Save auto-withdrawal limit</button></div></form>`
       : `<p class="muted">Auto-withdrawal limit is currently <strong>${esc(autoWdNow)}</strong> (0 = OFF — everything manual). Only the super admin can change it, in Settings → Withdrawal &amp; risk controls.</p>`);
-  const body = wdStrip + autoWdCard + moneyTabs(req, R(req, '/withdrawals'), counts, status, [['paid', 'Paid']]) + wFilterForm + ui.table(['ID', 'Player', 'Method', 'Amount', 'Charge', 'Net payout', 'Status', 'When', ''],
+  /* SETTINGS-FIND-01 (two doors, same pattern as the auto-limit card
+     above): the wagering gate ALSO lives here, on the page where
+     withdrawals are worked — the owner could not find this checkbox
+     inside the mega Settings page on his phone, and a control the
+     operator cannot find is a defect. Same /settings/risk route, same
+     withdrawal_turnover_required key; every other risk field is
+     carried hidden at its current value. Super-only editing. */
+  const turnoverOn = getS(req.settings, 'withdrawal_turnover_required', '1') === '1';
+  const gatesCard = ui.card('Withdrawal gates',
+    isSuperReq(req)
+      ? `<p class="muted">Wagering gate: while ON, a player must have wagered at least their approved deposits (1×) before any withdrawal is allowed. This is the same switch as Settings → Withdrawal &amp; risk controls.</p>
+         <form method="POST" action="${R(req, '/settings/risk')}" class="adm-form"><input type="hidden" name="_csrf" value="${req.csrfToken}">
+         ${riskHidden('auto_withdrawal_limit', autoWdNow)}
+         ${riskHidden('withdrawal_daily_cap', (parseFloat(getS(req.settings, 'withdrawal_daily_cap', '0')) / 100).toFixed(2))}
+         ${riskHidden('withdrawal_monthly_cap', (parseFloat(getS(req.settings, 'withdrawal_monthly_cap', '0')) / 100).toFixed(2))}
+         ${riskHidden('payout_lock_hours', getS(req.settings, 'payout_lock_hours', '48'))}
+         ${riskHidden('maker_checker_threshold', (parseFloat(getS(req.settings, 'maker_checker_threshold', '0')) / 100).toFixed(2))}
+         ${riskHidden('referral_cap_per_referee', (parseFloat(getS(req.settings, 'referral_cap_per_referee', '0')) / 100).toFixed(2))}
+         <div class="field"><label><input type="checkbox" name="withdrawal_turnover_required" ${turnoverOn ? 'checked' : ''}> Require 1× wagering before withdrawal</label></div>
+         <div class="mt"><button class="btn btn-p" type="submit">Save withdrawal gates</button></div></form>`
+      : `<p class="muted">Require 1× wagering before withdrawal is currently <strong>${turnoverOn ? 'ON' : 'OFF'}</strong>. Only the super admin can change it, in Settings → Withdrawal &amp; risk controls.</p>`);
+  const body = wdStrip + autoWdCard + gatesCard + moneyTabs(req, R(req, '/withdrawals'), counts, status, [['paid', 'Paid']]) + wFilterForm + ui.table(['ID', 'Player', 'Method', 'Amount', 'Charge', 'Net payout', 'Status', 'When', ''],
     rows.map(x => [`<span class="code">${esc(x.public_id)}</span>`, esc(x.email), esc(x.method_name || '—'),
       money(req, x.amount, x.currency), money(req, x.charge, x.currency), money(req, x.net, x.currency),
       ui.statusBadge(x.status), d(x.created_at), `<a class="btn btn-sm" href="${R(req, '/withdrawals/' + x.id)}">Review</a>`])) +
     ui.paginate(R(req, '/withdrawals') + (qsPartsW.length ? '?' + qsPartsW.join('&') : ''), page, PER, total);
-  res.send(shell(req, '/withdrawals', 'Withdrawals', body));
+  res.send(shell(req, '/withdrawals', 'Withdrawals', body, 'Review payout requests and mark them paid.'));
 });
 
 router.get('/withdrawals/:id', async (req, res) => {
-  const x = await req.db.get(`SELECT w.*, u.email, u.name AS user_name, m.name AS method_name FROM withdrawals w JOIN users u ON u.id = w.user_id LEFT JOIN payment_methods m ON m.id = w.method_id WHERE w.id = ?`, [req.params.id]);
+  const x = await req.db.get(`SELECT w.*, u.email, u.name AS user_name, m.name AS method_name, m.rail AS method_rail FROM withdrawals w JOIN users u ON u.id = w.user_id LEFT JOIN payment_methods m ON m.id = w.method_id WHERE w.id = ?`, [req.params.id]);
   if (!x) return notFound(req, res, 'Withdrawal not found.');
   let userData = {};
   try { userData = decodeUserData(x.user_data); } catch {}
@@ -1639,8 +2014,8 @@ router.get('/withdrawals/:id', async (req, res) => {
         ['Created', d(x.created_at)], ['Decided', x.decided_at ? d(x.decided_at) : '—'],
       ])}
     </div><div>
-      <h4>Player payout details</h4>
-      ${ui.table(['Field', 'Value'], Object.entries(userData).map(([k, v]) => [esc(k), esc(v)]))}
+      <h4>Player payout details — send the Net payout here</h4>
+      ${ui.table(['Field', 'Value'], labelledUserData(x.method_rail, 'withdrawal', userData).map(([k, v]) => [esc(k), esc(v)]))}
       <h4 class="mt">Admin note (internal — never shown to the player)</h4>
       ${ui.formHtml(R(req, '/withdrawals/' + x.id + '/note'), [{ key: 'admin_note', label: 'Note', type: 'textarea', value: x.admin_note }], { csrf: req.csrfToken, submit: 'Save note', grid: false })}
     </div></div>
@@ -1707,22 +2082,45 @@ router.post('/withdrawals/:id/note', async (req, res) => {
 });
 
 /* ============================================================ PAYMENT METHODS */
+/* CURRENCY-SYSTEM-01: coverage warning — an enabled currency with no
+   enabled deposit and/or withdrawal method is exactly the owner's INR
+   bug (INR selected, only USD methods exist). Computed from the real
+   methods table; shown on the Currencies card and the Methods page. */
+async function currencyCoverageGaps(req) {
+  const curs = getCurrencies(req.settings);
+  const rows = await req.db.query("SELECT currency, kind FROM payment_methods WHERE enabled = 1");
+  const gaps = [];
+  for (const c of curs) {
+    const hasDep = rows.some(r => r.currency === c.code && (r.kind === 'deposit' || r.kind === 'both'));
+    const hasWd = rows.some(r => r.currency === c.code && (r.kind === 'withdrawal' || r.kind === 'both'));
+    if (!hasDep || !hasWd) gaps.push({ code: c.code, hasDep, hasWd });
+  }
+  return gaps;
+}
+function coverageHtml(gaps) {
+  if (!gaps.length) return '';
+  const lines = gaps.map(g => `<li><strong>${esc(g.code)}</strong> is enabled but has ${!g.hasDep && !g.hasWd ? 'no deposit method and no withdrawal method' : !g.hasDep ? 'no deposit method' : 'no withdrawal method'} — ${esc(g.code)} players will only see other-currency methods.</li>`).join('');
+  return `<div class="alert a-err">Currency coverage warning:<ul style="margin:6px 0 0">${lines}</ul></div>`;
+}
+
 router.get('/methods', async (req, res) => {
   const methods = await req.db.query('SELECT * FROM payment_methods ORDER BY sort');
-  const body = `<div class="btn-row" style="margin-bottom:16px"><a class="btn btn-p" href="${R(req, '/methods/new')}">+ New method</a></div>` +
-    ui.table(['Logo', 'Name', 'Kind', 'Rail', 'Currency', 'Min / Max', 'Charge', 'Status', ''],
+  const coverageGaps = await currencyCoverageGaps(req);
+  const body = coverageHtml(coverageGaps) + `<div class="btn-row" style="margin-bottom:16px"><a class="btn btn-p" href="${R(req, '/methods/new')}">+ New method</a></div>` +
+    ui.table(['Logo', 'Name', 'Kind', 'Rail', 'Currency', 'Min / Max', 'Charge', 'Mode', 'Status', ''],
       methods.map(m => [
         m.logo_url ? `<img src="${esc(m.logo_url)}" alt="" style="height:28px">` : '<span class="muted">—</span>',
         esc(m.name), esc(m.kind), esc((getRail(m.rail) || {}).name || m.rail),
         esc(m.currency),
         `${money(req, m.min_amount, m.currency)} – ${m.max_amount ? money(req, m.max_amount, m.currency) : '∞'}`,
         `${money(req, m.fixed_charge, m.currency)} + ${m.percent_charge}%`,
+        m.processing_mode === 'auto' ? ui.badge('Auto Pay', 'ok') : ui.badge('Manual Pay', 'muted'),
         m.enabled ? ui.badge('enabled', 'ok') : ui.badge('disabled', 'muted'),
         `<a class="btn btn-sm" href="${R(req, '/methods/' + m.id)}">Edit</a>
          <a class="btn btn-sm" href="${R(req, '/methods/' + m.id + '/credentials')}">Credentials</a>
          <form method="POST" action="${R(req, '/methods/' + m.id + '/toggle')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm">${m.enabled ? 'Disable' : 'Enable'}</button></form>`,
       ]));
-  res.send(shell(req, '/methods', 'Payment Methods', body));
+  res.send(shell(req, '/methods', 'Payment Methods', body, 'Payment rails — receiving details, limits and Manual / Auto mode.'));
 });
 
 const METHOD_FIELDS = (m = {}) => [
@@ -1736,7 +2134,8 @@ const METHOD_FIELDS = (m = {}) => [
   { key: 'max_amount', label: 'Max amount (blank = no max)', type: 'text', value: m.max_amount ? fromMinor(m.max_amount) : '' },
   { key: 'fixed_charge', label: 'Fixed charge (e.g. 0.50)', type: 'text', value: m.fixed_charge ? fromMinor(m.fixed_charge) : '' },
   { key: 'percent_charge', label: 'Percent charge %', type: 'text', value: m.percent_charge || '' },
-  { key: 'instruction', label: 'Instruction shown to player', type: 'textarea', value: m.instruction },
+  { key: 'instruction', label: 'Deposit how-to shown to player', type: 'textarea', value: m.instruction, help: 'Manual deposit steps. Each new line becomes a numbered step on the deposit page.' },
+  { key: 'withdraw_instruction', label: 'Withdrawal how-to shown to player', type: 'textarea', value: m.withdraw_instruction || '', help: 'Withdrawal steps shown on the withdraw page. Blank = the deposit how-to is used.' },
   { key: 'custom_fields', label: 'Custom user-data fields (JSON)', type: 'textarea', value: m.custom_fields || '[]', help: 'e.g. [{"key":"account","label":"Your account number","type":"text","required":true}]' },
   { key: 'enabled', label: 'Enabled', type: 'checkbox', value: m.enabled },
 ];
@@ -1794,12 +2193,12 @@ router.post('/methods/new', async (req, res) => {
     const f = validateMethodFields(req.body, req.settings);
     const cf = parseCustomFields(req.body.custom_fields);
     const slug = 'm-' + randHex(4) + '-' + Date.now().toString(36);
-    await req.db.run(`INSERT INTO payment_methods (kind, name, slug, rail, logo_url, currency, rate, min_amount, max_amount, fixed_charge, percent_charge, instruction, custom_fields, enabled, sort)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    await req.db.run(`INSERT INTO payment_methods (kind, name, slug, rail, logo_url, currency, rate, min_amount, max_amount, fixed_charge, percent_charge, instruction, withdraw_instruction, custom_fields, enabled, sort)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [f.kind, f.name, slug, f.rail, req.body.logo_url || '', f.currency,
        rateNew, f.min, f.max,
        f.fixed, pctNew,
-       req.body.instruction || '', JSON.stringify(cf), req.body.enabled ? 1 : 0, 999]);
+       req.body.instruction || '', req.body.withdraw_instruction || '', JSON.stringify(cf), req.body.enabled ? 1 : 0, 999]);
     await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'method.create', entity: 'method', entityId: slug, detail: { new: { kind: f.kind, name: f.name, rail: f.rail, currency: f.currency, rate: rateNew, min: f.min, max: f.max, fixed: f.fixed, percent: pctNew } }, ip: req.ip });
     await req.setFlash('success', 'Method created.');
   } catch (e) { await req.setFlash('error', e.message); return res.redirect(R(req, '/methods/new')); }
@@ -1826,11 +2225,11 @@ router.post('/methods/:id', async (req, res) => {
     if (pctEdit >= 100) throw new Error('Percent charge must be less than 100% — at 100% or more, a deposit would credit the player nothing and could never be approved cleanly.');
     const f = validateMethodFields(req.body, req.settings);
     const cf = parseCustomFields(req.body.custom_fields);
-    await req.db.run(`UPDATE payment_methods SET kind=?, name=?, rail=?, logo_url=?, currency=?, rate=?, min_amount=?, max_amount=?, fixed_charge=?, percent_charge=?, instruction=?, custom_fields=?, enabled=? WHERE id=?`,
+    await req.db.run(`UPDATE payment_methods SET kind=?, name=?, rail=?, logo_url=?, currency=?, rate=?, min_amount=?, max_amount=?, fixed_charge=?, percent_charge=?, instruction=?, withdraw_instruction=?, custom_fields=?, enabled=? WHERE id=?`,
       [f.kind, f.name, f.rail, req.body.logo_url || '', f.currency,
        rateEdit, f.min, f.max,
        f.fixed, pctEdit,
-       req.body.instruction || '', JSON.stringify(cf), req.body.enabled ? 1 : 0, req.params.id]);
+       req.body.instruction || '', req.body.withdraw_instruction || '', JSON.stringify(cf), req.body.enabled ? 1 : 0, req.params.id]);
     await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'method.update', entity: 'method', entityId: req.params.id, detail: { old: { kind: old.kind, name: old.name, rail: old.rail, currency: old.currency, rate: old.rate, min: old.min_amount, max: old.max_amount, fixed: old.fixed_charge, percent: old.percent_charge }, new: { kind: f.kind, name: f.name, rail: f.rail, currency: f.currency, rate: rateEdit, min: f.min, max: f.max, fixed: f.fixed, percent: pctEdit } }, ip: req.ip });
     await req.setFlash('success', 'Method saved.');
   } catch (e) { await req.setFlash('error', e.message); }
@@ -1855,6 +2254,78 @@ router.post('/methods/:id/delete', async (req, res) => {
   await req.setFlash('success', 'Method deleted.');
   res.redirect(R(req, '/methods'));
 });
+/* METHOD-MODE-01: per-method Manual Pay / Auto Pay. Auto is honest or
+   it does not exist (R-044): it can only be SAVED when this rail has a
+   real provider-confirmation path (signed webhooks) AND every field
+   Auto needs is already filled below. Rails without a webhook path
+   (UPI, bank transfer, vouchers, cash agents, PayPal — no PayPal
+   verification client exists in this codebase) stay Manual forever,
+   and the admin is told exactly that, in plain words. */
+function autoPayBlockReason(rail) {
+  if (!rail) return 'Is method ki rail pehchani nahi gayi — Auto band hai, ye Manual hi chalega.';
+  if (rail.key === 'paypal') return 'PayPal ki payment verification integration abhi code me hai hi nahi — Auto band hai, Manual chalega.';
+  return 'Is method me Auto asal me nahi ho sakta — provider ki taraf se koi payment confirmation (webhook) nahi aati, is liye ye Manual hi chalega.';
+}
+async function autoPayMissingFields(req, m, rail) {
+  const { loadCredentials } = require('../lib/credentials');
+  const saved = await loadCredentials(req.db, m.id).catch(() => ({}));
+  const missing = [];
+  for (const f of (rail ? rail.credentialFields : [])) {
+    const v = String(saved[f.key] || '').trim();
+    if ((f.key === 'webhook_secret' || f.required) && !v) missing.push(f.label);
+  }
+  return missing;
+}
+function methodModeCard(req, m, rail) {
+  const mode = m.processing_mode === 'auto' ? 'auto' : 'manual';
+  const canAuto = !!(rail && rail.webhook);
+  const autoLimit = getS(req.settings, 'auto_withdrawal_limit', '0');
+  const autoLine = canAuto
+    ? 'Auto Pay: deposit provider ki signed confirmation (webhook) aane par khud credit hoga. Withdrawal sirf auto-withdrawal limit tak khud approve hota hai — paisa bhejna aur mark-paid admin hi karega.'
+    : autoPayBlockReason(rail);
+  const limitLine = (!autoLimit || autoLimit === '0')
+    ? 'Auto-withdrawal limit abhi OFF (0) hai — Auto mode me bhi koi withdrawal khud approve nahi hoga.'
+    : `Auto-withdrawal limit abhi ${esc(autoLimit)} hai — is se zyada ke withdrawals hamesha manual queue me jayenge.`;
+  return ui.card('Processing mode — ' + esc(m.name),
+    `<form method="POST" action="${R(req, '/methods/' + m.id + '/mode')}" class="adm-form"><input type="hidden" name="_csrf" value="${req.csrfToken}">
+      <div class="field"><label for="pmode">Please select: Manual Pay / Auto Pay</label>
+      <select id="pmode" name="processing_mode">
+        <option value="manual"${mode === 'manual' ? ' selected' : ''}>Manual Pay</option>
+        <option value="auto"${mode === 'auto' ? ' selected' : ''}${canAuto ? '' : ' disabled'}>Auto Pay</option>
+      </select></div>
+      <p class="muted">Manual Pay: player proof bhejega, phir admin queue me approve / reject hoga — paisa tabhi credit hoga jab admin confirm kare.</p>
+      <p class="muted">${autoLine}</p>
+      <p class="muted">${canAuto ? limitLine : ''}</p>
+      <div class="mt"><button class="btn btn-p" type="submit">Save mode</button></div></form>`);
+}
+router.post('/methods/:id/mode', async (req, res) => {
+  const { normalizeRole } = require('../lib/rbac');
+  if (normalizeRole(req.user) !== 'super') return res.status(403).render('error', { status: 403, message: 'Only the super admin can change a method mode.' });
+  const m = await req.db.get('SELECT * FROM payment_methods WHERE id = ?', [req.params.id]);
+  if (!m) return notFound(req, res, 'Method not found.');
+  const rail = getRail(m.rail);
+  const want = String(req.body.processing_mode || 'manual');
+  const back = R(req, '/methods/' + m.id + '/credentials');
+  if (want !== 'manual' && want !== 'auto') { await req.setFlash('error', 'Mode not saved: choose Manual Pay or Auto Pay.'); return res.redirect(back); }
+  if (want === 'auto') {
+    if (!rail || !rail.webhook) {
+      await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'method.mode_blocked', entity: 'method', entityId: m.id, detail: { want: 'auto', reason: 'rail has no provider confirmation path' }, ip: req.ip });
+      await req.setFlash('error', 'Auto Pay NOT set: ' + autoPayBlockReason(rail));
+      return res.redirect(back);
+    }
+    const missing = await autoPayMissingFields(req, m, rail);
+    if (missing.length) {
+      await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'method.mode_blocked', entity: 'method', entityId: m.id, detail: { want: 'auto', missing }, ip: req.ip });
+      await req.setFlash('error', 'Auto Pay NOT set: Auto ke liye pehle ye details bharo: ' + missing.join(', ') + '. Ye details isi page par neeche bhar kar pehle Save credentials karo, phir Auto Pay select karo.');
+      return res.redirect(back);
+    }
+  }
+  await req.db.run('UPDATE payment_methods SET processing_mode = ? WHERE id = ?', [want, m.id]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'method.mode', entity: 'method', entityId: m.id, detail: { mode: want, rail: m.rail }, ip: req.ip });
+  await req.setFlash('success', want === 'auto' ? 'Auto Pay is ON for this method.' : 'Manual Pay is set for this method.');
+  return res.redirect(back);
+});
+
 router.get('/methods/:id/credentials', async (req, res) => {
   // DS-011: decrypted gateway credentials are super-admin only. RBAC lets
   // every staff role read GET pages, so this route gates itself.
@@ -1875,12 +2346,22 @@ router.get('/methods/:id/credentials', async (req, res) => {
      copy — the old map dropped every field's help text. Password fields
      render EMPTY: a stored secret is never echoed back into the page;
      the operator sees the field's own help plus the keep-saved note. */
+  /* CREDENTIALS-REAL-01: every field states WHICH mode needs it, so the
+     owner never fills API fields for a manual-only setup unknowingly. */
+  const { RECEIVING_FIELDS: RF, PUBLIC_CONFIG_FIELDS: PCF } = require('../lib/rails');
+  const modeTag = f => {
+    if (rail && (RF[rail.key] || []).includes(f.key)) return 'Needed for: Manual — this is where the player pays; it is shown on the deposit page.';
+    if (rail && (PCF[rail.key] || []).includes(f.key)) return 'Shown to players as payment context. Needed for Auto/API checkout.';
+    if (f.type === 'password' || /secret|api_key|api_token|client_id/.test(f.key)) return 'Needed for: Auto/API mode only — not needed for Manual.';
+    if (f.key === 'mode' || f.key === 'environment') return 'Provider mode setting — used by Auto/API mode.';
+    return 'Provider configuration.';
+  };
   const fields = (rail ? rail.credentialFields : []).map(f => ({ ...f,
     type: f.type === 'password' ? 'password' : f.type,
     value: f.type === 'password' ? '' : (saved[f.key] || ''),
-    help: f.type === 'password' ? ((f.help ? f.help + ' ' : '') + 'Leave blank to keep the saved value.') : f.help,
+    help: ((f.help ? f.help + ' ' : '') + '[' + modeTag(f) + ']') + (f.type === 'password' ? ' Leave blank to keep the saved value.' : ''),
   }));
-  const body = ui.card(`Gateway credentials — ${m.name} (${rail ? rail.name : m.rail})`,
+  const body = methodModeCard(req, m, rail) + ui.card(`Gateway credentials — ${m.name} (${rail ? rail.name : m.rail})`,
     `<p class="muted">Credentials are stored server-side. Receiving details (wallet address, UPI ID, bank account, QR code) ARE shown to players on the deposit page so they can pay; secret keys are never shown to players. ${rail && rail.webhook ? 'This rail supports provider webhooks with signature verification.' : 'This rail runs in manual mode: players submit proof, staff approves.'} ${keyConfigured() ? 'Credentials are encrypted at rest (AES-256-GCM).' : 'No encryption key is configured — credentials are stored in plaintext. Set CREDENTIAL_ENCRYPTION_KEY and re-save to encrypt.'}</p>` +
     (fields.length ? ui.formHtml(R(req, '/methods/' + m.id + '/credentials'), fields,
       { csrf: req.csrfToken, submit: 'Save credentials' })
@@ -1951,7 +2432,7 @@ router.get('/reports', async (req, res) => {
   let body = `<div class="tabs">${tabs}</div>` + dateForm;
   if (rangeError) {
     body += `<div class="alert a-err">${esc(rangeError)}</div>`;
-    return res.send(shell(req, '/reports', 'Reports', body));
+    return res.send(shell(req, '/reports', 'Reports', body, 'Money and activity reports.'));
   }
   if (capped) body += '<div class="alert a-warn">Date range capped at 366 days.</div>';
   const repBase = `${R(req, '/reports')}?type=${type}&from=${fmtDateInput(from)}&to=${fmtDateInput(to)}${q ? '&q=' + encodeURIComponent(q) : ''}`;
@@ -2029,7 +2510,7 @@ router.get('/reports', async (req, res) => {
       [d(x.created_at), `<span class="code">${esc(x.public_id)}</span>`, esc(x.email), money(req, x.amount, x.currency), money(req, x.charge, x.currency), money(req, x.net, x.currency), ui.statusBadge(x.status)]))) +
       ui.paginate(repBase, page, PER, total);
   }
-  res.send(shell(req, '/reports', 'Reports', body));
+  res.send(shell(req, '/reports', 'Reports', body, 'Money and activity reports.'));
 });
 
 /* ============================================================ DATA — IMPORT & EXPORT (U-23)
@@ -2147,7 +2628,7 @@ router.get('/data', async (req, res) => {
        <div class="field"><label for="imp_csv">CSV contents</label><textarea id="imp_csv" name="csv_text" rows="10" required placeholder="Paste the full contents of the .csv file here"></textarea></div>
        <div class="mt"><button class="btn btn-p" type="submit">Check the file</button></div></form>`);
   }
-  res.send(shell(req, '/data', 'Data — Import & Export', exportCard + importCard));
+  res.send(shell(req, '/data', 'Data — Import & Export', exportCard + importCard, 'Export or import platform data.'));
 });
 router.get('/data/export/:dataset', async (req, res) => {
   const { normalizeRole } = require('../lib/rbac');
@@ -2412,7 +2893,7 @@ router.get('/support', async (req, res) => {
          ? `<a class="btn btn-sm" href="${R(req, '/support/' + t.public_id)}?view=deleted">View</a><br><span class="muted">deleted ${d(t.deleted_at)} by ${esc(t.deleted_by_email || ('#' + t.deleted_by))}</span>`
          : `<a class="btn btn-sm" href="${R(req, '/support/' + t.public_id)}">Open</a> <form method="POST" action="${R(req, '/support/' + t.public_id + '/delete')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm">Delete</button></form>`])) +
     ui.paginate(deletedView ? delBase(prio) : supBase(status, prio), page, PER, total);
-  res.send(shell(req, '/support', 'Support Tickets', body));
+  res.send(shell(req, '/support', 'Support Tickets', body, 'Player help requests and your replies.'));
 });
 /* BP-21 (v19): KYC review queue. Player-uploaded identity documents live
    in a private store (lib/upload) and are served ONLY through the
@@ -2440,7 +2921,7 @@ router.get('/kyc', async (req, res) => {
   ${ui.card('KYC — pending review (' + pending.length + ')', pending.length ? ui.table(['#', 'Player', 'Document', 'File', 'Size', 'Submitted', ''], pending.map(rowP)) : '<p class="muted">No documents waiting for review.</p>')}
   ${ui.card('Recently decided', decided.length ? ui.table(['#', 'Player', 'Document', 'Status', 'Reviewed', ''], decided.map(doc => ['#' + doc.id, esc(doc.uname), esc(KYC_DOC_LABELS[doc.doc_type] || doc.doc_type), ui.statusBadge(doc.status === 'approved' ? 'verified' : doc.status), d(doc.reviewed_at), `<a class="btn btn-sm" href="${R(req, '/kyc/' + doc.id)}">Open</a>`])) : '<p class="muted">Nothing decided yet.</p>')}
   <p class="muted">KYC is a switchable module (Settings → KYC). It ships OFF; per-user requirements live on each user page (KYC requirement: default / required / exempt).</p>`;
-  res.send(shell(req, '/kyc', 'KYC Review', body));
+  res.send(shell(req, '/kyc', 'KYC Review', body, 'Identity documents waiting for review.'));
 });
 router.get('/kyc/document/:id', async (req, res) => {
   const doc = await req.db.get('SELECT * FROM kyc_documents WHERE id = ?', [req.params.id]);
@@ -2540,7 +3021,7 @@ router.get('/support/canned-replies', async (req, res) => {
       <input type="hidden" name="_csrf" value="${req.csrfToken}">
       <button class="btn btn-sm btn-d" type="submit">Delete</button>
     </form>`)).join('') : ui.card('Canned replies', '<p class="muted">No canned replies yet. Create the first one above — it will appear in the reply picker on every support ticket.</p>');
-  res.send(shell(req, '/support/canned-replies', 'Canned Replies', createForm + list));
+  res.send(shell(req, '/support/canned-replies', 'Canned Replies', createForm + list, 'Saved reply templates for support.'));
 });
 router.post('/support/canned-replies', async (req, res) => {
   const title = String(req.body.title || '').trim().slice(0, 120);
@@ -2662,7 +3143,7 @@ router.get('/extensions', async (req, res) => {
       </div></div></div>`;
   }).join('');
   res.send(shell(req, '/extensions', 'Extensions', `<div class="grid2">${cards}</div>
-    <p class="muted">Every integration has an on/off switch. With an extension OFF or unconfigured, the site works fully — the feature is simply skipped.</p>`));
+    <p class="muted">Every integration has an on/off switch. With an extension OFF or unconfigured, the site works fully — the feature is simply skipped.</p>`, 'Optional add-on modules and their on/off switches.'));
 });
 router.get('/extensions/:key', async (req, res) => {
   const e = (await getExtensions(req.db))[req.params.key];
@@ -2780,7 +3261,7 @@ router.get('/notifications', async (req, res) => {
       ui.card('Push', `<p>${ui.badge('not configured', 'warn')} — push notifications are not set up yet.</p>`) +
       `<p class="muted">When a provider is not configured, notifications are logged to the outbox and the site keeps working — nothing breaks.</p>`;
   }
-  res.send(shell(req, '/notifications', 'Notifications', body));
+  res.send(shell(req, '/notifications', 'Notifications', body, 'Every email, SMS and in-app message the system sent.'));
 });
 router.get('/notifications/log/:id', async (req, res) => {
   const l = await req.db.get('SELECT * FROM notifications_log WHERE id = ?', [req.params.id]);
@@ -2900,7 +3381,7 @@ router.get('/contact-messages', async (req, res) => {
     rows.map(x => [d(x.created_at), esc(x.name) + ' &lt;' + esc(x.email) + '&gt;', esc(x.subject || '—'), esc(String(x.message || '').slice(0, 140)),
       x.handled ? ui.badge('handled', 'ok') : ui.badge('new', 'warn'),
       `<form method="POST" action="${R(req, '/contact-messages/' + x.id + '/handled')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm">${x.handled ? 'Reopen' : 'Mark handled'}</button></form>`])));
-  res.send(shell(req, '/contact-messages', 'Contact Messages', body));
+  res.send(shell(req, '/contact-messages', 'Contact Messages', body, 'Messages sent from the public contact form.'));
 });
 router.post('/contact-messages/:id/handled', async (req, res) => {
   const r = await req.db.run('UPDATE contact_messages SET handled = 1 - handled WHERE id = ?', [req.params.id]);
@@ -2966,7 +3447,7 @@ router.get('/pages', async (req, res) => {
     body += ui.table(['Key', 'Title', 'Updated', ''], rows.map(b =>
       [`<span class="code">${esc(b.key)}</span>`, esc(b.title), d(b.updated_at), `<a class="btn btn-sm" href="${R(req, '/content/' + encodeURIComponent(b.key))}">Edit</a>`]));
   }
-  res.send(shell(req, '/pages', 'Pages & Content', body));
+  res.send(shell(req, '/pages', 'Pages & Content', body, 'Site pages and editable content blocks.'));
 });
 const PAGE_FIELDS = (p = {}) => [
   { key: 'name', label: 'Name', type: 'text', value: p.name, required: true },
@@ -3066,7 +3547,7 @@ router.get('/cron', async (req, res) => {
     ui.card('Edit schedule', ui.formHtml(R(req, '/cron/schedule'),
       (await req.db.query('SELECT * FROM cron_jobs ORDER BY id')).map(j => ({ key: 'interval_' + j.id, label: j.name + ' (minutes)', type: 'number', value: String(j.interval_minutes) })),
       { csrf: req.csrfToken, submit: 'Save schedules' })));
-  res.send(shell(req, '/cron', 'Cron Jobs', body));
+  res.send(shell(req, '/cron', 'Cron Jobs', body, 'Scheduled background jobs and their last runs.'));
 });
 router.post('/cron/schedule', async (req, res) => {
   const jobs = await req.db.query('SELECT * FROM cron_jobs');
@@ -3126,22 +3607,25 @@ router.get('/login-history', async (req, res) => {
       rows.map(r => [esc(r.name || '—'), esc(r.email || '—'), esc(r.ip || '—'), esc(r.browser || '—'), esc(r.os || '—'),
         r.success ? ui.badge('success', 'ok') : ui.badge('failed', 'err'), d(r.created_at)])) +
     ui.paginate(R(req, '/login-history') + (qs ? '?' + qs : ''), page, PER, total);
-  res.send(shell(req, '/login-history', 'Login History', body));
+  res.send(shell(req, '/login-history', 'Login History', body, 'Sign-in attempts — successes and failures.'));
 });
 /* Referrals: who referred whom + commission earned (ViserLab-style referral) */
 router.get('/referrals', async (req, res) => {
   const page = pageOf(req);
   const total = (await req.db.get('SELECT COUNT(*) AS c FROM users WHERE referred_by IS NOT NULL')).c;
   const rows = await req.db.query(
-    `SELECT u.email AS referred_email, u.name AS referred_name, u.created_at, r.email AS referrer_email,
-       (SELECT COALESCE(SUM(amount),0) FROM transactions WHERE user_id = r.id AND type = 'referral_commission') AS earned
+    `SELECT u.email AS referred_email, u.name AS referred_name, u.created_at, r.email AS referrer_email, r.id AS referrer_id
      FROM users u JOIN users r ON r.id = u.referred_by ORDER BY u.created_at DESC LIMIT ? OFFSET ?`,
     [PER, (page - 1) * PER]);
+  /* CURRENCY-SYSTEM-01: referral earnings are summed PER CURRENCY (the old
+     subquery mixed every currency into one base-labelled number). */
+  const refComm = await req.db.query("SELECT user_id, currency, COALESCE(SUM(amount),0) AS s FROM transactions WHERE type = 'referral_commission' GROUP BY user_id, currency");
+  const refMap = {}; for (const r of refComm) (refMap[r.user_id] = refMap[r.user_id] || []).push(r);
   const body = ui.table(['Referred player', 'Referrer', 'Joined', 'Commission earned by referrer'],
-    rows.map(x => [esc(x.referred_email) + ' (' + esc(x.referred_name) + ')', esc(x.referrer_email), d(x.created_at),
-      money(req, x.earned, getS(req.settings, 'base_currency', 'USD'))])) +
+    rows.map(x => { const ec = refMap[x.referrer_id] || []; return [esc(x.referred_email) + ' (' + esc(x.referred_name) + ')', esc(x.referrer_email), d(x.created_at),
+      ec.length ? ec.map(r => money(req, r.s, r.currency)).join(' · ') : money(req, 0, getS(req.settings, 'base_currency', 'USD'))]; })) +
     ui.paginate(R(req, '/referrals'), page, PER, total);
-  res.send(shell(req, '/referrals', 'Referrals', body));
+  res.send(shell(req, '/referrals', 'Referrals', body, 'Referral links, sign-ups and rewards.'));
 });
 /* Clear settings cache (operator tool — settings cache is 5s TTL, this forces a reload) */
 router.post('/settings/clear-cache', async (req, res) => {
@@ -3178,6 +3662,70 @@ const TOGGLES = [
   ['breached_password_check', 'Breached-password check', 'Reject passwords found in public data breaches (HIBP, fails open offline).'],
   ['csp_enabled', 'Content-Security-Policy', 'Send the CSP header (nonce-based; disable only if a custom embed breaks).'],
 ];
+/* ================= ADMIN-CLARITY-01: Limits & Controls hub =======
+   ONE page for every global money limit ("deposit/withdraw limit set
+   karne ka bhi ho, ek sath sab ki"). Every row writes the SAME single
+   settings key the Settings page writes — two doors, one truth, no
+   duplicate storage:
+     deposit_daily_cap / deposit_monthly_cap  -> NEW (engine: money.js createDeposit)
+     withdrawal_daily_cap / withdrawal_monthly_cap / payout_lock_hours /
+     auto_withdrawal_limit / withdrawal_turnover_required -> /settings/risk keys
+   Validations mirror /settings/risk exactly for the shared fields. */
+router.get('/limits', async (req, res) => {
+  const s = req.settings;
+  const sup = isSuperReq(req);
+  const amt = (k) => (parseFloat(getS(s, k, '0')) / 100).toFixed(2);
+  const row = (name, what, inputHtml) => `<tr><td><strong>${name}</strong><div class="muted" style="font-size:12px">${what}</div></td><td style="min-width:170px">${inputHtml}</td></tr>`;
+  const num = (name, val, step) => sup
+    ? `<input class="input" name="${name}" type="number" step="${step || '0.01'}" min="0" value="${esc(val)}" style="min-height:48px">`
+    : `<strong>${esc(val)}</strong>`;
+  const rows = [
+    row('Daily deposit limit (per player, per currency)', 'A player\'s deposits today (waiting + approved) may not pass this total. 0 = no limit.', num('deposit_daily_cap', amt('deposit_daily_cap'))),
+    row('Monthly deposit limit (per player, per currency)', 'Same rule over the whole month. 0 = no limit.', num('deposit_monthly_cap', amt('deposit_monthly_cap'))),
+    row('Daily withdrawal limit (per player, per currency)', 'A player\'s withdrawals today (waiting + approved + paid) may not pass this total. 0 = no limit.', num('withdrawal_daily_cap', amt('withdrawal_daily_cap'))),
+    row('Monthly withdrawal limit (per player, per currency)', 'Same rule over the whole month. 0 = no limit.', num('withdrawal_monthly_cap', amt('withdrawal_monthly_cap'))),
+    row('Auto-withdrawal limit', 'Withdrawals at or under this amount approve themselves after all safety checks; paying still happens by hand. 0 = auto off, everything manual.', num('auto_withdrawal_limit', getS(s, 'auto_withdrawal_limit', '0'))),
+    row('Payout-detail change lock (hours)', 'After a player changes payout details, withdrawals to the new details wait this long (24–72).', num('payout_lock_hours', getS(s, 'payout_lock_hours', '48'), '1')),
+    row('Wagering required before withdrawal', 'Players must wager at least their deposits before withdrawing (1× rule).', sup
+      ? `<label class="fld-check"><input type="checkbox" name="withdrawal_turnover_required" value="1" ${getS(s, 'withdrawal_turnover_required', '0') === '1' ? 'checked' : ''}> Required</label>`
+      : `<strong>${getS(s, 'withdrawal_turnover_required', '0') === '1' ? 'Required' : 'Not required'}</strong>`),
+  ].join('');
+  const overrides = await req.db.get('SELECT COUNT(*) AS c FROM users WHERE auto_withdrawal_limit IS NOT NULL');
+  const body =
+    ui.card('Global limits — apply to every player at once',
+      (sup ? `<form method="post" action="${R(req, '/limits')}"><input type="hidden" name="_csrf" value="${esc(req.csrfToken || '')}">` : '') +
+      `<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Limit</th><th>Value</th></tr></thead><tbody>${rows}</tbody></table></div>` +
+      (sup ? `<div class="mt"><button class="btn btn-p" type="submit" style="min-height:48px">Save limits</button></div></form>` : '<p class="muted mt">Only the super admin can change limits.</p>')) +
+    ui.card('Limits that live elsewhere', `<ul class="clean-list">
+      <li><strong>Per-method min/max</strong> (each payment method\'s own smallest/largest payment) — set on <a href="${R(req, '/methods')}">Payment Methods</a>.</li>
+      <li><strong>Per-player overrides</strong> — ${overrides.c} player(s) currently have their own auto-withdrawal limit; set them on each player\'s page via <a href="${R(req, '/users')}">Users</a>.</li>
+      <li><strong>Player self-limits</strong> — players can set their own daily deposit limit on their Responsible Play page. Those are theirs; there is no editor here.</li>
+    </ul>`);
+  res.send(shell(req, '/limits', 'Limits & Controls', body, 'Every global deposit and withdrawal limit in one place. Changes apply to all players at once.'));
+});
+router.post('/limits', async (req, res) => {
+  if (!isSuperReq(req)) return res.status(403).send(shell(req, '/limits', 'Limits & Controls', '<div class="alert a-err">Only the super admin can change limits.</div>'));
+  const back = (msg) => req.setFlash('error', msg).then(() => res.redirect(R(req, '/limits')));
+  const daily = toMinor(req.body.deposit_daily_cap), monthly = toMinor(req.body.deposit_monthly_cap);
+  const wDaily = toMinor(req.body.withdrawal_daily_cap), wMonthly = toMinor(req.body.withdrawal_monthly_cap);
+  const lockRaw = String(req.body.payout_lock_hours || '').trim();
+  const lock = /^-?\d+$/.test(lockRaw) ? parseInt(lockRaw, 10) : null;
+  const autoRaw = String(req.body.auto_withdrawal_limit || '0').trim();
+  if (daily === null || monthly === null || wDaily === null || wMonthly === null) return back('Limits must be valid amounts (e.g. 500.00). Nothing was saved.');
+  if (!/^\d+(\.\d{1,2})?$/.test(autoRaw)) return back('Auto-withdrawal limit must be an amount like 50 or 50.00 (0 = off). Nothing was saved.');
+  if (lock === null || lock < 24 || lock > 72) return back('Payout-detail change lock must be an integer 24–72 hours. Nothing was saved.');
+  const keys = { deposit_daily_cap: String(daily), deposit_monthly_cap: String(monthly), withdrawal_daily_cap: String(wDaily), withdrawal_monthly_cap: String(wMonthly), payout_lock_hours: String(lock), auto_withdrawal_limit: autoRaw, withdrawal_turnover_required: req.body.withdrawal_turnover_required ? '1' : '0' };
+  const changes = {};
+  for (const [k, v] of Object.entries(keys)) {
+    const old = getS(req.settings, k, '');
+    if (old !== v) changes[k] = { from: old, to: v };
+    await setSetting(req.db, req.driver, k, v);
+  }
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'settings.limits', entity: 'settings', entityId: '', detail: { changes }, ip: req.ip });
+  await req.setFlash('success', 'Limits saved. They apply to every player immediately.');
+  res.redirect(R(req, '/limits'));
+});
+
 router.get('/settings', async (req, res) => {
   const s = req.settings;
   const prizes = await req.db.query('SELECT pops_count, multiplier FROM prize_table ORDER BY pops_count');
@@ -3188,12 +3736,18 @@ router.get('/settings', async (req, res) => {
     : '';
   const body = `
   ${breachedWarn}
+  <nav class="sumstrip" aria-label="Settings sections"><span><strong>Jump to:</strong>
+    <a href="#set-economy">Game economy</a> <span class="muted">(wagers, draws, prizes)</span> ·
+    <a href="#set-risk">Withdrawal &amp; risk controls</a> <span class="muted">(caps, wagering rule, payout lock)</span> ·
+    <a href="#set-kyc">KYC</a> <span class="muted">(identity checks)</span> ·
+    <a href="#set-currencies">Currencies</a> <span class="muted">(enabled currencies and rates)</span> ·
+    <a href="#set-appearance">Appearance &amp; legal</a> <span class="muted">(name, logo, legal pages)</span></span></nav>
   ${ui.card('Operator notes', `<p class="muted">Admin path: the panel URL prefix is set at boot via the <span class="code">ADMIN_PATH</span> env var (or its default) — it is intentionally NOT editable here, so a settings save can never expose or move the hidden panel. Upcoming draw days are set in Game economy below.</p>`)}
   ${ui.card('System configuration', ui.formHtml(R(req, '/settings/toggles'),
     TOGGLES.map(([k, label, help]) => ({ key: k, label, type: 'checkbox', value: getS(s, k, '0') === '1', help })),
     { csrf: req.csrfToken, submit: 'Save toggles' }))}
   ${ui.card('Operator tools', `<form method="POST" action="${R(req, '/settings/clear-cache')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-g" type="submit">Clear settings cache</button></form><p class="muted">Forces settings to reload from the database (cache is otherwise 5 seconds).</p>`)}
-  ${ui.card('Game economy — every amount is set here', ui.formHtml(R(req, '/settings/economy'), [
+  <div id="set-economy">${ui.card('Game economy — every amount is set here', ui.formHtml(R(req, '/settings/economy'), [
       { key: 'wager_options', label: 'Wager options (e.g. 1,2,5,10)', type: 'text', value: getS(s, 'wager_options', '1,2,5,10') },
       { key: 'max_pops', label: 'Max pops per ticket', type: 'number', value: getS(s, 'max_pops', '15') },
       { key: 'max_draws', label: 'Max consecutive draws', type: 'number', value: getS(s, 'max_draws', '7') },
@@ -3212,7 +3766,7 @@ router.get('/settings', async (req, res) => {
      <div class="prize-grid">${prizes.map(p => `<div class="field"><label>${p.pops_count} pop${p.pops_count > 1 ? 's' : ''} → ×</label><input type="number" name="mult_${p.pops_count}" value="${p.multiplier}" min="1"></div>`).join('')}</div>
      <div class="mt"><button class="btn btn-p" type="submit">Save prize table</button>
      <button class="btn" type="submit" formaction="${R(req, '/settings/prizes/preview')}">Simulate first (no save)</button></div></form>`)}
-  ${ui.card('Withdrawal & risk controls', ui.formHtml(R(req, '/settings/risk'), [
+  </div><div id="set-risk">${ui.card('Withdrawal & risk controls', ui.formHtml(R(req, '/settings/risk'), [
       { key: 'withdrawal_turnover_required', label: 'Require 1× wagering before withdrawal', type: 'checkbox', value: getS(s, 'withdrawal_turnover_required', '1') === '1', help: 'Players must wager at least their approved deposits before withdrawing.' },
       { key: 'withdrawal_daily_cap', label: 'Daily withdrawal cap (e.g. 500.00; 0 = unlimited)', type: 'text', value: (parseFloat(getS(s, 'withdrawal_daily_cap', '0')) / 100).toFixed(2) },
       { key: 'withdrawal_monthly_cap', label: 'Monthly withdrawal cap (e.g. 5000.00; 0 = unlimited)', type: 'text', value: (parseFloat(getS(s, 'withdrawal_monthly_cap', '0')) / 100).toFixed(2) },
@@ -3221,11 +3775,11 @@ router.get('/settings', async (req, res) => {
       { key: 'auto_withdrawal_limit', label: 'Auto-withdrawal limit (e.g. 50.00; 0 = OFF — everything manual)', type: 'text', value: getS(s, 'auto_withdrawal_limit', '0'), help: 'Operator pre-authorization: a withdrawal at or under this amount (in the withdrawal\'s own currency) is AUTO-APPROVED by the system once every existing gate passes (wagering, OTP, KYC, payout lock). This deliberately bypasses maker-checker review for small amounts — set it knowingly. Auto-approval NEVER pays out by itself: payout still happens only through the normal mark-paid step with a provider payout ID. Per-user limits on the user page override this value.' },
       { key: 'referral_cap_per_referee', label: 'Referral cap per referee (e.g. 50.00; 0 = unlimited)', type: 'text', value: (parseFloat(getS(s, 'referral_cap_per_referee', '0')) / 100).toFixed(2) },
     ], { csrf: req.csrfToken, submit: 'Save risk controls' }))}
-  ${ui.card('KYC — identity verification', ui.formHtml(R(req, '/settings/kyc'), [
+  </div><div id="set-kyc">${ui.card('KYC — identity verification', ui.formHtml(R(req, '/settings/kyc'), [
       { key: 'kyc_enabled', label: 'Enable KYC requirement for all users (master switch)', type: 'checkbox', value: getS(s, 'kyc_enabled', '0') === '1', help: 'Ships OFF: with the switch off, nobody is gated unless their per-user requirement is set to "required" on their user page. Users set to "exempt" are never gated.' },
       { key: 'kyc_gate', label: 'Gate scope', type: 'select', options: [{ v: 'withdrawals', l: 'Withdrawals only' }, { v: 'deposits_and_withdrawals', l: 'Deposits and withdrawals' }], value: getS(s, 'kyc_gate', 'withdrawals'), help: 'Withdrawals only = KYC approval is required before withdrawals. Deposits and withdrawals = deposits are gated too. Players submit documents on their /kyc page; review them under KYC in the menu.' },
     ], { csrf: req.csrfToken, submit: 'Save KYC settings' }))}
-  ${ui.card('Phone countries — dial codes & blocks', ui.formHtml(R(req, '/settings/phone-countries'), [
+  </div>${ui.card('Phone countries — dial codes & blocks', ui.formHtml(R(req, '/settings/phone-countries'), [
       { key: 'blocked_phone_countries', label: 'Blocked countries (ISO codes, comma-separated)', type: 'text', value: getS(s, 'blocked_phone_countries', ''), help: 'Example: PK,BD — players from these countries will NOT see their dial code in the phone dropdown and cannot register with that country number. Leave empty to allow all countries.' },
     ], { csrf: req.csrfToken, submit: 'Save phone countries' })) + `<p class="muted">The register and OTP phone fields show a country dial-code dropdown with all ${require('../lib/phone-countries').COUNTRIES.length} countries. Blocked countries are hidden from the dropdown and rejected server-side.</p>`}
   ${ui.card('Support ticket limits', `<p class="muted">Caps enforced server-side when a player opens support tickets. Set either limit to <strong>0</strong> for unlimited.</p>` + ui.formHtml(R(req, '/settings/support-limits'), [
@@ -3233,12 +3787,47 @@ router.get('/settings', async (req, res) => {
       { key: 'support_max_new_tickets_24h', label: 'Max new tickets per player per 24 hours', type: 'number', value: getS(s, 'support_max_new_tickets_24h', '3'), help: 'Rolling 24-hour window. 0 = unlimited.' },
     ], { csrf: req.csrfToken, submit: 'Save ticket limits' }))}
   ${ui.card('Homepage hero stats', `<p class="muted">Hero stats always show true database counts (players, tickets today, total paid out). The old 'marketing' mode — invented base numbers that ticked up by random amounts — was removed because it fabricated public statistics.</p>`)}
-  ${ui.card('Currencies', `<p class="muted">JSON list of supported currencies. <span class="code">rate</span> = units per 1 base unit. First currency is the display default. Seeded rates are PLACEHOLDERS (no live FX updater exists) — update them here before enabling a currency. All 13 seeded payment rails are USD-only templates until the operator configures them per currency.</p>` +
-    ui.formHtml(R(req, '/settings/currencies'), [
-      { key: 'currencies', label: 'Currencies JSON', type: 'textarea', value: getS(s, 'currencies', '[]') },
-      { key: 'base_currency', label: 'Base currency code', type: 'text', value: getS(s, 'base_currency', 'USD') },
-    ], { csrf: req.csrfToken, submit: 'Save currencies', grid: false }))}
-  ${ui.card('Appearance & legal', ui.formHtml(R(req, '/settings/appearance'), [
+  <div id="set-currencies">${ui.card('Currencies', await (async () => {
+    /* CURRENCY-SYSTEM-01: the currencies card is a readable TABLE now
+       (one row per currency: code, symbol, "1 BASE = X CODE" rate,
+       enabled, base marker) instead of a raw JSON textarea as the only
+       control. The storage format underneath is UNCHANGED (the same
+       currencies JSON + base_currency keys); the POST handler rebuilds
+       the JSON from these rows. The raw JSON remains under Advanced.
+       A currency is "enabled" by being in the list — unticking removes
+       it on save, exactly like deleting it from the JSON did. Rates
+       are ADMIN-SET placeholders (no live FX updater exists). */
+    const curs = getCurrencies(s);
+    const base = getS(s, 'base_currency', 'USD');
+    const gaps = await currencyCoverageGaps(req);
+    const rowsHtml = curs.map((c, i) => `<tr>
+      <td><strong>${esc(c.code)}</strong><input type="hidden" name="cur_code" value="${esc(c.code)}"><input type="hidden" name="cur_decimals" value="${c.decimals === undefined ? '' : esc(String(c.decimals))}"></td>
+      <td><input class="input" name="cur_symbol" value="${esc(c.symbol || '')}" maxlength="8" style="min-height:48px" aria-label="Symbol for ${esc(c.code)}"></td>
+      <td><input class="input" name="cur_rate" type="number" step="any" min="0" value="${esc(String(c.rate))}" style="min-height:48px" aria-label="Rate for ${esc(c.code)}"></td>
+      <td><label class="fld-check"><input type="checkbox" name="cur_enabled" value="${esc(c.code)}" checked> Enabled</label></td>
+      <td><label class="fld-check"><input type="radio" name="base_currency" value="${esc(c.code)}" ${c.code === base ? 'checked' : ''}> Base</label></td>
+    </tr>`).join('');
+    return coverageHtml(gaps) + `<p class="muted">Rate = how many units of the currency equal 1 unit of the base currency (e.g. 1 USD = 90.50 INR). Rates are set by you — there is no live exchange-rate feed. Seeded payment rails are USD templates until you create methods per currency.</p>
+    <form method="post" action="${R(req, '/settings/currencies')}">
+      <input type="hidden" name="_csrf" value="${esc(req.csrfToken || '')}">
+      <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Code</th><th>Symbol</th><th>Rate (per 1 ${esc(base)})</th><th>Enabled</th><th>Base</th></tr></thead><tbody>${rowsHtml}
+      <tr><td><input class="input" name="cur_code" value="" placeholder="New code (e.g. GBP)" style="min-height:48px" aria-label="New currency code"><input type="hidden" name="cur_decimals" value=""></td>
+      <td><input class="input" name="cur_symbol" value="" placeholder="£" maxlength="8" style="min-height:48px" aria-label="New currency symbol"></td>
+      <td><input class="input" name="cur_rate" type="number" step="any" min="0" value="" placeholder="Rate" style="min-height:48px" aria-label="New currency rate"></td>
+      <td><label class="fld-check"><input type="checkbox" name="cur_enabled" value="__new__"> Enabled</label></td><td class="muted">new</td></tr>
+      </tbody></table></div>
+      <div class="field mt"><label for="exfee">Wallet exchange fee (%)</label><input class="input" id="exfee" name="exchange_fee_percent" type="number" step="any" min="0" max="100" value="${esc(getS(s, 'exchange_fee_percent', '0'))}"><small class="muted">Taken from the converted amount when a player exchanges between their own wallets. 0 = no fee.</small></div>
+      <div class="mt"><button class="btn btn-p" type="submit" style="min-height:48px">Save currencies</button></div>
+    </form>
+    <details class="mt"><summary>Advanced (JSON)</summary>
+      <p class="muted">The same data as raw JSON — saving here replaces the table above. Storage format unchanged.</p>
+      ${ui.formHtml(R(req, '/settings/currencies'), [
+        { key: 'currencies', label: 'Currencies JSON', type: 'textarea', value: getS(s, 'currencies', '[]') },
+        { key: 'base_currency', label: 'Base currency code', type: 'text', value: getS(s, 'base_currency', 'USD') },
+      ], { csrf: req.csrfToken, submit: 'Save currencies (JSON)', grid: false })}
+    </details>`;
+  })())}
+  </div><div id="set-appearance">${ui.card('Appearance & legal', ui.formHtml(R(req, '/settings/appearance'), [
       { key: 'site_name', label: 'Site name', type: 'text', value: getS(s, 'site_name', '') },
       { key: 'cookie_text', label: 'Cookie banner text', type: 'textarea', value: getS(s, 'cookie_text', '') },
       { key: 'custom_css', label: 'Custom CSS', type: 'textarea', value: getS(s, 'custom_css', '') },
@@ -3248,8 +3837,8 @@ router.get('/settings', async (req, res) => {
       { key: 'site_timezone', label: 'Site timezone (IANA)', type: 'text', value: getS(s, 'site_timezone', 'UTC'), help: 'Draw dates and daily limits follow this timezone, e.g. America/Chicago. Must be a valid IANA name.' },
       { key: 'support_notify_email', label: 'Support notification email', type: 'text', value: getS(s, 'support_notify_email', ''), help: 'When set (and email is configured), every new player support ticket is emailed here.' },
       { key: 'sms_provider', label: 'SMS provider', type: 'select', options: ['', 'twilio', 'textbelt'], value: getS(s, 'sms_provider', ''), help: 'Used for phone OTP codes. Twilio needs TWILIO_* env vars; TextBelt needs TEXTBELT_KEY. The SMS_PROVIDER env var, when set, overrides this.' },
-    ], { csrf: req.csrfToken, submit: 'Save appearance', grid: false }))}`;
-  res.send(shell(req, '/settings', 'Settings', body));
+    ], { csrf: req.csrfToken, submit: 'Save appearance', grid: false }))}</div>`;
+  res.send(shell(req, '/settings', 'Settings', body, 'All site settings, grouped — use the Jump to index at the top.'));
 });
 router.post('/settings/toggles', async (req, res) => {
   // Guard: enabling admin TOTP enforcement before the current admin has
@@ -3481,7 +4070,34 @@ router.post('/settings/currencies', async (req, res) => {
   // allowed duplicate codes and a base currency outside the list, and
   // audited nothing. All four are now enforced; a bad list saves nothing.
   try {
-    const list = JSON.parse(req.body.currencies || '[]');
+    /* CURRENCY-SYSTEM-01: the card's TABLE form posts rows, not JSON.
+       Build the same list shape from the rows and let the ONE existing
+       validation below judge both paths. '__new__' in cur_enabled
+       marks the add-a-currency row (its code is its own input). */
+    let list;
+    if (req.body.currencies !== undefined && req.body.currencies !== '') {
+      list = JSON.parse(req.body.currencies || '[]');
+    } else {
+      const arr = (v) => Array.isArray(v) ? v : (v === undefined ? [] : [v]);
+      const codes = arr(req.body.cur_code), symbols = arr(req.body.cur_symbol), rates = arr(req.body.cur_rate), decs = arr(req.body.cur_decimals);
+      const enabled = new Set(arr(req.body.cur_enabled));
+      list = [];
+      for (let i = 0; i < codes.length; i++) {
+        const code = String(codes[i] || '').toUpperCase().trim();
+        if (!code) continue;
+        const isNewRow = i === codes.length - 1 && !getCurrencies(req.settings).some(c => c.code === code);
+        const on = isNewRow ? (enabled.has('__new__') || enabled.has(code)) : enabled.has(code);
+        if (!on) continue;
+        const entry = { code, symbol: String(symbols[i] || ''), rate: Number(rates[i]) };
+        if (String(decs[i] || '') !== '') entry.decimals = Number(decs[i]);
+        list.push(entry);
+      }
+      if (req.body.exchange_fee_percent !== undefined) {
+        const fee = parseFloat(req.body.exchange_fee_percent);
+        if (!Number.isFinite(fee) || fee < 0 || fee > 100) throw new Error('Exchange fee must be between 0 and 100.');
+        await setSetting(req.db, req.driver, 'exchange_fee_percent', String(fee));
+      }
+    }
     if (!Array.isArray(list) || !list.length) throw new Error('Currency list must be a non-empty JSON array.');
     const seen = new Set(), cleaned = [];
     for (const c of list) {
@@ -3537,7 +4153,7 @@ router.get('/approvals', async (req, res) => {
   const body = ui.card('Awaiting second approval', `<p class="muted">Money actions at or above the maker-checker threshold wait here. A DIFFERENT admin must approve — the requester cannot approve their own action. Rejecting leaves the original deposit/withdrawal untouched (still pending).</p>` +
     ui.table(['ID', 'Action', 'Target', 'Amount', 'Requested by', 'Requested', 'Status', ''], open.map(a => row(a, true)))) +
     ui.card('Decided', ui.table(['ID', 'Action', 'Target', 'Amount', 'Requested by', 'Requested', 'Status', ''], decided.map(a => row(a, false))));
-  res.send(shell(req, '/approvals', 'Approvals', body));
+  res.send(shell(req, '/approvals', 'Approvals', body, 'Money actions waiting for a second approver.'));
 });
 router.post('/approvals/:id/approve', async (req, res) => {
   const a = await req.db.get('SELECT * FROM pending_approvals WHERE id = ?', [req.params.id]);
@@ -3639,7 +4255,7 @@ router.get('/reconciliation', async (req, res) => {
   if (latest) {
     let det = {};
     try { det = JSON.parse(latest.details || '{}'); } catch {}
-    detailHtml = ui.card('Latest report — ' + d(latest.checked_at), `<p>Wallets checked: ${latest.wallets_checked} · Mismatches: <strong>${latest.mismatch_count}</strong> · Provider txns without webhook events: ${(det.unconfirmed_provider_txns || []).length} · Stale proof deposits: ${(det.stale_proof_deposits || []).length}</p>` +
+    detailHtml = ui.card('Latest report — ' + dPlain(latest.checked_at), `<p>Wallets checked: ${latest.wallets_checked} · Mismatches: <strong>${latest.mismatch_count}</strong> · Provider txns without webhook events: ${(det.unconfirmed_provider_txns || []).length} · Stale proof deposits: ${(det.stale_proof_deposits || []).length}</p>` +
       (det.mismatches && det.mismatches.length ? ui.table(['User', 'Currency', 'Wallet', 'Ledger', 'Diff'], det.mismatches.map(m => ['#' + m.user_id, esc(m.currency), money(req, m.wallet || 0, m.currency), money(req, m.ledger, m.currency), money(req, m.diff, m.currency)])) : '<p class="muted">No wallet/ledger mismatches.</p>') +
       ((det.unconfirmed_provider_txns || []).length ? ui.table(['Deposit', 'Provider txn ID'], det.unconfirmed_provider_txns.map(x => [`<span class="code">${esc(x.public_id)}</span>`, `<span class="code">${esc(x.provider_txn_id)}</span>`])) : '') +
       ((det.stale_proof_deposits || []).length ? ui.table(['Stale proof deposit'], det.stale_proof_deposits.map(x => [`<span class="code">${esc(x.public_id)}</span>`])) : ''));
@@ -3648,7 +4264,7 @@ router.get('/reconciliation', async (req, res) => {
     ui.formHtml(R(req, '/reconciliation/run'), [], { csrf: req.csrfToken, submit: 'Run now' })) +
     detailHtml +
     ui.card('History', ui.table(['When', 'Wallets', 'Mismatches'], reports.map(r => [d(r.checked_at), r.wallets_checked, r.mismatch_count])));
-  res.send(shell(req, '/reconciliation', 'Reconciliation', body));
+  res.send(shell(req, '/reconciliation', 'Reconciliation', body, 'Proof that wallets and the ledger agree.'));
 });
 router.post('/reconciliation/run', async (req, res) => {
   try {
@@ -3667,7 +4283,7 @@ router.get('/flags', async (req, res) => {
     showReview ? `<form method="POST" action="${R(req, '/flags/' + f.id + '/review')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-sm">Mark reviewed</button></form>` : '']));
   const body = ui.card('Open flags — review only, never auto-ban', `<p class="muted">Shared device/IP across accounts is a signal, not proof: households, agents and VPNs share IPs legitimately. Review and decide; the system never bans on a flag alone.</p>` + table(open, true)) +
     ui.card('Reviewed', table(done, false));
-  res.send(shell(req, '/flags', 'Fraud Flags', body));
+  res.send(shell(req, '/flags', 'Fraud Flags', body, 'Automatic risk flags that need a human look.'));
 });
 router.post('/flags/:id/review', async (req, res) => {
   const r = await req.db.run('UPDATE account_flags SET reviewed_by = ?, reviewed_at = ? WHERE id = ? AND reviewed_at IS NULL', [req.user.id, now(), req.params.id]);
@@ -3678,6 +4294,117 @@ router.post('/flags/:id/review', async (req, res) => {
 });
 
 /* ============================================================ STAFF & ROLES (v14) */
+/* ================= ADMIN-SELF-01: My Account (self-service) ======
+   The panel's own account page. Every handler operates ONLY on
+   req.user.id — no id is read from the client, ever — so this page
+   can never become a path into another admin's account (the generic
+   user handlers keep refusing admin targets exactly as before). */
+router.get('/my-account', async (req, res) => {
+  const me = await req.db.get('SELECT id, name, email, role, admin_role, force_password_reset FROM users WHERE id = ?', [req.user.id]);
+  res.send(shell(req, '/my-account', 'My Account',
+    ui.card('Display name', `
+      <form method="POST" action="${R(req, '/my-account/name')}" class="adm-form">
+        <input type="hidden" name="_csrf" value="${req.csrfToken}">
+        <div class="field"><label for="myname">Display name</label><input type="text" id="myname" name="name" required maxlength="80" value="${esc(me.name || '')}"></div>
+        <div class="mt"><button class="btn btn-p" type="submit">Save name</button></div>
+      </form>`) +
+    ui.card('Login email', `
+      <p class="muted">This is the email you sign in with. Changing it needs your current password. If email delivery is set up, the new address must click a verification link before the change applies; if it is not set up, the change applies straight away.</p>
+      <form method="POST" action="${R(req, '/my-account/email')}" class="adm-form">
+        <input type="hidden" name="_csrf" value="${req.csrfToken}">
+        <div class="field"><label for="myemail">New login email</label><input type="email" id="myemail" name="new_email" required value="${esc(me.email || '')}"></div>
+        <div class="field"><label for="myemailpw">Current password</label><input type="password" id="myemailpw" name="current_password" required autocomplete="current-password"></div>
+        <div class="mt"><button class="btn btn-p" type="submit">Change login email</button></div>
+      </form>`) +
+    ui.card('Password', `
+      ${me.force_password_reset ? '<p class="muted"><strong>Note:</strong> your account is currently flagged "must change password at next sign-in". Changing it here clears that flag.</p>' : ''}
+      <form method="POST" action="${R(req, '/my-account/password')}" class="adm-form">
+        <input type="hidden" name="_csrf" value="${req.csrfToken}">
+        <div class="field"><label for="mypw0">Current password</label><input type="password" id="mypw0" name="current_password" required autocomplete="current-password"></div>
+        <div class="field"><label for="mypw1">New password</label><input type="password" id="mypw1" name="new_password" required autocomplete="new-password"></div>
+        <div class="field"><label for="mypw2">Confirm new password</label><input type="password" id="mypw2" name="new_password_confirm" required autocomplete="new-password"></div>
+        <div class="mt"><button class="btn btn-p" type="submit">Change password</button></div>
+      </form>
+      <p class="muted">Changing your password signs out your OTHER sessions; this one stays signed in.</p>`) +
+    ui.card('Hosting note', `<p class="muted">On the current free hosting plan, if the database is ever wiped, this admin account is re-created from the hosting seed values — name, login email and password changed here would revert unless the seed values are updated to match, or the paid disk plan is in place.</p>`), 'Your own staff account — name, sign-in email and password.'));
+});
+
+router.post('/my-account/name', async (req, res) => {
+  const back = R(req, '/my-account');
+  const name = String(req.body.name || '').trim().slice(0, 80);
+  if (!name) { await req.setFlash('error', 'Name cannot be empty.'); return res.redirect(back); }
+  const old = await req.db.get('SELECT name FROM users WHERE id = ?', [req.user.id]);
+  await req.db.run('UPDATE users SET name = ? WHERE id = ?', [name, req.user.id]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'admin.self_name', entity: 'user', entityId: req.user.id, detail: { from: old ? old.name : '', to: name }, ip: req.ip });
+  await req.setFlash('success', 'Display name saved.');
+  res.redirect(back);
+});
+
+router.post('/my-account/email', async (req, res) => {
+  const back = R(req, '/my-account');
+  const me = await req.db.get('SELECT * FROM users WHERE id = ?', [req.user.id]);
+  const fail = async (msg, reason) => {
+    await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'admin.self_email', entity: 'user', entityId: req.user.id, detail: { ok: false, reason }, ip: req.ip });
+    await req.setFlash('error', msg);
+    return res.redirect(back);
+  };
+  if (!me.password_hash || !verifyPassword(String(req.body.current_password || ''), me.password_hash))
+    return fail('Login email NOT changed: your current password is incorrect.', 'current_password');
+  const email = normalizeEmail(req.body.new_email);
+  if (!validEmail(email)) return fail('Login email NOT changed: that is not a valid email address.', 'invalid_email');
+  if (email === String(me.email || '').toLowerCase()) return fail('That is already your login email.', 'same_email');
+  const dup = await req.db.get('SELECT id FROM users WHERE email = ? AND id != ?', [email, req.user.id]);
+  if (dup) return fail('Login email NOT changed: that email is already used by another account.', 'duplicate_email');
+  /* Reuse the standard email_verifications machinery: the swap only
+     happens when the NEW address clicks its link (routes/auth
+     /verify-email/:token, with its own duplicate re-check). If email
+     delivery is not configured the send reports non-'sent' — then the
+     pending row is burned and the change applies immediately, and the
+     page says so plainly. */
+  await req.db.run('UPDATE email_verifications SET used = 1 WHERE user_id = ? AND used = 0', [req.user.id]);
+  const token = randHex(24);
+  await req.db.run('INSERT INTO email_verifications (user_id, new_email, token_hash, expires_at, used, created_at) VALUES (?, ?, ?, ?, 0, ?)',
+    [req.user.id, email, sha256('verify:' + token), now() + 24 * 3600 * 1000, now()]);
+  const link = (process.env.BASE_URL || (req.protocol + '://' + req.get('host'))) + '/verify-email/' + token;
+  const sent = await notify.send(req.db, req.settings, 'email', 'email_verification', email, { name: me.name, link }).catch(() => ({ status: 'failed' }));
+  if (sent.status === 'sent') {
+    await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'admin.self_email', entity: 'user', entityId: req.user.id, detail: { ok: true, pending_verification: true, to: email }, ip: req.ip });
+    await req.setFlash('success', 'Verification link sent to ' + email + '. Your login email changes when that link is clicked.');
+    return res.redirect(back);
+  }
+  await req.db.run('UPDATE email_verifications SET used = 1 WHERE user_id = ? AND used = 0', [req.user.id]);
+  await req.db.run('UPDATE users SET email = ?, email_verified = 1 WHERE id = ?', [email, req.user.id]);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'admin.self_email', entity: 'user', entityId: req.user.id, detail: { ok: true, applied: 'immediate_email_not_configured', to: email }, ip: req.ip });
+  await req.setFlash('success', 'Login email changed to ' + email + '. (Email delivery is not configured, so no verification link was sent and the change applied straight away.)');
+  res.redirect(back);
+});
+
+router.post('/my-account/password', async (req, res) => {
+  const back = R(req, '/my-account');
+  const me = await req.db.get('SELECT * FROM users WHERE id = ?', [req.user.id]);
+  const fail = async (msg, reason) => {
+    await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'admin.self_password', entity: 'user', entityId: req.user.id, detail: { ok: false, reason }, ip: req.ip });
+    await req.setFlash('error', msg);
+    return res.redirect(back);
+  };
+  if (!me.password_hash || !verifyPassword(String(req.body.current_password || ''), me.password_hash))
+    return fail('Password NOT changed: your current password is incorrect.', 'current_password');
+  const { passwordError } = require('../lib/validate');
+  const { isBreached } = require('../lib/breached');
+  const pw = String(req.body.new_password || '');
+  const pw2 = String(req.body.new_password_confirm || '');
+  let err = passwordError(pw, me.role, getBool(req.settings, 'secure_password', true));
+  if (!err && pw !== pw2) err = 'Passwords do not match.';
+  if (!err && getBool(req.settings, 'breached_password_check', true) && await isBreached(pw)) err = 'This password has appeared in a data breach. Please choose a different one.';
+  if (err) return fail('Password NOT changed: ' + err, 'validation');
+  await req.db.run('UPDATE users SET password_hash = ?, force_password_reset = 0 WHERE id = ?', [hashPassword(pw), req.user.id]);
+  // Mirror the forced-reset pattern: kill every OTHER session, keep this one.
+  await destroyUserSessions(req.db, req.user.id, req.sess ? req.sess.id : null);
+  await audit.log(req.db, { actorId: req.user.id, actorRole: 'admin', action: 'admin.self_password', entity: 'user', entityId: req.user.id, detail: { ok: true }, ip: req.ip });
+  await req.setFlash('success', 'Password changed. Your other sessions were signed out.');
+  res.redirect(back);
+});
+
 router.get('/staff', async (req, res) => {
   const staff = await req.db.query("SELECT * FROM users WHERE role = 'admin' ORDER BY created_at");
   const isSuper = (req.user.admin_role || 'super') === 'super';
@@ -3693,7 +4420,7 @@ router.get('/staff', async (req, res) => {
       s.id === req.user.id ? '<span class="muted">you</span>'
       : isSuper ? `<form method="POST" action="${R(req, '/staff/' + s.id + '/role')}" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><select name="admin_role">${['super', 'finance', 'support', 'risk'].map(r => `<option value="${r}"${(s.admin_role || 'super') === r ? ' selected' : ''}>${r}</option>`).join('')}</select><button class="btn btn-sm">Change role</button></form>`
       : '<span class="muted">—</span>'])));
-  res.send(shell(req, '/staff', 'Staff', body));
+  res.send(shell(req, '/staff', 'Staff', body, 'Staff accounts and what each role may do.'));
 });
 router.post('/staff', async (req, res) => {
   /* U-20.4: raw body destructuring 500'd on object-typed fields
@@ -3729,16 +4456,60 @@ router.post('/staff/:id/role', async (req, res) => {
 });
 
 /* ============================================================ ADMIN SECURITY — TOTP enrollment (v14) */
+/* AUTH-CHANNELS-01: one truthful row per sign-in / verification channel.
+   CONFIGURED comes from ENV PRESENCE ONLY (booleans — never values);
+   the last delivery result comes from the notifications outbox. */
+async function channelHealth(req) {
+  const smsProvider = process.env.SMS_PROVIDER || getS(req.settings, 'sms_provider', '');
+  const smsNamed = smsProvider === 'textbelt' ? 'TextBelt' : (smsProvider === 'twilio' || process.env.TWILIO_SID ? 'Twilio' : '');
+  const smsConfigured = smsProvider === 'textbelt' ? !!process.env.TEXTBELT_KEY : !!(process.env.TWILIO_SID && process.env.TWILIO_TOKEN && process.env.TWILIO_FROM);
+  const lastEmail = await req.db.get("SELECT status, error, created_at FROM notifications_log WHERE channel = 'email' ORDER BY id DESC LIMIT 1").catch(() => null);
+  const lastSms = await req.db.get("SELECT status, error, created_at FROM notifications_log WHERE channel = 'sms' ORDER BY id DESC LIMIT 1").catch(() => null);
+  const totpCount = await req.db.get("SELECT COUNT(*) AS c FROM users WHERE role IN ('admin','staff') AND totp_secret IS NOT NULL AND totp_secret != ''").catch(() => ({ c: 0 }));
+  const lastStr = r => r ? `${esc(r.status)} · ${d(r.created_at)}${r.error ? ' · ' + esc(String(r.error).slice(0, 80)) : ''}` : '<span class="muted">no deliveries yet</span>';
+  const conf = ok => ok ? ui.badge('CONFIGURED', 'ok') : ui.badge('NOT CONFIGURED', 'bad');
+  const rows = [
+    ['Email (SMTP)', conf(!!process.env.SMTP_HOST), `Login/register OTP: ${getBool(req.settings, 'email_otp_enabled', false) ? 'ON' : 'OFF'} · Withdrawal OTP uses this or SMS`, lastStr(lastEmail)],
+    ['SMS' + (smsNamed ? ' (' + smsNamed + ')' : ''), conf(smsConfigured), `Phone OTP login: ${getBool(req.settings, 'phone_otp_enabled', false) ? 'ON' : 'OFF'} · set the provider under Notifications`, lastStr(lastSms)],
+    ['Google sign-in', conf(!!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET)), `Toggle: ${getBool(req.settings, 'google_oauth_enabled', false) ? 'ON' : 'OFF'} (Settings → Toggles)`, '<span class="muted">sign-ins are not deliveries — see Login History</span>'],
+    ['Facebook sign-in', conf(!!(process.env.FACEBOOK_APP_ID && process.env.FACEBOOK_APP_SECRET)), `Toggle: ${getBool(req.settings, 'facebook_oauth_enabled', false) ? 'ON' : 'OFF'} (Settings → Toggles)`, '<span class="muted">sign-ins are not deliveries — see Login History</span>'],
+    ['Authenticator (TOTP) 2FA', conf(Number(totpCount.c) > 0), `${Number(totpCount.c)} staff account(s) enrolled · owner-verified live 2026-10-29`, '<span class="muted">verified at sign-in, nothing is sent</span>'],
+  ];
+  return `<div class="tbl-wrap"><table class="tbl"><tr><th>Channel</th><th>State</th><th>Notes</th><th>Last delivery</th></tr>${rows.map(r => `<tr><td><strong>${r[0]}</strong></td><td>${r[1]}</td><td>${r[2]}</td><td>${r[3]}</td></tr>`).join('')}</table></div>
+  <p class="muted">NOT CONFIGURED is not a bug: until the owner adds the provider details (see the setup checklist), that channel honestly refuses on the player side instead of pretending a code was sent.</p>
+  <form method="POST" action="${R(req, '/security/test-email')}" style="display:inline-block;margin-right:8px"><input type="hidden" name="_csrf" value="${req.csrfToken}"><div class="field" style="display:inline-block"><label for="test_email_to">Send test email to</label><input id="test_email_to" type="email" name="to" required placeholder="you@example.com"></div> <button class="btn btn-p" type="submit">Send test email</button></form>
+  <form method="POST" action="${R(req, '/security/test-sms')}" style="display:inline-block"><input type="hidden" name="_csrf" value="${req.csrfToken}"><div class="field" style="display:inline-block"><label for="test_sms_to">Send test SMS to</label><input id="test_sms_to" type="text" name="to" required placeholder="+1..."></div> <button class="btn btn-p" type="submit">Send test SMS</button></form>`;
+}
+const testSendLimiter = rateLimit({ windowMs: 3600000, max: 5, keyFn: req => 'test-send:' + req.user.id });
+router.post('/security/test-email', testSendLimiter, async (req, res) => {
+  const to = String(req.body.to || '').trim();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(to)) { await req.setFlash('error', 'Enter a valid email address for the test.'); return res.redirect(R(req, '/security')); }
+  const r = await notify.sendRaw(req.db, req.settings, 'email', to, 'Cash Pop test email', 'This is a test email from your Cash Pop admin panel. If you received it, email delivery works.');
+  await audit.log(req.db, { actorId: req.user.id, actorRole: req.user.role, action: 'security.test_send', entity: 'notification', entityId: '', detail: { channel: 'email', status: r.status }, ip: req.ip });
+  if (r.status === 'sent') await req.setFlash('success', 'Test email sent to ' + to + '.');
+  else await req.setFlash('error', 'Test email FAILED (' + r.status + ')' + (r.error ? ': ' + r.error : '') + ' — the channel is not delivering yet.');
+  res.redirect(R(req, '/security'));
+});
+router.post('/security/test-sms', testSendLimiter, async (req, res) => {
+  const to = String(req.body.to || '').trim();
+  if (!to || to.length < 7) { await req.setFlash('error', 'Enter a valid phone number for the test.'); return res.redirect(R(req, '/security')); }
+  const r = await notify.sendRaw(req.db, req.settings, 'sms', to, '', 'Cash Pop test SMS: if you received this, SMS delivery works.');
+  await audit.log(req.db, { actorId: req.user.id, actorRole: req.user.role, action: 'security.test_send', entity: 'notification', entityId: '', detail: { channel: 'sms', status: r.status }, ip: req.ip });
+  if (r.status === 'sent') await req.setFlash('success', 'Test SMS sent to ' + to + '.');
+  else await req.setFlash('error', 'Test SMS FAILED (' + r.status + ')' + (r.error ? ': ' + r.error : '') + ' — the channel is not delivering yet.');
+  res.redirect(R(req, '/security'));
+});
 router.get('/security', async (req, res) => {
   const u = await req.db.get('SELECT totp_secret FROM users WHERE id = ?', [req.user.id]);
   const enforced = getBool(req.settings, 'admin_totp_required', false);
-  res.send(shell(req, '/security', 'Security', ui.card('Authenticator (TOTP)', `
+  const health = await channelHealth(req);
+  res.send(shell(req, '/security', 'Security', ui.card('Login & verification health', health) + ui.card('Authenticator (TOTP)', `
     <p class="muted">Your authenticator protects the admin panel. ${enforced ? 'TOTP is REQUIRED for admins on this site.' : 'TOTP is not required for admins yet. Enroll first, then turn on "Admin TOTP required" in Settings → Toggles.'}</p>
     <p>Status: ${u.totp_secret ? ui.badge('enabled', 'ok') : ui.badge('not enrolled', 'warn')}</p>
     ${u.totp_secret
       ? `<form method="POST" action="${R(req, '/security/totp/disable')}"><input type="hidden" name="_csrf" value="${req.csrfToken}"><div class="field"><label>Password (to confirm)</label><input type="password" name="password" required></div><div class="field"><label>Current authenticator code (or a backup code)</label><input type="text" name="totp_code" required autocomplete="off"></div><button class="btn btn-d" type="submit">Disable authenticator</button></form>`
       : `<form method="POST" action="${R(req, '/security/totp/start')}"><input type="hidden" name="_csrf" value="${req.csrfToken}"><div class="field"><label>Password (to confirm)</label><input type="password" name="password" required></div><button class="btn btn-p" type="submit">Enroll authenticator</button></form>`}
-  `)));
+  `), 'Sign-in security — authenticator, sessions and login channel health.'));
 });
 router.post('/security/totp/start', rateLimit({ windowMs: 15 * 60000, max: 10, keyFn: req => `admin-totp:${req.user.id}` }), async (req, res) => {
   /* D2-C3 (v20): enrolment requires the current password, mirroring
@@ -3823,9 +4594,9 @@ router.get('/audit', async (req, res) => {
     : `<div class="alert a-err">Audit chain BROKEN at row #${chain.firstBadId} (${esc(chain.reason)}). Investigate immediately.</div>`;
   const body = chainBanner + ui.filtersHtml(R(req, '/audit'), [{ key: 'q', label: 'Search action/entity' }], req.query) +
     ui.table(['When', 'Actor', 'Action', 'Entity', 'IP', 'Detail'], rows.map(a =>
-      [d(a.created_at), `${esc(a.actor_role || '?')} #${a.actor_id || '—'}`, esc(a.action), esc(a.entity) + ' ' + esc(a.entity_id), esc(a.ip), `<span class="code">${esc(String(a.detail).slice(0, 120))}</span>`])) +
+      [d(a.created_at), `${esc(a.actor_role || '?')} #${a.actor_id || '—'}`, esc(a.action), auditEntityHtml(a), esc(a.ip), auditDetailHtml(req, a.detail)])) +
     ui.paginate(`${R(req, '/audit')}?q=${encodeURIComponent(q)}${actor ? '&actor=' + actor : ''}`, page, PER, total);
-  res.send(shell(req, '/audit', 'Audit Trail', body));
+  res.send(shell(req, '/audit', 'Audit Trail', body, 'Every important action, recorded and tamper-evident.'));
 });
 
 module.exports = router;

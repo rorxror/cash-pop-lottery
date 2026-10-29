@@ -49,7 +49,7 @@ gtag('config', '<%= extCfg('google_analytics').tracking_id %>');
           <span class="cur-caret">&#9662;</span>
         </summary>
         <div class="cur-menu" role="menu">
-          <div class="cur-menu-title">Display currency</div>
+          <div class="cur-menu-title">My currency</div>
           <% (typeof currencies !== 'undefined' ? currencies : []).forEach(function(c){ %>
           <form action="/currency" method="POST" role="none">
             <input type="hidden" name="_csrf" value="<%= csrf %>">

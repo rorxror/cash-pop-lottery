@@ -136,7 +136,20 @@ router.post('/players/new', async (req, res) => {
 
 router.get('/transfer', async (req, res) => {
   const aid = agentId(req);
-  const floats = await req.db.query('SELECT currency, balance FROM agent_floats WHERE agent_id = ?', [aid]);
+  const floatRows = await req.db.query('SELECT currency, balance FROM agent_floats WHERE agent_id = ?', [aid]);
+  /* AGENT-CURRENCY-01 (owner-reported): the currency dropdown used to
+     render ONLY from agent_floats rows — an agent whose float was
+     never funded had zero rows, so the select rendered EMPTY (owner:
+     "currency ka option hai lekin show nahi hoti") and the form was
+     silently unusable. The dropdown now always lists the site's
+     enabled currencies, each annotated with this agent's float
+     balance in it (0 where unfunded); a fully-empty float also gets
+     a plain-language empty-state on the page. The POST guard below
+     still refuses an underfunded transfer with the true reason. */
+  const byCur = Object.fromEntries(floatRows.map(f => [f.currency, Number(f.balance) || 0]));
+  const floats = getCurrencies(req.settings).map(c => ({ currency: c.code, balance: byCur[c.code] || 0 }));
+  for (const f of floatRows) if (!floats.some(x => x.currency === f.currency)) floats.push({ currency: f.currency, balance: Number(f.balance) || 0 });
+  const floatTotal = floats.reduce((a, f) => a + (f.balance > 0 ? f.balance : 0), 0);
   const players = await req.db.query("SELECT id, name FROM users WHERE agent_id = ? AND role = 'player' AND status = 'active' ORDER BY name", [aid]);
   /* D1-C7 (v20): every rendered transfer form carries a fresh one-time
      submission token, stored server-side in the session; the POST
@@ -144,7 +157,7 @@ router.get('/transfer', async (req, res) => {
      migration v21) inside the transfer transaction. */
   const transferToken = randHex(16);
   if (req.sess) await touchSession(req.db, req.sess.id, { transfer_token: transferToken });
-  res.render('agent/transfer', { metaTitle: 'Fund Player', metaDesc: '', floats, players, transferToken });
+  res.render('agent/transfer', { metaTitle: 'Fund Player', metaDesc: '', floats, players, transferToken, floatEmpty: floatTotal <= 0 });
 });
 
 router.post('/transfer', async (req, res) => {

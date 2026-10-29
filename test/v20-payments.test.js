@@ -98,7 +98,7 @@ test('U-21 validation: true reasons for the classic garbage saves', () => {
   assert.match(rails.validateRailCredentials('bank_transfer', { ...bankBase, routing_number: '12345' }).error, /9 digits/);
   assert.equal(rails.validateRailCredentials('bank_transfer', { ...bankBase, routing_number: '021000021' }).ok, true);
   // qr: https only; apple merchant id shape; pix key shapes
-  assert.match(rails.validateRailCredentials('qr_pay', { provider: 'PromptPay', qr_image_url: 'http://x.test/q.png' }).error, /https/);
+  assert.match(rails.validateRailCredentials('qr_pay', { provider: 'PromptPay', payee_id: '0812345678', qr_image_url: 'http://x.test/q.png' }).error, /https/);
   assert.match(rails.validateRailCredentials('apple_pay', { merchant_id: 'com.example', processor: 'Stripe' }).error, /merchant\./);
   assert.equal(rails.validateRailCredentials('pix', { pix_key: '12345678901' }).ok, true, 'CPF pix key');
   assert.match(rails.validateRailCredentials('pix', { pix_key: '!!' }).error, /Pix key/);
@@ -295,6 +295,17 @@ test('E2E-2 cards/Stripe sandbox: config save -> encrypted at rest -> good Strip
   assert.equal(Number(raw.field_enc), 1, 'webhook secret encrypted at rest');
   assert.ok(!String(raw.field_value).includes(CARDS_WHSEC), 'webhook secret plaintext must not appear at rest');
   await toggleMethod(cardsId);
+  /* METHOD-MODE-01 (manual-payments round): a signed webhook only
+     auto-credits a method the operator set to Auto Pay. This E2E is
+     about the AUTO path, so flip cards to Auto first (webhook_secret
+     is saved above, so the save must be accepted). */
+  {
+    const g = await adminJar.text(`${ADMIN_PATH}/methods/${cardsId}/credentials`);
+    const post = await adminJar.text(`${ADMIN_PATH}/methods/${cardsId}/mode`, { method: 'POST', body: { _csrf: csrfOf(g.body), processing_mode: 'auto' } });
+    assert.equal(post.status, 302, 'mode save redirects');
+    const mrow = await dbB.get('SELECT processing_mode FROM payment_methods WHERE id = ?', [cardsId]);
+    assert.equal(mrow.processing_mode, 'auto', 'cards method is Auto Pay for the webhook assertions below');
+  }
 
   // player creates a $25 cards deposit (manual request; provider ref recorded as a PSP would)
   let g = await playerJar.text('/deposit/new?m=' + cardsId);

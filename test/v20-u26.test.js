@@ -100,8 +100,8 @@ function navHrefs(html) {
 }
 
 /* ---- frozen route inventory (pre-U-26 code state) ---- */
-const ADMIN_GET = ['/', '/draws', '/draws/:id', '/tickets', '/tickets/:id', '/automation', '/bonuses', '/users', '/users/:id', '/otp', '/agents', '/agents/:id', '/deposits', '/deposits/:id', '/withdrawals', '/withdrawals/:id', '/methods', '/methods/new', '/methods/:id', '/methods/:id/credentials', '/reports', '/data', '/data/export/:dataset', '/support', '/kyc', '/kyc/document/:id', '/kyc/:id', '/support/canned-replies', '/support/:publicId', '/extensions', '/extensions/:key', '/notifications', '/notifications/log/:id', '/contact-messages', '/notifications/:id', '/pages', '/pages/new', '/pages/:id', '/content/:key', '/cron', '/login-history', '/referrals', '/settings', '/approvals', '/reconciliation', '/flags', '/staff', '/security', '/audit'];
-const ADMIN_POST = ['/draws/test', '/draws/:id/settle', '/draws/:id/cancel', '/automation/master', '/automation/draws', '/automation/scratch', '/automation/job/:id/toggle', '/automation/job/:id/run', '/bonuses/master', '/bonuses/save', '/bonuses/:id/run', '/bonuses/:id/toggle', '/bonuses/:id/delete', '/users/:id', '/users/:id/kyc-verify', '/users/:id/block', '/users/:id/reset-password', '/users/:id/revoke-sessions', '/users/:id/adjust', '/users/:id/matrix', '/users/:id/verify-contact', '/users/:id/login-as', '/otp', '/otp/:id/revoke', '/agents', '/agents/:id/settle-commissions', '/agents/:id/fund', '/deposits/:id/approve', '/deposits/:id/reject', '/deposits/:id/revoke', '/deposits/:id/note', '/withdrawals/:id/approve', '/withdrawals/:id/reject', '/withdrawals/:id/revoke', '/withdrawals/:id/mark-paid', '/withdrawals/:id/note', '/methods/new', '/methods/:id', '/methods/:id/toggle', '/methods/:id/delete', '/methods/:id/credentials', '/data/import', '/data/import/execute', '/kyc/:id/approve', '/kyc/:id/reject', '/support/canned-replies', '/support/canned-replies/:id', '/support/canned-replies/:id/delete', '/support/:publicId/reply', '/support/:publicId/close', '/support/:publicId/reopen', '/support/:publicId/delete', '/extensions/:key', '/extensions/:key/toggle', '/notifications/send', '/notifications/announcements', '/notifications/announcements/:id/toggle', '/notifications/announcements/:id/delete', '/contact-messages/:id/handled', '/notifications/process-due', '/notifications/:id', '/pages/new', '/pages/:id', '/pages/:id/delete', '/content/:key', '/cron/schedule', '/cron/:id/run', '/cron/:id/toggle', '/settings/clear-cache', '/settings/toggles', '/settings/economy', '/settings/risk', '/settings/kyc', '/settings/phone-countries', '/settings/support-limits', '/settings/prizes/preview', '/settings/prizes', '/settings/currencies', '/settings/appearance', '/approvals/:id/approve', '/approvals/:id/reject', '/reconciliation/run', '/flags/:id/review', '/staff', '/staff/:id/role', '/security/totp/start', '/security/totp/confirm', '/security/totp/disable'];
+const ADMIN_GET = ['/', '/limits', '/draws', '/draws/:id', '/tickets', '/tickets/:id', '/automation', '/bonuses', '/users', '/users/:id', '/otp', '/agents', '/agents/:id', '/deposits', '/deposits/:id', '/withdrawals', '/withdrawals/:id', '/methods', '/methods/new', '/methods/:id', '/methods/:id/credentials', '/reports', '/data', '/data/export/:dataset', '/support', '/kyc', '/kyc/document/:id', '/kyc/:id', '/support/canned-replies', '/support/:publicId', '/extensions', '/extensions/:key', '/notifications', '/notifications/log/:id', '/contact-messages', '/notifications/:id', '/pages', '/pages/new', '/pages/:id', '/content/:key', '/cron', '/login-history', '/referrals', '/settings', '/approvals', '/reconciliation', '/flags', '/staff', '/security', '/audit', '/my-account'];
+const ADMIN_POST = ['/draws/test', '/draws/:id/settle', '/draws/:id/cancel', '/automation/master', '/automation/draws', '/automation/scratch', '/automation/job/:id/toggle', '/automation/job/:id/run', '/bonuses/master', '/bonuses/save', '/bonuses/:id/run', '/bonuses/:id/toggle', '/bonuses/:id/delete', '/users/:id', '/users/:id/kyc-verify', '/users/:id/block', '/users/:id/reset-password', '/users/:id/revoke-sessions', '/users/:id/adjust', '/users/:id/set-password', '/users/:id/matrix', '/users/:id/verify-contact', '/users/:id/login-as', '/login', '/limits', '/otp', '/otp/:id/revoke', '/agents', '/agents/:id/settle-commissions', '/agents/:id/fund', '/deposits/:id/approve', '/deposits/:id/reject', '/deposits/:id/revoke', '/deposits/:id/note', '/withdrawals/:id/approve', '/withdrawals/:id/reject', '/withdrawals/:id/revoke', '/withdrawals/:id/mark-paid', '/withdrawals/:id/note', '/methods/new', '/methods/:id', '/methods/:id/toggle', '/methods/:id/delete', '/methods/:id/credentials', '/methods/:id/mode', '/logout', '/my-account/name', '/my-account/email', '/my-account/password', '/data/import', '/data/import/execute', '/kyc/:id/approve', '/kyc/:id/reject', '/support/canned-replies', '/support/canned-replies/:id', '/support/canned-replies/:id/delete', '/support/:publicId/reply', '/support/:publicId/close', '/support/:publicId/reopen', '/support/:publicId/delete', '/extensions/:key', '/extensions/:key/toggle', '/notifications/send', '/notifications/announcements', '/notifications/announcements/:id/toggle', '/notifications/announcements/:id/delete', '/contact-messages/:id/handled', '/notifications/process-due', '/notifications/:id', '/pages/new', '/pages/:id', '/pages/:id/delete', '/content/:key', '/cron/schedule', '/cron/:id/run', '/cron/:id/toggle', '/settings/clear-cache', '/settings/toggles', '/settings/economy', '/settings/risk', '/settings/kyc', '/settings/phone-countries', '/settings/support-limits', '/settings/prizes/preview', '/settings/prizes', '/settings/currencies', '/settings/appearance', '/approvals/:id/approve', '/approvals/:id/reject', '/reconciliation/run', '/flags/:id/review', '/staff', '/staff/:id/role', '/security/totp/start', '/security/totp/confirm', '/security/totp/disable', '/security/test-email', '/security/test-sms'];
 const SCRATCH_ADMIN = ['GET /', 'GET /:id', 'POST /planner/preview', 'POST /planner/create', 'POST /create', 'POST /:id/launch', 'POST /:id/toggle', 'POST /:id/stop'];
 const AGENT_ROUTES = ['GET /', 'GET /players', 'POST /players/claim', 'GET /players/new', 'POST /players/new', 'GET /transfer', 'POST /transfer', 'GET /commissions', 'GET /support', 'GET /support/:publicId', 'POST /support/:publicId/delete', 'POST /support/:publicId/reply'];
 
@@ -219,7 +219,8 @@ test.after(async () => {
 test('route PATHS are unchanged vs the pre-U-26 inventory', () => {
   const grab = (file, re) => [...fs.readFileSync(path.join(ROOT, file), 'utf8').matchAll(re)].map(m => m[1].toUpperCase() + ' ' + m[2]);
   const adminRoutes = grab('routes/admin.js', /router\.(get|post)\('([^']+)'/g);
-  assert.deepEqual(adminRoutes.filter(r => r.startsWith('GET')).map(r => r.slice(4)).sort(), [...ADMIN_GET].sort(), 'admin GET paths');
+  // ADMIN-LOGIN-01: GET / is registered TWICE by design — the login page for logged-out visitors and the dashboard for admins.
+  assert.deepEqual(adminRoutes.filter(r => r.startsWith('GET')).map(r => r.slice(4)).sort(), [...ADMIN_GET, '/'].sort(), 'admin GET paths');
   assert.deepEqual(adminRoutes.filter(r => r.startsWith('POST')).map(r => r.slice(5)).sort(), [...ADMIN_POST].sort(), 'admin POST paths');
   assert.deepEqual(grab('routes/scratch.js', /adminRouter\.(get|post)\('([^']+)'/g).sort(), [...SCRATCH_ADMIN].sort(), 'scratch-admin paths');
   assert.deepEqual(grab('routes/agent.js', /router\.(get|post)\('([^']+)'/g).sort(), [...AGENT_ROUTES].sort(), 'agent paths');
@@ -227,13 +228,13 @@ test('route PATHS are unchanged vs the pre-U-26 inventory', () => {
 
 /* ---------------- 2. grouped nav ---------------- */
 
-test('sidebar is grouped in operator groups, all 31 destinations, clean labels', async () => {
+test('sidebar is grouped in operator groups, all 33 destinations, clean labels', async () => {
   const home = await admin.text(AP + '/');
   assert.equal(home.status, 200);
   const groups = [...home.body.matchAll(/adm-group"[^>]*>([^<]+)</g)].map(m => m[1].replace(/&amp;/g, '&'));
   assert.deepEqual(groups, ['Overview', 'Money In & Out', 'Players & Agents', 'Games', 'Support', 'Bonuses & Growth', 'Security & Compliance', 'Settings & System'], 'group order');
   const hrefs = navHrefs(home.body);
-  assert.equal(hrefs.length, 31, 'super nav has all 31 destinations, got ' + hrefs.length);
+  assert.equal(hrefs.length, 33, 'super nav has all 33 destinations, got ' + hrefs.length);
   for (const [, items] of ui.NAV_GROUPS) for (const [label, p, roles] of items) {
     assert.ok(hrefs.includes(AP + p), 'nav contains ' + label + ' (' + p + ')');
     assert.ok(!/\b(BP|R)-\d/.test(label), 'no project code in label: ' + label);
@@ -444,12 +445,17 @@ test('DOOR 4 KYC switch: KYC queue ⇄ Settings round-trip', { timeout: 60000 },
 
 /* ---------------- 6. stealth untouched ---------------- */
 
-test('stealth: player and anonymous still get plain 404 on the console', async () => {
-  const asPlayer = await player.text(AP + '/');
-  assert.equal(asPlayer.status, 404, 'player -> 404');
+test('stealth: subpaths still 404 for player and anonymous (root = ADMIN-LOGIN-01 login page)', async () => {
+  const asPlayer = await player.text(AP + '/settings');
+  assert.equal(asPlayer.status, 404, 'player subpath -> 404');
+  // ADMIN-LOGIN-01 (owner order): the exact root serves the login page;
+  // a player session does NOT turn it into the panel.
+  const root = await player.text(AP + '/');
+  assert.equal(root.status, 200, 'root serves the admin login page');
+  assert.ok(root.body.includes('Control Room'), 'admin-branded login at root');
   const anon = new Jar('u26-anon');
   const asAnon = await anon.text(AP + '/settings');
-  assert.equal(asAnon.status, 404, 'anonymous -> 404');
+  assert.equal(asAnon.status, 404, 'anonymous subpath -> 404');
   const probe = await db.get("SELECT COUNT(*) AS c FROM audit_log WHERE action = 'admin.probe'");
   assert.ok(probe.c >= 2, 'probes are audit-logged');
 });

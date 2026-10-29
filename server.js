@@ -168,7 +168,7 @@ async function boot() {
   const bootSettings = await getSettings(db, driver, true);
   const ADMIN_PATH = getS(bootSettings, 'admin_path', process.env.ADMIN_PATH || '/ops-7f3a9c-console');
 
-  app.use(loadSession(db));
+  app.use(loadSession(db, { adminPath: ADMIN_PATH })); // SESSION-TAB-01: per-scope session loading
 
   // per-request context: settings, currencies, locals
   app.use(async (req, res, next) => {
@@ -327,7 +327,7 @@ async function boot() {
          /reset/:token now creates the anon session + CSRF cookie first
          (routes/auth.js), so an emailed-link visitor POSTs with a
          session and the standard check below applies. */
-      if (authPaths.includes(req.path) || req.path.startsWith('/reset/')) return res.status(403).render('error', { status: 403, message: 'Security token mismatch. Please open the form first and try again.' });
+      if (authPaths.includes(req.path) || req.path.startsWith('/reset/') || req.path === ADMIN_PATH + '/login') return res.status(403).render('error', { status: 403, message: 'Security token mismatch. Please open the form first and try again.' });
       return next(); // e.g. /setup — nothing to forge against
     }
     if (!checkCsrf(req)) return res.status(403).render('error', { status: 403, message: 'Security token mismatch. Please go back and try again.' });
@@ -391,12 +391,21 @@ async function boot() {
     // maintenance page for a guessed prefix (the admin router itself still
     // 404'd them, but the maintenance bypass itself was sloppy).
     if (req.path === adminPath || req.path.startsWith(adminPath + '/')) return next();
-    if (req.path === '/login' || req.path === '/logout' || req.path === '/impersonate/exit') return next();
+    if (req.path === '/login' || req.path === '/logout' || req.path === adminPath + '/logout' || req.path === '/impersonate/exit') return next();
     if (req.path.startsWith('/webhooks/')) return next();
     if (req.path === '/healthz') return next();
     if (req.path.startsWith('/verify-email/') || req.path.startsWith('/reset/') || req.path === '/forgot' || req.path === '/force-reset') return next();
     if (req.path.startsWith('/style.css') || req.path.startsWith('/app.js') || req.path === '/favicon.ico') return next();
-    if (req.method === 'GET') return res.status(503).render('maintenance', { metaTitle: 'Under Maintenance', metaDesc: '' });
+    /* MAINT-FORM-01 (owner live report 2026-10-29): the old line answered
+       EVERY non-GET with JSON. A plain HTML form POST (e.g. the header
+       currency switcher) is a top-level browser navigation — a JSON
+       response to it is downloaded by the browser as "<path>.json"
+       instead of showing the maintenance page. Browsers (Accept:
+       text/html) now get the maintenance page for EVERY method; JSON
+       stays only for API/fetch-style callers. The block itself is
+       unchanged: no POST is processed while maintenance is on. */
+    const wantsHtml = (req.headers.accept || '').includes('text/html');
+    if (req.method === 'GET' || wantsHtml) return res.status(503).render('maintenance', { metaTitle: 'Under Maintenance', metaDesc: '' });
     return res.status(503).json({ ok: false, error: 'Site under maintenance' });
   });
 
@@ -411,7 +420,7 @@ async function boot() {
       const u = await db.get('SELECT force_password_reset, force_totp_enroll, totp_secret FROM users WHERE id = ?', [req.user.id]);
       if (!u) return next();
       if (u.force_password_reset) {
-        if (req.path === '/force-reset' || req.path === '/logout' || req.path === '/impersonate/exit') return next();
+        if (req.path === '/force-reset' || req.path === '/logout' || req.path === (req.adminPath || '/ops-7f3a9c-console') + '/logout' || req.path === '/impersonate/exit') return next();
         return res.redirect('/force-reset');
       }
       // admin_totp_required enforcement for PRE-EXISTING admins: the toggle
@@ -423,7 +432,7 @@ async function boot() {
       const totpRequired = req.settings && (req.settings.admin_totp_required === '1' || req.settings.admin_totp_required === 'true' || req.settings.admin_totp_required === true);
       if ((u.force_totp_enroll || (totpRequired && !u.totp_secret)) && req.user.role === 'admin') {
         const adminPath = req.adminPath || '/ops-7f3a9c-console';
-        if (req.path === adminPath + '/security' || req.path.startsWith(adminPath + '/security/') || req.path === '/logout' || req.path === '/impersonate/exit') return next();
+        if (req.path === adminPath + '/security' || req.path.startsWith(adminPath + '/security/') || req.path === '/logout' || req.path === adminPath + '/logout' || req.path === '/impersonate/exit') return next();
         return res.redirect(adminPath + '/security');
       }
     } catch (e) { return next(e); }

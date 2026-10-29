@@ -5,6 +5,7 @@
     <p class="login-value">Sign in to <strong>play draws</strong>, track your winnings, and <strong>cash out fast</strong>.</p>
 
     <% if (typeof formError !== 'undefined' && formError) { %><div class="flash f-err"><%= formError %></div><% } %>
+    <% if (typeof signedInAs !== 'undefined' && signedInAs) { %><div class="flash f-info">You are signed in as <%= signedInAs %> in this browser. Signing in with a different account adds a separate session — your current one stays active in its own tab.</div><% } %>
 
     <% /* Social (only when admin enabled + configured) */ %>
     <% if ((typeof facebookOn !== 'undefined' && facebookOn) || (typeof googleOn !== 'undefined' && googleOn)) { %>

@@ -4,10 +4,14 @@
   <div class="grid2">
     <div class="card">
       <div class="card-h"><h2>Payment method</h2></div>
+      <% /* CURRENCY-SYSTEM-01: the player's own currency group first,
+             foreign methods under their own heading, every method
+             tagged with its currency — never silently foreign. */ %>
       <ul class="method-list">
-        <% (methods || []).forEach(function(m){ %>
+        <% var _seenOther = false; (methods || []).forEach(function(m){ var _mine = (typeof myCur !== 'undefined' && m.currency === myCur); %>
+        <% if (!_mine && !_seenOther) { _seenOther = true; %><li class="method-group">Other currencies</li><% } %>
         <li class="<%= method && method.id === m.id ? 'sel' : '' %>">
-          <span class="method-name"><%= m.name %></span>
+          <span class="method-name"><%= m.name %> <span class="muted">(<%= m.currency %>)</span></span>
           <a class="btn <%= method && method.id === m.id ? 'btn-p' : 'btn-g' %> btn-sm" href="/deposit/new?m=<%= m.id %>">Select</a>
         </li>
         <% }) %>
@@ -16,7 +20,8 @@
     <div class="card">
       <% if (method) { %>
       <div class="card-h"><h2><%= method.name %></h2></div>
-      <div class="instruction"><%- content('deposit_instruction_' + method.id) %><p class="muted pre"><%= method.instruction %></p></div>
+      <div class="instruction"><%- content('deposit_instruction_' + method.id) %><% /* INSTR-APPLE-01: the how-to IS the mode text — auto methods render the rail autoInstruction, manual methods the numbered manual steps (switched in the route); the two are never mixed. Multi-line text renders as a numbered step list. */ %><% if (method.instruction) { const _steps = String(method.instruction).split(/\n+/).map(function(x){ return x.trim(); }).filter(Boolean); if (_steps.length > 1) { %><ol class="howto-steps"><% _steps.forEach(function(st){ %><li><%= st.replace(/^\d+[.)]\s*/, '') %></li><% }) %></ol><% } else { %><p class="muted pre"><%= method.instruction %></p><% } } %>
+      </div>
       <% if (typeof receiving !== 'undefined' && receiving && receiving.length) { %>
       <div class="instruction">
         <p><strong>Send your payment to:</strong></p>
@@ -46,7 +51,8 @@
           <label for="depAmount">Amount (<%= method.currency %>)</label>
           <input type="number" id="depAmount" name="amount" min="<%= method.min_amount ? (method.min_amount / Math.pow(10, methodDec)) : '' %>" max="<%= method.max_amount ? (method.max_amount / Math.pow(10, methodDec)) : '' %>" required
                  data-fixed="<%= method.fixed_charge %>" data-percent="<%= method.percent_charge %>" data-currency="<%= method.currency %>" data-decimals="<%= methodDec %>">
-          <small class="muted"><% if (method.min_amount) { %>Min <%= fmt(method.min_amount, method.currency) %><% } %><% if (method.min_amount && method.max_amount) { %> &middot; <% } %><% if (method.max_amount) { %>Max <%= fmt(method.max_amount, method.currency) %><% } %><% if (!method.min_amount && !method.max_amount) { %>No limits<% } %></small>
+          <small class="muted"><% if (method.min_amount) { %>Min <%= fmt(method.min_amount, method.currency) %><% if (typeof minEquiv !== 'undefined' && minEquiv) { %> (&asymp; <%= minEquiv %>)<% } %><% } %><% if (method.min_amount && method.max_amount) { %> &middot; <% } %><% if (method.max_amount) { %>Max <%= fmt(method.max_amount, method.currency) %><% if (typeof maxEquiv !== 'undefined' && maxEquiv) { %> (&asymp; <%= maxEquiv %>)<% } %><% } %><% if (!method.min_amount && !method.max_amount) { %>No limits<% } %></small>
+          <% if (typeof rateNote !== 'undefined' && rateNote) { %><small class="muted"><%= rateNote %></small><% } %>
         </div>
         <p class="muted" id="chargePreview"></p>
         <% (method.custom_fields || []).forEach(function(f){ %>

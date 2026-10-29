@@ -200,15 +200,36 @@ test('BP-26 http: forged/replayed/cross-account requests cannot move numbers', a
 
   // 5+6) Forged reveal prize + reveal replay: buy until a winning ticket exists,
   //      reveal it once WITH forged params, then reveal again — exactly one credit.
+  //      FIXTURE NOTE (honest repair; every product assertion below is unchanged):
+  //      hunting a winner in the Gold Rush deck is NOT deterministic — outcomes
+  //      are crypto-shuffled per boot (26 winners / 74 zeros in 100) AND the buy
+  //      route is rate-limited to 10 buys/min/user (routes/scratch.js), so only
+  //      ~10 of any 40 rapid buys actually execute; the old 40-try loop failed
+  //      whenever no winner sat in the first ~10 outcomes (observed 2026-10-29,
+  //      full-suite run: 'a winning ticket was bought within 40 tries'). The hunt
+  //      therefore uses a fixture series whose deck (5 prizes / 5 zeros in 10)
+  //      guarantees a winner within 6 buys — inside the limiter budget together
+  //      with case 4's single Gold Rush buy.
+  const { launchSeries } = require('../lib/scratch');
+  const { randHex, sha256 } = require('../lib/util');
+  const poolSeed = randHex(32);
+  const poolIns = await dbB.run(
+    `INSERT INTO scratch_series (title,slug,game_type,currency,price,total_tickets,status,enabled,rules,server_seed,seed_hash,created_by,created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    ['Tamper Pool', 'tamper-pool', 'single', 'USD', 100, 10, 'draft', 0,
+     'Fixture series for the BP-26 reveal cases.', poolSeed, sha256(poolSeed), 0, Date.now()]
+  );
+  await dbB.run('INSERT INTO scratch_prize_tiers (series_id,amount,quantity,label) VALUES (?,?,?,?)', [poolIns.id, 300, 5, 'Win']);
+  await launchSeries(dbB, poolIns.id, 0);
   let winTicket = null;
-  for (let i = 0; i < 40 && !winTicket; i++) {
+  for (let i = 0; i < 10 && !winTicket; i++) {
     const g = await get(aJar, '/scratch');
-    await postForm(aJar, `/scratch/${series.id}/buy`, { _csrf: csrfOf(g.text) });
+    await postForm(aJar, `/scratch/${poolIns.id}/buy`, { _csrf: csrfOf(g.text) });
     const row = await dbB.get(`SELECT st.public_id, so.prize FROM scratch_tickets st JOIN scratch_outcomes so ON so.id = st.outcome_id
-      WHERE st.user_id = (SELECT id FROM users WHERE email = 'a@tamper.test') AND st.status = 'purchased' AND so.prize > 0 ORDER BY st.id DESC LIMIT 1`);
+      WHERE st.user_id = (SELECT id FROM users WHERE email = 'a@tamper.test') AND st.status = 'purchased' AND so.prize > 0 AND so.series_id = ? ORDER BY st.id DESC LIMIT 1`, [poolIns.id]);
     if (row) winTicket = row;
   }
-  assert.ok(winTicket, 'a winning ticket was bought within 40 tries (75% RTP pool)');
+  assert.ok(winTicket, 'a winning ticket was bought within 10 tries (fixture deck guarantees one within 6)');
   const balBefore = await balanceOf('a@tamper.test');
   {
     const g = await get(aJar, '/scratch/my-tickets');

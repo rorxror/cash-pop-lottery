@@ -215,8 +215,18 @@ test('U-28: owner-only markers are absent from player and agent responses', asyn
 });
 
 test('U-28: console + export paths are stealth 404 for anon, player and agent', async () => {
-  const paths = [ADMIN, ADMIN + '/scratch', ADMIN + '/data', ADMIN + '/data/export/users', ADMIN + '/data/export/ledger'];
+  /* ADMIN-LOGIN-01 (owner order 2026-10-29, superseding the 2026-10-27
+     root-404 rule): the EXACT console root serves the dedicated admin
+     login page — the path itself is the secret, like the reference
+     scripts. Every path UNDER it stays plain-404 + probe-logged, and
+     the public site still carries zero references to the path (asserted
+     by the marker tests above). */
+  const paths = [ADMIN + '/scratch', ADMIN + '/data', ADMIN + '/data/export/users', ADMIN + '/data/export/ledger'];
   for (const jar of [anon, jarA, jarG]) {
+    const root = await jar.get(ADMIN);
+    assert.equal(root.status, 200, 'console root serves the admin login page, got ' + root.status);
+    assert.ok(root.text.includes('type="password"'), 'root page is a login form');
+    for (const m of MARKERS) { if (m === ADMIN) continue; assert.ok(!root.text.includes(m), 'login page must not contain marker ' + JSON.stringify(m)); }
     for (const p of paths) {
       const r = await jar.get(p);
       assert.equal(r.status, 404, p + ' must 404 for non-admins, got ' + r.status);

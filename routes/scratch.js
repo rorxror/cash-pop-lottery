@@ -280,7 +280,7 @@ adminRouter.get('/', async (req, res) => {
         { key: 'total_tickets', label: 'Total tickets', type: 'number', required: true },
         { key: 'target_rtp', label: 'Target RTP % (e.g. 75)', type: 'text', value: getS(req.settings, 'scratch_planner_target_rtp', '75'), required: true },
       ], { csrf: req.csrfToken, submit: 'Preview plan' }));
-  res.send(ui.layout({ adminPath: req.adminPath, section: '/scratch', title: 'Scratch', body, csrf: req.csrfToken, flash: req.flashData || {}, assetV: req.app.locals.assetV || '1', role: (req.user && req.user.admin_role) || 'super' }));
+  res.send(ui.layout({ adminPath: req.adminPath, section: '/scratch', title: 'Scratch', body, csrf: req.csrfToken, flash: req.flashData || {}, assetV: req.app.locals.assetV || '1', role: (req.user && req.user.admin_role) || 'super', subtitle: 'Scratch card series, prize plans and inventory.' }));
 });
 
 /* BP-23(a): Prize Pool Planner — preview the generated tier table and

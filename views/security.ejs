@@ -115,6 +115,7 @@
       <div><strong><%= s.deviceLabel %></strong></div>
       <% if (isCurrent) { %><span class="v20-session-badge">This session</span><% } %>
       <p class="v20-session-meta"><strong>Device:</strong> <%= s.device %><% if (s.os) { %> &middot; <strong>System:</strong> <%= s.os %><% } %> &middot; <strong>Browser:</strong> <%= s.browser %></p>
+      <p class="v20-session-meta"><strong>Signed in to:</strong> <%= s.scopeLabel || 'Website' %></p>
       <p class="v20-session-meta"><strong>IP address:</strong> <%= s.ip || '—' %></p>
       <p class="v20-session-meta"><strong>Signed in:</strong> <%= new Date(s.created_at).toLocaleString() %></p>
       <p class="v20-session-meta"><strong>Expires:</strong> <%= new Date(s.expires_at).toLocaleString() %></p>
