@@ -330,9 +330,9 @@ function rateNote(req, code) {
   const perBase = (c) => { const e = entry(c), b = entry(base); return (e && b && Number(b.rate)) ? (Number(e.rate) / Number(b.rate)) : null; };
   const parts = [];
   const pc = perBase(code);
-  if (code && code !== req.cur && pc) parts.push(`Amounts on this method are in ${code}. Admin-set rate: 1 ${base} = ${pc.toFixed(4)} ${code}.`);
+  if (code && code !== req.cur && pc) parts.push(`Amounts on this method are in ${code}. Set rate: 1 ${base} = ${pc.toFixed(4)} ${code}.`);
   const pu = perBase(req.cur);
-  if (req.cur !== base && pu) parts.push(`Your currency is ${req.cur}: 1 ${base} = ${pu.toFixed(4)} ${req.cur} (admin-set rate).`);
+  if (req.cur !== base && pu) parts.push(`Your currency is ${req.cur}: 1 ${base} = ${pu.toFixed(4)} ${req.cur} (set rate).`);
   return parts.join(' ');
 }
 
@@ -416,7 +416,7 @@ router.post('/wallet/exchange', requireLogin, async (req, res) => {
   try {
     const r = await exchangeCurrency(req.db, { userId: req.user.id, from, to, amountMinor: amount, settings: req.settings });
     await audit.log(req.db, { actorId: req.user.id, actorRole: 'player', action: 'wallet.exchange', entity: 'wallet', entityId: r.pairRef, detail: { from, to, amount, credited: r.credit, fee: r.fee, fee_percent: r.feePercent !== undefined ? r.feePercent : (parseFloat(getS(req.settings, 'exchange_fee_percent', '0')) || 0) }, ip: req.ip });
-    await req.setFlash('success', `Exchanged ${req.fmt(amount, from)} → ${req.fmt(r.credit, to)} at the admin-set rate.`);
+    await req.setFlash('success', `Exchanged ${req.fmt(amount, from)} → ${req.fmt(r.credit, to)} at the set rate.`);
     return res.redirect('/wallet');
   } catch (e) { return back(e.message); }
 });

@@ -31,16 +31,16 @@
     <% }) %>
   </div>
   <% if (typeof totalApprox !== 'undefined' && totalApprox) { %>
-  <p class="mt"><strong>Total (approx): <%= totalApprox %></strong> <span class="muted">— all balances converted to your currency (<%= myCur %>) at the admin-set rate. Amounts stay stored in their own currencies; this total is for reading only.</span></p>
+  <p class="mt"><strong>Total (approx): <%= totalApprox %></strong> <span class="muted">— all balances converted to your currency (<%= myCur %>) at the set rate. Amounts stay stored in their own currencies; this total is for reading only.</span></p>
   <% } %>
 
   <div class="card mt">
     <div class="card-h"><h2>Exchange</h2></div>
-    <p class="muted">Move money between your own wallets at the <strong>admin-set rate</strong> (Settings &rarr; Currencies — this is not a live market rate).<% if (typeof exchangeFeePercent !== 'undefined' && exchangeFeePercent > 0) { %> Fee: <%= exchangeFeePercent %>% of the converted amount, shown before you confirm.<% } %></p>
+    <p class="muted">Move money between your own wallets at the <strong>set rate</strong> — this is Cash Pop's own set rate, not a live market rate.<% if (typeof exchangeFeePercent !== 'undefined' && exchangeFeePercent > 0) { %> Fee: <%= exchangeFeePercent %>% of the converted amount, shown before you confirm.<% } %></p>
     <% if (typeof exchangePreview !== 'undefined' && exchangePreview) { %>
     <div class="alert a-ok">
       <p><strong>Check your exchange:</strong> you give <strong><%= fmt(exchangePreview.amount, exchangePreview.from) %></strong> &rarr; you receive <strong><%= fmt(exchangePreview.credit, exchangePreview.to) %></strong><% if (exchangePreview.fee > 0) { %> (fee <%= fmt(exchangePreview.fee, exchangePreview.to) %> included)<% } %>.</p>
-      <p class="muted">Admin-set rate: 1 <%= exchangePreview.from %> = <%= (exchangePreview.rateTo / exchangePreview.rateFrom).toFixed(4) %> <%= exchangePreview.to %>.</p>
+      <p class="muted">Set rate: 1 <%= exchangePreview.from %> = <%= (exchangePreview.rateTo / exchangePreview.rateFrom).toFixed(4) %> <%= exchangePreview.to %>.</p>
       <form action="/wallet/exchange" method="POST">
         <input type="hidden" name="_csrf" value="<%= csrf %>">
         <input type="hidden" name="from_currency" value="<%= exchangePreview.from %>">

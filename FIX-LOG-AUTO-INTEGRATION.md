@@ -362,3 +362,11 @@ updated OWNER-DETAILS-CHECKLIST:
 4. NEW test/player-credential-leak.test.js: plants a distinctive value in EVERY credential field of EVERY rail — lib projections (receiving = pay-to keys only; public config never carries credential-pair values) + spawned-server HTTP check that the rendered deposit page shows the pay-to email, no planted value, and no gateway block. 3/3 pass.
 
 **Gate with hotfix:** full suite on final code 332 tests / 331 pass-equivalent — the only failure in the full run was U-28.9's superseded assertion, fixed above and re-proven (affected files re-run together: 57/57 pass, incl. manual-payments, auto-integration, v20-payments, v20-u24, player-credential-leak).
+
+## ADDENDUM 2 — HOTFIX 2026-10-29 (owner-reported on live v22): admin wording on player pages
+
+**Defect (owner's own words: "sari baat admin ki likh deta hai tu"):** the player wallet page said "Move money between your own wallets at the admin-set rate (Settings → Currencies — this is not a live market rate)" — operator internals (the admin, a Settings path) printed on a player surface, violating the owner's 2026-10-28 owner-only-information rule. The wording came from CURRENCY-SYSTEM-01's honesty requirement (never call it a "live market rate"); the honesty stays, the admin reference goes.
+
+**Sweep + fix (player/agent surfaces only; admin panel wording unchanged):** views/wallet.ejs ×3 (total line, exchange intro, rate label), routes/player.js ×3 (method rate note, player-currency rate note, exchange success flash), views/agent/transfer.ejs ×1 ("Ask the admin" → "Ask the Cash Pop team"). New player wording: "the set rate — this is Cash Pop's own set rate, not a live market rate." Other grep hits adjudicated as NOT player-visible: code comments, the staff-only impersonation bar, the one-time setup page, server-side provider error strings (log/admin context).
+
+**Guard:** currency-system test now asserts the rendered deposit page carries no admin/settings mention; NEW leak-test A3 sweeps player-facing sources for "admin-set" / Settings-path strings (comments stripped). Affected suites re-run green (currency-system + player-credential-leak: 8/8).

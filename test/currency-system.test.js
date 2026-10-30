@@ -80,8 +80,9 @@ test('deposit page: INR methods first, Other currencies group, INR default, fore
   assert.ok(g.html.includes(`name="method_id" value="${upiId}"`), 'default selection is the INR method');
   const usd = await player.req('/deposit/new?m=' + bankId);
   assert.ok(usd.html.includes('(USD)'), 'foreign method tagged with its currency');
-  assert.ok(usd.html.includes('₹905.00'), 'min $10.00 shows the equivalent ₹905.00 at the admin-set rate');
-  assert.ok(usd.html.includes('Admin-set rate'), 'rate note names the admin-set rate honestly');
+  assert.ok(usd.html.includes('₹905.00'), 'min $10.00 shows the equivalent ₹905.00 at the set rate');
+  assert.ok(usd.html.includes('Set rate'), 'rate note names the set rate honestly');
+  assert.ok(!/admin-set|settings\s*→|settings\s*->/i.test(usd.html), 'player pages never mention admin or settings (owner rule, hotfix 2026-10-29)');
 });
 
 test('wallet: Total (approx) in INR; exchange happy path credits exactly; ledger pair shares one ref', async () => {

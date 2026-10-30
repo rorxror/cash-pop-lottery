@@ -13,7 +13,7 @@
     <h1>Transfer to Player</h1>
     <p class="muted">Move funds from your agent float to a player's wallet.</p>
     <% if (typeof floatEmpty !== 'undefined' && floatEmpty) { %>
-    <div class="flash f-err">Your float has no money in any currency yet, so transfers cannot be sent. Ask the admin to fund your float first — once it is funded, your balance will show next to each currency below.</div>
+    <div class="flash f-err">Your float has no money in any currency yet, so transfers cannot be sent. Ask the Cash Pop team to fund your float first — once it is funded, your balance will show next to each currency below.</div>
     <% } %>
     <form action="/agent/transfer" method="POST">
       <input type="hidden" name="_csrf" value="<%= csrf %>">

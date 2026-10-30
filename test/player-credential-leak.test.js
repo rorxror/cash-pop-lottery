@@ -86,6 +86,27 @@ test('A2 paypal specifically: Client ID is not public config anymore, pay-to ema
   assert.ok(JSON.stringify(recv).includes('leakval_paypal_account_email@leak.test'), 'pay-to email still shows (intended)');
 });
 
+test('A3 wording sweep: player/agent-facing sources never mention admin-set rates or settings paths', async () => {
+  // Owner rule (2026-10-28, reinforced 2026-10-29 after he saw
+  // "admin-set rate (Settings -> Currencies ...)" on his own wallet
+  // page): operator internals — the word admin attached to product
+  // behavior, settings names/paths — never appear on player surfaces.
+  const fsx = require('node:fs');
+  const targets = ['views/wallet.ejs', 'views/agent/transfer.ejs', 'views/deposit_new.ejs', 'views/withdraw_new.ejs'];
+  for (const rel of targets) {
+    const p = path.join(ROOT, rel);
+    if (!fsx.existsSync(p)) continue;
+    const src = fsx.readFileSync(p, 'utf8');
+    // strip EJS/HTML comments (developer notes are not player-visible)
+    const visible = src.replace(/<%\s*\/\*[\s\S]*?\*\//g, '').replace(/<!--[\s\S]*?-->/g, '');
+    assert.ok(!/admin-set/i.test(visible), rel + ' must not say admin-set');
+    assert.ok(!/Settings\s*(&rarr;|→|->)/.test(visible), rel + ' must not show a Settings path');
+  }
+  const playerSrc = fsx.readFileSync(path.join(ROOT, 'routes/player.js'), 'utf8');
+  const flashLines = playerSrc.split('\n').filter(l => /setFlash|parts\.push/.test(l));
+  for (const l of flashLines) assert.ok(!/admin-set/i.test(l), 'player flash/note must not say admin-set: ' + l.trim().slice(0, 80));
+});
+
 /* ---------------- Part B: rendered deposit page over HTTP ---------------- */
 const PORT = 4171;
 const BASE = 'http://127.0.0.1:' + PORT;
