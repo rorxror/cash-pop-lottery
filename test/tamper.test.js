@@ -77,7 +77,11 @@ const envB = {
   ADMIN_SEED_PASSWORD: 'Tamper#pass1',
   ADMIN_SEED_NAME: 'Tamper Admin',
 };
-delete envB.CREDENTIAL_ENCRYPTION_KEY;
+/* H5-01 (v23): manual deposits require saved receiving details, and
+   saving details requires the encryption key — this server gets a
+   throwaway test key so the funding flow below can be set up the way
+   the owner would (details first, then deposits). */
+envB.CREDENTIAL_ENCRYPTION_KEY = 'e5'.repeat(32);
 let serverProc = null;
 let dbB = null;
 
@@ -133,8 +137,13 @@ before(async () => {
   serverProc.stderr.on('data', (d) => process.stderr.write('[tamper-server] ' + d));
   await waitHealthy();
   process.env.SQLITE_PATH = path.join(tmpB, 'b.sqlite');
+  process.env.CREDENTIAL_ENCRYPTION_KEY = envB.CREDENTIAL_ENCRYPTION_KEY;
   const { openDB } = require('../lib/db');
   ({ db: dbB } = openDB());
+  const { saveCredentialField } = require('../lib/credentials');
+  const bank = await dbB.get("SELECT id FROM payment_methods WHERE rail = 'bank_transfer' LIMIT 1");
+  for (const [k, v] of Object.entries({ bank_name: 'Tamper Bank', account_name: 'Tamper Owner', account_number: 'GB29NWBK60161331926819' }))
+    await saveCredentialField(dbB, bank.id, k, v);
 });
 after(() => { if (serverProc) serverProc.kill('SIGKILL'); });
 

@@ -1,7 +1,11 @@
 <section class="wrap section narrow-wide">
   <h1 class="sec-title">Contact us</h1>
   <div class="card">
+    <% if (typeof emailOn !== 'undefined' && emailOn) { %>
     <p class="muted">Send us a message and the support team will get back to you by email. For account-specific help, <a href="/support">open a support ticket</a> instead — it reaches us faster.</p>
+    <% } else { %>
+    <p class="muted">Send us a message and the support team will read it here. For a reply you can track, <a href="/support">open a support ticket</a> on your account — replies by email are not available right now.</p>
+    <% } %>
     <form action="/contact" method="POST" class="mt">
       <input type="hidden" name="_csrf" value="<%= csrf %>">
       <div class="field"><label for="cname">Your name</label><input id="cname" name="name" required maxlength="120" value="<%= user ? user.name : '' %>"></div>

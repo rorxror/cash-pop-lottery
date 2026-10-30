@@ -180,10 +180,12 @@ test('U-03/U-11: countdown format is unified — always a day part, one ticker c
   assert.match(js, /el\.textContent = d \+ 'd ' \+ pad\(h\)/, 'tick always writes "Dd HH:MM:SS"');
   assert.ok(!js.includes("d > 0 ? d + 'd '"), 'the old conditional day-prefix (two structures) is gone');
   assert.match(js, /querySelectorAll\('\.countdown\[data-close-at\]'\)/, 'ticker still selects .countdown[data-close-at]');
-  // Server placeholders share the same structure on banner + all cards.
+  // H5-13 (v23): the server renders the REAL countdown text in the same
+  // "Dd HH:MM:SS" structure the ticker writes (the old assertion pinned
+  // the broken literal placeholder "-d --:--:--" on every card).
   const placeholders = [...anonHome.matchAll(/class="countdown[^"]*"[^>]*>([^<]*)</g)].map(m => m[1]);
   assert.ok(placeholders.length >= 5, 'banner + 4 card countdowns render');
-  assert.ok(placeholders.every(p => p === '-d --:--:--'), 'every countdown placeholder is identical: ' + JSON.stringify(placeholders));
+  assert.ok(placeholders.every(p => /^\d+d \d{2}:\d{2}:\d{2}$/.test(p) || p === 'Closing...'), 'every server countdown is a real formatted value: ' + JSON.stringify(placeholders));
   for (const c of parseDrawCards(anonHome)) {
     assert.match(c.raw, /class="countdown v20-draw-countdown" data-close-at="\d+"/, 'card countdown carries countdown + v20 class + epoch close');
     assert.match(c.raw, /class="v20-draw-ball"/, 'card carries the glossy v20 ball');
@@ -215,7 +217,9 @@ test('U-10: stats are an equal v20 3-up with unchanged real values (0 anon → 1
   const cards = [...anonHome.matchAll(/<div class="v20-stat-card">([\s\S]*?)<\/div>/g)].map(m => m[1]);
   assert.equal(cards.length, 3);
   const labels = cards.map(c => (c.match(/v20-stat-label">([^<]+)</) || [])[1]);
-  assert.deepEqual(labels, ['Players', 'Tickets in the last 24 hours', 'Paid out']);
+  // H1-04/H1-20 (v23): labels state what the numbers ARE — lottery
+  // tickets only, and winnings CREDITED (not cash paid out).
+  assert.deepEqual(labels, ['Players', 'Lottery tickets in the last 24 hours', 'Winnings credited']);
   for (const c of cards) {
     assert.match(c, /class="v20-stat-deco" aria-hidden="true"/, 'decorative ball present and aria-hidden');
     assert.ok(!/<a[\s>]/.test(c), 'no Play/link button inside a stat card for the deco to cover');

@@ -145,6 +145,10 @@ async function boot() {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    // H3-09 (v23): HSTS on secure requests (Render terminates TLS, so
+    // req.secure is the signal) — browsers then refuse plain-HTTP
+    // downgrade for a year. Not sent on local plain-HTTP development.
+    if (req.secure) res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
     next();
   });
   app.use((req, res, next) => { req.cookies = parseCookies(req); next(); });
@@ -257,6 +261,25 @@ async function boot() {
       Object.defineProperty(res.locals, 'csrf', { enumerable: true, configurable: true, get: () => req.csrfToken || '' });
       next();
     } catch (e) { next(e); }
+  });
+
+  /* H3-03 (v23): impersonation (login-as) sessions are view/support
+     only. Any money-moving POST under one is refused and audit-logged —
+     deposits, withdrawals, wallet exchange, ticket/scratch buys and
+     agent transfers can never be executed "as" a player by staff.
+     Viewing pages and non-money actions (support replies, profile
+     edits) stay available, which is what login-as exists for. */
+  const IMPERSONATION_MONEY_POSTS = [/^\/deposit\//, /^\/withdraw\//, /^\/wallet\/exchange$/, /^\/play$/, /^\/scratch\/buy/, /^\/agent\//];
+  app.use(async (req, res, next) => {
+    try {
+      if (req.method === 'POST' && req.sessionData && req.sessionData.impersonated_by
+        && IMPERSONATION_MONEY_POSTS.some(rx => rx.test(req.path))) {
+        const audit = require('./lib/audit');
+        await audit.log(db, { actorId: req.sessionData.impersonated_by, actorRole: 'admin', action: 'impersonation.money_blocked', entity: 'user', entityId: req.user ? req.user.id : null, detail: { path: req.path }, ip: req.ip });
+        return res.status(403).render('error', { status: 403, message: 'Money actions are disabled while viewing as a player. Sign in as yourself to move money.' });
+      }
+    } catch { /* the guard must never break the request pipeline */ }
+    next();
   });
 
   // Layout wrapper: every EJS view renders inside views/layout.ejs (<%- body %>).
@@ -394,7 +417,7 @@ async function boot() {
     if (req.path === '/login' || req.path === '/logout' || req.path === adminPath + '/logout' || req.path === '/impersonate/exit') return next();
     if (req.path.startsWith('/webhooks/')) return next();
     if (req.path === '/healthz') return next();
-    if (req.path.startsWith('/verify-email/') || req.path.startsWith('/reset/') || req.path === '/forgot' || req.path === '/force-reset') return next();
+    if (req.path.startsWith('/verify-email/') || req.path.startsWith('/reset/') || req.path === '/forgot-password' || req.path === '/forgot' || req.path === '/force-reset') return next();
     if (req.path.startsWith('/style.css') || req.path.startsWith('/app.js') || req.path === '/favicon.ico') return next();
     /* MAINT-FORM-01 (owner live report 2026-10-29): the old line answered
        EVERY non-GET with JSON. A plain HTML form POST (e.g. the header
@@ -512,6 +535,15 @@ async function boot() {
        server fault — friendly wording, no parser internals. */
     if (err && (err.type === 'entity.parse.failed' || (err instanceof SyntaxError && err.status === 400))) {
       return res.status(400).render('error', { status: 400, message: 'That submission could not be read. Please go back and try again.' });
+    }
+    /* H5-09 (v23): an error that CARRIES a deliberate client status
+       (upload limits, route-level 4xx) answers with that status instead
+       of a blanket 500 — a client mistake is not a server fault. The
+       message stays generic; the detail goes to the log under the ref. */
+    if (err && Number.isInteger(err.status) && err.status >= 400 && err.status < 500) {
+      const ref4 = 'E' + Date.now().toString(36).toUpperCase() + require('node:crypto').randomBytes(2).toString('hex').toUpperCase();
+      console.error(`[error] ref=${ref4}`, err);
+      return res.status(err.status).render('error', { status: err.status, message: 'That request could not be processed. Please go back and try again.', ref: ref4 });
     }
     /* U-24 (v20): an unexpected error shows the player a SHORT REFERENCE
        CODE only — no message, class, stack or SQL ever reaches the page.

@@ -16,7 +16,7 @@ const { decideDeposit, releaseReferralCredits } = require('../lib/money');
 const { loadCredentials } = require('../lib/credentials');
 const { getSettings, getCurrencies } = require('../lib/settings');
 const notify = require('../lib/notify');
-const { fmtMoney } = require('../lib/util');
+const { fmtMoney, decimalsFor } = require('../lib/util');
 const audit = require('../lib/audit');
 
 /* Generic event parser: providers disagree on field names, so try the common
@@ -123,7 +123,7 @@ router.post('/paypal', rateLimit({ windowMs: 60000, max: 60, keyFn: r => 'webhoo
   };
 
   if (event.event_type === 'PAYMENT.CAPTURE.COMPLETED') {
-    const capture = paypal.normalizeCapture(event.resource);
+    const capture = paypal.normalizeCapture(event.resource, decimalsFor(method.currency, getCurrencies(settings)));
     if (capture) await applyCapture(capture); else note = 'event recorded, unparseable capture resource';
   } else if (event.event_type === 'CHECKOUT.ORDER.APPROVED' || event.event_type === 'CHECKOUT.ORDER.COMPLETED') {
     /* We never create PayPal orders (players pay the account directly),
@@ -134,7 +134,7 @@ router.post('/paypal', rateLimit({ windowMs: 60000, max: 60, keyFn: r => 'webhoo
     const units = Array.isArray(order.purchase_units) ? order.purchase_units : [];
     const captures = units.flatMap(u => (u.payments && Array.isArray(u.payments.captures)) ? u.payments.captures : []);
     if (String(order.status || '') === 'COMPLETED' && captures.length) {
-      const capture = paypal.normalizeCapture(captures[0]);
+      const capture = paypal.normalizeCapture(captures[0], decimalsFor(method.currency, getCurrencies(settings)));
       if (capture) await applyCapture(capture);
     } else note = 'order event recorded — no completed capture, no credit';
   } else if (event.event_type === 'PAYMENT.CAPTURE.REFUNDED' || event.event_type === 'PAYMENT.CAPTURE.REVERSED') {
@@ -143,7 +143,8 @@ router.post('/paypal', rateLimit({ windowMs: 60000, max: 60, keyFn: r => 'webhoo
     const up = (Array.isArray(r.links) ? r.links : []).find(l => l && l.rel === 'up' && /\/captures\/([A-Za-z0-9_-]+)/.test(String(l.href || '')));
     const captureId = up ? /\/captures\/([A-Za-z0-9_-]+)/.exec(String(up.href))[1] : '';
     const refundValue = r.amount && r.amount.value !== null && r.amount.value !== undefined ? Number(r.amount.value) : NaN;
-    const refundMinor = Number.isFinite(refundValue) ? Math.round(refundValue * 100) : null;
+    /* H2-04 (v23): refund value is in MAJOR units of its currency. */
+    const refundMinor = Number.isFinite(refundValue) ? Math.round(refundValue * (10 ** decimalsFor(String((r.amount && r.amount.currency_code) || method.currency || '').toUpperCase(), getCurrencies(settings)))) : null;
     const refundCur = String((r.amount && r.amount.currency_code) || '').toUpperCase() || null;
     const dep = captureId ? await findDepositForRef(req.db, { methodId: method.id, ref: captureId, proofKey: 'paypal_txid' }) : null;
     if (!dep) note = 'refund recorded, no matching deposit';
@@ -191,7 +192,8 @@ router.post('/skrill', rateLimit({ windowMs: 60000, max: 60, keyFn: r => 'webhoo
   if (!depositId && (parsed.action === 'payment_success' || parsed.action === 'chargeback')) {
     const dep = await findDepositForRef(req.db, { methodId: method.id, ref: parsed.mbTransactionId, proofKey: 'ewallet_txid' });
     if (dep) {
-      const amountOk = parsed.amountMinor !== null && parsed.amountMinor === Number(dep.amount);
+      /* H2-04 (v23): convert with the DEPOSIT currency's decimals. */
+      const amountOk = parsed.amountMajor !== null && Math.round(parsed.amountMajor * (10 ** decimalsFor(dep.currency, getCurrencies(settings)))) === Number(dep.amount);
       const currencyOk = !!parsed.currency && parsed.currency === String(dep.currency).toUpperCase();
       if (!amountOk || !currencyOk) {
         await audit.log(req.db, { actorId: null, actorRole: 'webhook', action: 'webhook.verification_mismatch', entity: 'deposit', entityId: dep.public_id, detail: { provider: 'skrill', ref: parsed.mbTransactionId, reason: amountOk ? 'currency mismatch' : 'amount mismatch' }, ip: req.ip });
@@ -267,9 +269,17 @@ router.post('/:rail', rateLimit({ windowMs: 60000, max: 60, keyFn: r => 'webhook
       // reference against the DECODED details in JS. Same match semantics
       // as the old LIKE '%"<ref>"%' (quoted value, case-insensitive).
       const { decodeUserData } = require('../lib/money');
+      /* H2-03 (v23): 'approved' deposits are candidates too — a refund /
+         chargeback for a MANUALLY approved deposit (provider_txn_id is
+         NULL, so the exact match above missed it) previously matched
+         NOTHING: the reversal was recorded and the house silently kept
+         money the provider had taken back. Pending rows sort first so
+         a success event can never be shadowed by an older approved row
+         carrying the same proof; the action branches below re-check
+         status before acting. */
       const cands = await req.db.query(
         `SELECT d.* FROM deposits d JOIN payment_methods m ON m.id = d.method_id
-         WHERE m.rail = ? AND d.status = 'pending' ORDER BY d.created_at ASC LIMIT 500`,
+         WHERE m.rail = ? AND d.status IN ('pending','approved') ORDER BY CASE d.status WHEN 'pending' THEN 0 ELSE 1 END, d.created_at ASC LIMIT 500`,
         [rail.key]);
       const needle = '"' + String(ev.ref).toLowerCase() + '"';
       for (const c of cands) {
@@ -305,9 +315,11 @@ router.post('/:rail', rateLimit({ windowMs: 60000, max: 60, keyFn: r => 'webhook
       if (ev.amount !== null) {
         const depAmt = Number(dep.amount);
         // R-005: exactly one unit interpretation, by rail family.
+        /* H2-04 (v23): major-unit rails convert with the DEPOSIT
+           currency's decimals (x100 was wrong for JPY/KWD). */
         amountOk = MINOR_UNIT_RAILS.has(rail.key)
           ? (Math.round(ev.amount) === depAmt)
-          : (Math.round(ev.amount * 100) === depAmt);
+          : (Math.round(ev.amount * (10 ** decimalsFor(dep.currency, getCurrencies(req.settings || {})))) === depAmt);
         amountOk = amountOk && currencyOk;
         if (!amountOk) amountNote = currencyOk
           ? `amount mismatch (webhook ${ev.amount}${ev.currency ? ' ' + ev.currency : ''} vs deposit ${depAmt} minor)`

@@ -147,7 +147,17 @@ test('A3 manual deposit loop (all 14 rails): approve credits exact net once; dou
     assert.equal(await balanceA(playerA), bal0 + 10000, `${k}: approve credits the exact amount`);
     await assert.rejects(() => money.decideDeposit(db, d1.id, 'approve', adminAId, null), `${k}: double approve must throw`);
     assert.equal(await balanceA(playerA), bal0 + 10000, `${k}: double approve moved nothing`);
-    const d2 = await money.createDeposit(db, { userId: playerA, method: m, amountMinor: 4000, userData: PROOF[k] });
+    /* H2-02 (v23): the reject-scenario deposit is a DIFFERENT payment,
+       so it carries a different reference — reusing d1's exact proof is
+       now refused by the duplicate-proof guard (by design). */
+    const PROOF2 = {
+      crypto: { tx_hash: 'f9e8d7c6'.repeat(8) }, upi: { utr: '987654321098' },
+      pix: { pix_txid: 'E12345678202501019876543210987654' }, mobile_money: { receipt_code: 'MP2601299999' },
+      ewallet: { ewallet_txid: 'EW-TX-112233' }, bank_transfer: { reference: 'BANKREF-67890' },
+      qr_pay: { reference: 'QRREF-67890' }, voucher: { voucher_pin: '6543210987654321' },
+      cash_agent: { receipt_code: 'AG-RCPT-88' }, paypal: { paypal_txid: '9CD23456EF789012F' },
+    };
+    const d2 = await money.createDeposit(db, { userId: playerA, method: m, amountMinor: 4000, userData: { ...PROOF[k], ...(PROOF2[k] || {}) } });
     await money.decideDeposit(db, d2.id, 'reject', adminAId, null, 'Proof does not match our records.');
     assert.equal(await balanceA(playerA), bal0 + 10000, `${k}: reject credits nothing`);
     const row = await db.get('SELECT decision_reason, status FROM deposits WHERE id = ?', [d2.id]);
@@ -527,7 +537,7 @@ test('B6 METHOD-MODE (e): BP-22 auto-approval on the AUTO crypto method — unde
   await new Promise(r => setTimeout(r, 5200));
   // B4b's credit was reversed by its refund segment, so fund player2
   // here with a manual approve (also re-proves the manual path).
-  const fundDep = await playerDepositAs(player2Jar, player2Id, methodIdB.paypal, '200.00', PROOF.paypal);
+  const fundDep = await playerDepositAs(player2Jar, player2Id, methodIdB.paypal, '200.00', { ...PROOF.paypal, paypal_txid: '7GH34567IJ890123K' }); // distinct txid: B3 already used PROOF.paypal's (H2-02 guard)
   await adminDecideB('deposits', fundDep.id, 'approve');
   const bal0 = await balAs(player2Id);
   assert.ok(bal0 >= 14000, 'funded for B6 (balance ' + bal0 + ')');
@@ -567,7 +577,7 @@ test('B7 AGENT-CURRENCY-01: unfunded agent sees currencies + empty state; EUR fl
   assert.equal(page.status, 200);
   assert.ok(page.body.includes('EUR'), 'EUR option renders even with zero float');
   assert.ok(page.body.includes('USD'), 'USD option renders even with zero float');
-  assert.ok(page.body.includes('Ask the admin to fund your float first'), 'plain-language empty state shows');
+  assert.ok(page.body.includes('Ask the Cash Pop team to fund your float first'), 'plain-language empty state shows');
   assert.ok(!page.body.includes('Amount (USD)</label>'), 'amount label is not hardcoded to USD');
 
   // (b) admin funds EUR float through the real admin form
@@ -576,7 +586,7 @@ test('B7 AGENT-CURRENCY-01: unfunded agent sees currencies + empty state; EUR fl
   assert.equal(post.status, 302, 'fund float redirects');
   page = await agentJar.text('/agent/transfer');
   assert.ok(page.body.includes('EUR'), 'EUR still listed after funding');
-  assert.ok(!page.body.includes('Ask the admin to fund your float first'), 'empty state clears once funded');
+  assert.ok(!page.body.includes('Ask the Cash Pop team to fund your float first'), 'empty state clears once funded');
 
   // (c) transfer €20 -> player EUR wallet credited exactly
   const tokM = page.body.match(/name="transfer_token" value="([^"]+)"/);

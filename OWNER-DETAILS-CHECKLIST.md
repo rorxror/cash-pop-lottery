@@ -163,10 +163,16 @@ bharni. Player ko kabhi apna card number site par NAHI dalna.
    naam jo us number par register hai — player ko confirmation par
    yehi dikhta hai. Khana: `Registered organisation / merchant name`
 5. **Provider API key / Consumer Key** — sirf Auto/API
-   - M-Pesa (Daraja): developer.safaricom.co.ke → My Apps → **Consumer Key**
    - Khana: `Provider API key / Consumer Key`
-6. **Webhook signing secret** — M-Pesa Daraja me ye cheez hoti hi nahi
-   (wo Callback URL istemal karta hai) — M-Pesa ke liye khali chhorein.
+   - ⚠️ SACHAI (v23): Mobile Money ka Auto mode abhi sirf un
+     providers ke saath kaam karta hai jo hamare generic signed-webhook
+     contract par callback bhejte hain (HMAC signature ke saath).
+     M-Pesa Daraja ka apna OAuth2 + Callback protocol abhi BUILT NAHI
+     hai — Daraja ki Consumer Key yahan daalne se M-Pesa Auto NAHI
+     chalega. Tab tak M-Pesa ko **Manual** mode me istemal karein
+     (upar wale receiving details) — wo poori tarah kaam karta hai.
+6. **Webhook signing secret** — generic-webhook providers ke liye
+   zaroori; Manual mode ke liye khali chhorein.
 
 ## E-Wallets ★ (Skrill / NETELLER)
 
@@ -343,48 +349,81 @@ usi card ki khali line me code, symbol aur rate likh kar save kar dein.
 
 ## Login aur verification channels — Email, SMS, Google, Facebook
 
-Ye cheezein Render ke **Environment** me lagti hain (admin panel me
-nahi). Admin panel → Security page par "Login & verification health"
-card me har channel ke samne CONFIGURED ya NOT CONFIGURED dikhta hai.
-Jo channel configured nahi, wo player ko saaf mana karta hai (jhuti
-"code bhej diya" kabhi nahi kehta) — ye design hai, bug nahi. Wahi
-page par "Send test email" / "Send test SMS" button se pehle khud
-test kar sakte hain.
+**Email aur SMS ki details ab Admin Panel me lagti hain:**
+**Admin → Security → Delivery (SMTP & SMS)** — wahi page par upar
+"Login & verification health" card me har channel ke samne CONFIGURED
+ya NOT CONFIGURED dikhta hai, aur wahi "Send test email" / "Send test
+SMS" button se pehle khud test kar sakte hain. Jo channel configured
+nahi, wo player ko saaf mana karta hai (jhuti "code bhej diya" kabhi
+nahi kehta) — ye design hai, bug nahi.
+
+⚠️ **Keys sirf Admin → Security → Delivery ke khano me dalein — kabhi
+chat me mat bhejein.** Wahan wo encrypted save hoti hain. Ek shart:
+server environment me `CREDENTIAL_ENCRYPTION_KEY` hona chahiye (live
+Render service par ye set hai) — bagair iske panel secret save karne
+se saaf mana karega. Server environment wali purani values
+(SMTP_*/TWILIO_*/TEXTBELT_KEY) ab bhi fallback ke tor par chalti hain —
+panel me bhari hui value un par jeet-ti hai.
+
+Google/Facebook sign-in ki details ab bhi Render ke **Environment**
+me lagti hain (neeche unke section me hai).
+
+⚠️ **Ek aur Render env lazmi hai: `BASE_URL`** — apni site ka asal
+address (masalan `https://cash-pop-lottery.onrender.com`). Password
+reset aur email verification ke LINK isi se bante hain — ye set na ho
+to wo email bheji hi nahi jati (site kabhi andaze se link nahi
+banati). Domain (zintola.com) lagne ke baad isay naye address se
+badal dein.
 
 ### Email (OTP, verification link, password reset — sab isi se jata hai)
 
-Gmail wala asaan rasta:
+Gmail wala asaan rasta — sab khane **Admin → Security → Delivery**
+ke **Email (SMTP)** hisse me hain:
 
-- [ ] `SMTP_HOST` = smtp.gmail.com
-- [ ] `SMTP_PORT` = 587
-- [ ] `SMTP_USER` = aapka apna Gmail address
-- [ ] `SMTP_PASS` = Google **App Password** (16 hisson wala code) — ye
-      aapka aam Gmail password NAHI hai. Banane ki jagah:
-      myaccount.google.com → Security → 2-Step Verification on karein
-      → phir "App passwords" me ja kar ek bana lein, wahi yahan lagayein.
-- [ ] `SMTP_FROM` = wahi Gmail address
+- [ ] **SMTP host** = `smtp.gmail.com`
+- [ ] **SMTP port** = `587`
+- [ ] **SMTP username** = aapka apna Gmail address
+- [ ] **SMTP password** = Google **App Password** — ye aapka aam Gmail
+      password NAHI hai, aur aam password kaam NAHI karega. Banane ke
+      qadam: (1) myaccount.google.com → Security → **2-Step
+      Verification ON** karein; (2) phir **App passwords** kholein →
+      ek App Password generate karein; (3) wahi 16-hisson wala code
+      yahan SMTP password me dalein.
+- [ ] **From address** = wahi Gmail address
 
 Note: muft Gmail se roz takreeban 500 email ki had hai. Baad me domain
 aane par domain wali email lag jayegi.
 
+**Doosra SMTP provider bhi chalega:** Brevo, Resend waghera ke SMTP
+relay ki values (unka diya hua SMTP host, port, username, password)
+bhi bilkul inhi khano me jati hain — tareeqa wohi hai, sirf values
+us provider ki hongi. (In providers ki API-key wali alag flow hamari
+site me NAHI hai — sirf SMTP wali values istemal hoti hain.)
+
 ### SMS (Phone OTP)
 
-Do raaste hain — ek chunein:
+Provider pehle **Admin → Settings → Appearance** me **SMS provider**
+wale khane se chunein (Twilio ya TextBelt). Phir us provider ki
+details **Admin → Security → Delivery** ke **SMS** hisse me bharein.
+Ek sach: agar chuna hua provider adhoora bhara ho aur doosra provider
+mukammal configured ho, to site mukammal wale ko istemal karegi —
+Security page par "effective provider" aur fallback saaf dikhta hai.
 
 **Twilio (asal/paid — real users ke liye yehi theek hai):**
 
-- [ ] Twilio account bana kar ek phone number khareedein.
-- [ ] `TWILIO_SID` = Twilio Console ke home page par "Account SID"
-- [ ] `TWILIO_TOKEN` = wahi page par "Auth Token"
-- [ ] `TWILIO_FROM` = jo number aapne khareeda (e.g. +1...)
-- [ ] Admin panel → Notifications → SMS provider me "Twilio" chunein
-      (ya Render env me `SMS_PROVIDER` = twilio).
+- [ ] twilio.com par account banayein → ek phone number khareedein.
+- [ ] **Twilio Account SID** = Twilio Console ke home page par
+      "Account SID" — Delivery ke SMS hisse ke isi naam wale khane me.
+- [ ] **Twilio Auth Token** = wahi page par "Auth Token" — isi naam
+      wale khane me (ye secret hai, chat me kabhi nahi).
+- [ ] **Twilio From number** = jo number aapne khareeda (e.g. +1...)
+      — isi naam wale khane me.
 
 **TextBelt (sab se sasta test rasta — muft key bohat limited hai):**
 
-- [ ] `TEXTBELT_KEY` = textbelt.com se li hui key (muft key din me
-      bohat kam SMS deti hai — sirf test ke liye).
-- [ ] Provider "TextBelt" chunein (ya `SMS_PROVIDER` = textbelt).
+- [ ] **TextBelt API key** = textbelt.com se li hui key — Delivery ke
+      SMS hisse ke isi naam wale khane me (muft key din me bohat kam
+      SMS deti hai — sirf test ke liye).
 
 ### Google sign-in (Gmail se login)
 

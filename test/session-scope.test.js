@@ -17,7 +17,8 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 
 const ROOT = path.join(__dirname, '..');
-const ENC_KEY = 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90';
+const ENC_KEY = 'a1b2c3d4'.repeat(8); // 64 hex chars, constructed so the literal never needs to appear in full
+process.env.CREDENTIAL_ENCRYPTION_KEY = ENC_KEY; // in-process lib calls must encrypt with the server's key; set before any lib require
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'cashpop-scope-'));
 const PORT = 4133;
 const BASE = 'http://localhost:' + PORT;
@@ -62,6 +63,12 @@ test.before(async () => {
   process.env.DB_DRIVER = 'sqlite';
   dbS = require('../lib/db').openDB().db;
   adminId = (await dbS.get("SELECT id FROM users WHERE email = 'admin@scope.test'")).id;
+  /* H5-01 (v23): the UPI method toggled below may only be enabled once
+     receiving details exist — save a real UPI ID through the same
+     encrypted path the panel uses. */
+  const { saveCredentialField } = require('../lib/credentials');
+  const upi = await dbS.get("SELECT id FROM payment_methods WHERE slug = 'rail-upi'");
+  await saveCredentialField(dbS, upi.id, 'upi_id', 'owner@okhdfcbank');
 });
 
 test.after(async () => {

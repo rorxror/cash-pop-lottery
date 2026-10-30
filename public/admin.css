@@ -159,7 +159,7 @@
 .adm .btn-p, .adm a.btn-p { color: var(--navy-ink); }
 /* DS-066: admin list filter bars */
 .filter-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 12px 0; }
-.filter-form input, .filter-form select { min-height: 40px; padding: 6px 10px; border: 1px solid rgba(23,32,58,.25); border-radius: 10px; background: #fff; color: #1b2340; font: inherit; font-size: 14px; }
+.filter-form input, .filter-form select { min-height: 44px; padding: 6px 10px; border: 1px solid rgba(23,32,58,.25); border-radius: 10px; background: #fff; color: #1b2340; font: inherit; font-size: 14px; /* DESIGN DEBATE (v23): 44px Apple floor — the owner works these filters from a phone at night; 40px was below it */ }
 
 /* AUDIT-DETAIL-01: humanized audit detail lines (admin.css) */
 .aud-lines { display: grid; gap: 2px; min-width: 180px; }

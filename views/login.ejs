@@ -2,7 +2,7 @@
   <div class="form-card auth-card fade-in">
     <div class="auth-logo">🎰</div>
     <h1>Welcome back</h1>
-    <p class="login-value">Sign in to <strong>play draws</strong>, track your winnings, and <strong>cash out fast</strong>.</p>
+    <p class="login-value">Sign in to <strong>play draws</strong>, track your winnings, and <strong>request withdrawals</strong>.</p>
 
     <% if (typeof formError !== 'undefined' && formError) { %><div class="flash f-err"><%= formError %></div><% } %>
     <% if (typeof signedInAs !== 'undefined' && signedInAs) { %><div class="flash f-info">You are signed in as <%= signedInAs %> in this browser. Signing in with a different account adds a separate session — your current one stays active in its own tab.</div><% } %>
@@ -112,7 +112,7 @@
         </div>
         <label class="muted sm" style="display:flex;gap:8px;align-items:flex-start;margin:12px 0;">
           <input type="checkbox" id="authAgree" style="min-height:auto;width:18px;margin-top:2px;">
-          <span>I agree to the Terms &amp; Privacy Policy. I confirm I am 18 or older.</span>
+          <span>I agree to the <a href="/page/terms">Terms</a> &amp; <a href="/page/privacy">Privacy Policy</a>. I confirm I am 18 or older.</span>
         </label>
         <button type="button" class="btn btn-p btn-lg btn-block" id="authProfileBtn">Complete Registration →</button>
       </div>
@@ -125,7 +125,7 @@
       <div class="login-trust">🔒 Secure sign-in · 18+ only · Play responsibly</div>
     </div>
     <p class="muted center">Don't have an account? <a href="/register"><strong>Register</strong></a></p>
-    <p class="text-caption center">By continuing, you agree to our Terms &amp; Privacy Policy.</p>
+    <p class="text-caption center">By continuing, you agree to our <a href="/page/terms">Terms</a> &amp; <a href="/page/privacy">Privacy Policy</a>.</p>
   </div>
 </section>
 

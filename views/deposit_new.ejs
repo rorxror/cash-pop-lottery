@@ -11,7 +11,7 @@
         <% var _seenOther = false; (methods || []).forEach(function(m){ var _mine = (typeof myCur !== 'undefined' && m.currency === myCur); %>
         <% if (!_mine && !_seenOther) { _seenOther = true; %><li class="method-group">Other currencies</li><% } %>
         <li class="<%= method && method.id === m.id ? 'sel' : '' %>">
-          <span class="method-name"><%= m.name %> <span class="muted">(<%= m.currency %>)</span></span>
+          <span class="method-name"><% if (m.logo_url) { %><img src="<%= m.logo_url %>" alt="" class="method-logo" width="24" height="24" loading="lazy"> <% } %><%= m.name %> <span class="muted">(<%= m.currency %>)</span></span>
           <a class="btn <%= method && method.id === m.id ? 'btn-p' : 'btn-g' %> btn-sm" href="/deposit/new?m=<%= m.id %>">Select</a>
         </li>
         <% }) %>

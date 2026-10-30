@@ -18,7 +18,7 @@
         <tr>
           <td><%= new Date(r.created_at).toLocaleString() %></td>
           <td><%= r.user_name %></td>
-          <td><a href="/ticket/<%= r.ticket_public_id %>"><span class="code"><%= r.ticket_public_id %></span></a></td>
+          <td><span class="code"><%= r.ticket_public_id %></span></td>
           <td><%= r.rate %>%</td>
           <td class="pos"><%= fmt(r.amount, r.currency) %></td>
         </tr>

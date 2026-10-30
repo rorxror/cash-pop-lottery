@@ -468,7 +468,7 @@ test('Migrations v22/v23: a v21 database upgrades — terms heal, columns arrive
   const up = openDB().db;
   await migrate(up, 'sqlite');
   let vers = await up.query('SELECT version FROM migrations_applied ORDER BY version DESC LIMIT 1');
-  assert.equal(Number(vers[0].version), 26, 'fresh migrate reaches v26');
+  assert.equal(Number(vers[0].version), 28, 'fresh migrate reaches v28 (v27 delivery credentials + v28 settings cleanup added in v23)');
 
   // Roll the DB back to a v21 state with the OLD terms paragraph planted.
   const OLD_PARA = '<p><strong>Template notice:</strong> the operator must replace this page with terms reviewed for their own licence and jurisdiction before offering real-money play.</p>';
@@ -479,7 +479,7 @@ test('Migrations v22/v23: a v21 database upgrades — terms heal, columns arrive
   await up.run("UPDATE pages SET body = ? WHERE slug = 'terms'", [OLD_PARA + terms.body]);
   await migrate(up, 'sqlite');
   vers = await up.query('SELECT version FROM migrations_applied ORDER BY version DESC LIMIT 1');
-  assert.equal(Number(vers[0].version), 26, 'upgrade migrate reaches the current latest version (v24 sessions.scope, v25 processing_mode, v26 withdraw_instruction added after v23)');
+  assert.equal(Number(vers[0].version), 28, 'upgrade migrate reaches the current latest version (v24 sessions.scope, v25 processing_mode, v26 withdraw_instruction, v27 delivery credentials, v28 settings cleanup)');
   const healed = await up.get("SELECT body FROM pages WHERE slug = 'terms'");
   assert.ok(!healed.body.includes('Template notice'), 'v22 removed the Template notice from the existing DB');
   assert.ok(healed.body.includes('Eligibility'), 'the rest of the terms page is intact');

@@ -402,6 +402,15 @@ adminRouter.get('/:id', async (req, res) => {
         fmt(b.amount, series.currency), b.total, b.sold, b.remaining,
         Number(b.amount) > 0 && Number(b.remaining) === 0 ? '⚠ exhausted' : (Number(b.remaining) === 0 ? 'gone' : 'live')]))) +
     ui.card('Tier plan', ui.table(['Prize', 'Quantity', 'Label'], tiers.map(t => [fmt(t.amount, series.currency), t.quantity, esc(t.label || '')]))) +
+    /* H4-13 (v23): the lifecycle actions also live HERE, on the series'
+       own page — the operator inspecting a series should not have to
+       go back to the list to launch, pause or stop it. Same routes the
+       list buttons post to. */
+    ui.card('Actions', `
+       ${series.status === 'draft' ? `<form method="POST" action="${base}/${series.id}/launch" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-p">Launch series</button></form> <span class="muted">Launching locks the prize outcomes — the tier plan above becomes final.</span>` : ''}
+       ${series.status === 'live' ? `<form method="POST" action="${base}/${series.id}/toggle" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn">${series.enabled ? 'Disable (stop selling, keep live tickets playable)' : 'Enable selling'}</button></form>
+       <form method="POST" action="${base}/${series.id}/stop" style="display:inline"><input type="hidden" name="_csrf" value="${req.csrfToken}"><button class="btn btn-d">Stop series</button></form>` : ''}
+       ${series.status !== 'draft' && series.status !== 'live' ? '<p class="muted">This series is finished — no actions remain.</p>' : ''}`) +
     `<p><a class="btn" href="${base}">← Back to series list</a></p>`;
   res.send(ui.layout({ adminPath: req.adminPath, section: '/scratch', title: 'Scratch — ' + series.title, body, csrf: req.csrfToken, flash: req.flashData || {}, assetV: req.app.locals.assetV || '1', role: (req.user && req.user.admin_role) || 'super' }));
 });

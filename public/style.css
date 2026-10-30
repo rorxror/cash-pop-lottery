@@ -420,7 +420,7 @@ img, video, svg { max-width: 100%; }
 .field small { display: block; margin-top: var(--sp-1); font-size: var(--fs-xs); }
 .field input[type="text"], .field input[type="email"], .field input[type="password"],
 .field input[type="number"], .field input[type="tel"], .field select, .field textarea {
-  width: 100%; min-height: 44px;
+  width: 100%; min-height: 48px; /* DESIGN DEBATE (v23): the owner's Apple rule is 48px touch targets — this rule's higher specificity was silently holding form fields at 44px */
   font-family: var(--font); font-size: var(--fs-base); line-height: var(--lh-body); color: var(--white);
   background: var(--navy-800); border: 1px solid var(--line-dark); border-radius: var(--r-sm);
   padding: var(--sp-2) var(--sp-4);
@@ -753,7 +753,7 @@ input:focus, select:focus, textarea:focus {
   border-radius: 10px;
   background: transparent;
   font-weight: 600;
-  min-height: 40px;
+  min-height: 48px; /* DESIGN DEBATE (v23): the login method switcher is a primary control — 40px was below the 48px touch-target rule */
 }
 .segmented button.active, .segmented .seg.active {
   background: #fff;

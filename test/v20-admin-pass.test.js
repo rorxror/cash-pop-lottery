@@ -16,6 +16,9 @@
  *
  * Self-contained: boots server.js on port 3251 against a fresh
  * temp-dir SQLite file; cleans up its child + temp dir.
+ * v23 note: the boot env carries a throwaway CREDENTIAL_ENCRYPTION_KEY
+ * because H5-01 requires saved receiving details before a manual
+ * method can be enabled — the fixture now completes that owner flow.
  */
 'use strict';
 const { test, before, after } = require('node:test');
@@ -45,6 +48,7 @@ function boot() {
       ...process.env, SQLITE_PATH: DBF, PORT: String(PORT), BASE_URL: BASE,
       TICKET_HMAC_SECRET: 'v20-admin-pass-secret-0123456789abcdef',
       ADMIN_SEED_EMAIL: 'admin@v20t.test', ADMIN_SEED_PASSWORD: 'V20Test#admin1',
+      CREDENTIAL_ENCRYPTION_KEY: 'b7'.repeat(32),
       NODE_ENV: 'test',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -134,6 +138,14 @@ before(async () => {
     assert.strictEqual(r.status, 302, 'method create -> ' + r.status);
     methodId = (await q1("SELECT id FROM payment_methods WHERE name = 'V20T Bank'")).id;
     assert.ok(methodId, 'method row missing');
+    /* H5-01 (v23): creation held the method OFF (no receiving details
+       yet) — save real bank details on the Credentials page, then
+       enable via the toggle, exactly the owner's flow. */
+    const tokC = await csrfFor(admin, AP + '/methods/' + methodId + '/credentials');
+    await admin.post(AP + '/methods/' + methodId + '/credentials', { _csrf: tokC, bank_name: 'V20T Bank', account_name: 'V20 Owner', account_number: 'GB29NWBK60161331926819' });
+    const tokT = await csrfFor(admin, AP + '/methods');
+    await admin.post(AP + '/methods/' + methodId + '/toggle', { _csrf: tokT });
+    assert.strictEqual(Number((await q1('SELECT enabled FROM payment_methods WHERE id = ?', [methodId])).enabled), 1, 'method enabled once receiving details exist');
   }
   idA = Number((await q1("SELECT id FROM users WHERE email='playera@v20t.test'")).id);
   idB = Number((await q1("SELECT id FROM users WHERE email='playerb@v20t.test'")).id);

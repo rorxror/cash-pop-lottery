@@ -2,7 +2,7 @@
   <h1 class="sec-title">Provably Fair</h1>
   <div class="card">
     <div class="card-h"><h2>Verify a draw</h2></div>
-    <p class="muted">Every draw commits to its secret seed before it closes by publishing the seed's SHA-256 hash. After the draw the seed is revealed, so anyone can recompute the hash and the winning number.</p>
+    <p class="muted">Here is how you can check a draw yourself. Before a draw closes, we lock in a secret random seed and publish its fingerprint. The fingerprint cannot be worked backwards to reveal the seed, and it cannot be changed afterwards. When the draw is over we reveal the seed — so you can confirm the winning number really came from the seed we locked in before the draw, and that nobody picked the number afterwards. The technical details are listed below for anyone who wants to recompute everything exactly.</p>
     <form action="/fairness" method="GET" class="filters">
       <div class="field inline">
         <label for="draw_id">Draw ID</label>

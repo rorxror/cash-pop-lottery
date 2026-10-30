@@ -10,6 +10,7 @@ const assert = require('node:assert');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 
+process.env.CREDENTIAL_ENCRYPTION_KEY = 'c3'.repeat(32); // must match the spawned server's key; set before any lib require (the credentials module reads it at load)
 const PORT = 4143, BASE = `http://127.0.0.1:${PORT}`, ROOT = path.join(__dirname, '..');
 const AP = '/ops-7f3a9c-console';
 const DBP = `/tmp/cp-clarity-${process.pid}.sqlite`;
@@ -31,7 +32,7 @@ const admin = new Jar(), player = new Jar();
 before(async () => {
   const env = { ...process.env, PORT: String(PORT), BASE_URL: BASE, DB_DRIVER: 'sqlite', SQLITE_PATH: DBP,
     TICKET_HMAC_SECRET: 'clarity-test-' + 'x'.repeat(48),
-    CREDENTIAL_ENCRYPTION_KEY: 'c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3',
+    CREDENTIAL_ENCRYPTION_KEY: 'c3'.repeat(32),
     ADMIN_SEED_EMAIL: ADMIN_EMAIL, ADMIN_SEED_PASSWORD: ADMIN_PASSWORD, ADMIN_SEED_NAME: 'Clarity Admin' };
   delete env.DATABASE_URL; delete env.SMTP_HOST;
   server = spawn('node', ['server.js'], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -50,6 +51,12 @@ before(async () => {
   const m = await db.get("SELECT id FROM payment_methods WHERE slug = 'rail-bank_transfer'");
   assert.ok(m, 'seeded bank method'); bankId = m.id;
   await db.run('UPDATE payment_methods SET enabled = 1 WHERE id = ?', [bankId]);
+  /* H5-01 (v23): a manual method may not take deposits until receiving
+     details exist — this fixture saves real ones through the same
+     encrypted path the panel uses, exactly as the owner would. */
+  const { saveCredentialField } = require('../lib/credentials');
+  for (const [k, v] of Object.entries({ bank_name: 'Clarity Bank', account_name: 'Clarity Owner', account_number: 'GB29NWBK60161331926819' }))
+    await saveCredentialField(db, bankId, k, v);
 });
 after(() => { if (server) server.kill(); });
 

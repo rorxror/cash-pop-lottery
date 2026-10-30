@@ -11,7 +11,7 @@
       <article class="scratch-card type-<%= s.game_type %>">
         <div class="scratch-card-top"><span class="eyebrow"><%= s.game_type %></span><span class="status-dot">Live</span></div>
         <h2><%= s.title %></h2>
-        <div class="scratch-metrics"><div><small>Price</small><strong><%= fmt(s.price,s.currency) %></strong></div><div><small>Top prize</small><strong><%= fmt(s.top_prize || 0,s.currency) %></strong></div><div><small>RTP</small><strong><%= rtp.toFixed(2) %>%</strong></div><div><small>Remaining</small><strong><%= s.remaining %></strong></div></div>
+        <div class="scratch-metrics"><div><small>Price</small><strong><%= fmt(s.price,s.currency) %></strong></div><div><small>Top prize</small><strong><%= fmt(s.top_prize || 0,s.currency) %></strong></div><div><small>Remaining</small><strong><%= s.remaining %></strong></div></div>
         <a class="btn btn-p btn-block" href="/scratch/<%= s.slug %>">View card</a>
       </article>
       <% }) %>

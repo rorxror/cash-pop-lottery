@@ -14,7 +14,7 @@
       <% (messages || []).forEach(function(m){ %>
       <div class="msg <%= m.mine ? 'mine' : '' %>">
         <div class="msg-head">
-          <strong><%= m.mine ? 'You' : m.author_role %></strong>
+          <strong><%= m.mine ? 'You' : (m.author_role === 'player' ? 'Player' : 'Support team') %></strong>
           <small class="muted"><%= new Date(m.created_at).toLocaleString() %></small>
         </div>
         <div class="msg-body"><%= m.body %></div>

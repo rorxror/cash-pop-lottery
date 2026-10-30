@@ -206,7 +206,11 @@ router.post('/transfer', async (req, res) => {
     await req.setFlash('success', 'Transfer completed.');
   } catch (e) {
     if (/UNIQUE|duplicate/i.test(e.message)) await req.setFlash('error', 'This transfer was already submitted — check the transfer history.');
-    else await req.setFlash('error', 'Transfer failed: ' + e.message);
+    /* H1-21 (v23): deliberate BUSINESS errors (insufficient float) are
+       shown verbatim — the agent needs the true reason; anything else
+       is an internal error and is logged server-side, never flashed. */
+    else if (/^Insufficient (float )?balance/.test(e.message)) await req.setFlash('error', e.message);
+    else { console.error('[agent transfer] failed:', e && e.message); await req.setFlash('error', 'Transfer failed. Please try again — if it keeps failing, contact the operator.'); }
   }
   res.redirect('/agent/transfer');
 });

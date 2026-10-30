@@ -25,9 +25,9 @@
       <% /* STEP 1 */ %>
       <div class="pstep">
         <div class="pstep-banner"><span class="pstep-num">1</span><span>Pick your pops</span></div>
-        <p class="pstep-sub">Play just 1 or up to 15 numbers (pops). The more numbers you play, the better your odds of winning!</p>
+        <p class="pstep-sub">Play just 1 or up to <%= maxPops %> numbers (pops). The more numbers you play, the better your odds of winning!</p>
         <div class="balls" id="ballBox">
-          <% for (let i=1; i<=15; i++) { %>
+          <% for (let i=1; i<=maxPops; i++) { %>
           <label class="ball-wrap"><input type="checkbox" name="pops" value="<%= i %>" class="ball-input"><span class="ball"><%= i %></span></label>
           <% } %>
         </div>

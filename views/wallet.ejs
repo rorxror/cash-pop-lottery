@@ -15,6 +15,14 @@
     <% } %>
   </div>
   <% } %>
+  <% if (typeof wagering !== 'undefined' && wagering && wagering.length) { %>
+  <div class="card mt" role="status">
+    <div class="card-h"><h2>Bonus wagering</h2></div>
+    <% wagering.forEach(function(wg){ %>
+    <p class="muted">You have a bonus in <%= wg.currency %> with <strong><%= fmt(wg.unmet, wg.currency) %></strong> of wagering left. Withdrawals from this currency open up as you play through it — every ticket and scratch card you buy counts towards it.</p>
+    <% }) %>
+  </div>
+  <% } %>
   <h2 class="sec-title">Balances</h2>
   <div class="cur-rows">
     <% (typeof wallets !== 'undefined' ? wallets : []).forEach(function(w){

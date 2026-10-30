@@ -34,6 +34,23 @@ router.get('/api/stats', async (req, res) => {
   });
 });
 
+/* H5-13 (v23): server-rendered countdown text in the exact format
+   public/app.js ticks ("Dd HH:MM:SS" / "Closing..."). Before, the
+   server sent the literal placeholder "-d --:--:--" and only the
+   client script replaced it — a no-JS or slow-JS visitor saw a broken
+   clock on the homepage hero. */
+function countdownText(closeAt) {
+  const ms = Number(closeAt) - Date.now();
+  if (!Number.isFinite(ms)) return '--:--:--';
+  if (ms <= 0) return 'Closing...';
+  let s = Math.floor(ms / 1000);
+  const d = Math.floor(s / 86400); s -= d * 86400;
+  const h = Math.floor(s / 3600); s -= h * 3600;
+  const m = Math.floor(s / 60); s -= m * 60;
+  const pad = (n) => (n < 10 ? '0' : '') + n;
+  return d + 'd ' + pad(h) + ':' + pad(m) + ':' + pad(s);
+}
+
 router.get('/', async (req, res) => {
   /* U-03 (v20): complete Day+Evening pairs, in chronological order.
      The old single query (ORDER BY close_at LIMIT 4) knew nothing
@@ -46,8 +63,12 @@ router.get('/', async (req, res) => {
      exist; when generation leaves a type missing (per-type AUTO
      switch off, past close skipped) only the real rows render — no
      card is invented to fill a pair. */
+  /* H1-07 (v23): only draws still open for purchase are shown — the
+     old query had no close_at filter, so a draw past its close (not yet
+     settled by the cron) displayed as upcoming with a "Closing..." clock
+     while the playslip (close_at > now) had already moved past it. */
   const drawsByType = await Promise.all(['DAY', 'EVE'].map(type => req.db.query(
-    "SELECT * FROM draws WHERE status = 'scheduled' AND draw_type = ? ORDER BY close_at ASC LIMIT 2", [type]
+    "SELECT * FROM draws WHERE status = 'scheduled' AND draw_type = ? AND close_at > ? ORDER BY close_at ASC LIMIT 2", [type, Date.now()]
   )));
   const draws = drawsByType.flat()
     .sort((a, b) => (Number(a.close_at) - Number(b.close_at))
@@ -80,10 +101,10 @@ router.get('/', async (req, res) => {
   const recentWins = await req.db.query(
     "SELECT t.amount, t.currency, t.created_at, u.name FROM transactions t JOIN users u ON u.id = t.user_id WHERE t.type IN ('win','scratch_prize') ORDER BY t.created_at DESC LIMIT 12"
   );
-  const nextDraw = draws.length ? draws[0] : null;
+  const nextDraw = draws.length ? { ...draws[0], countdownText: countdownText(draws[0].close_at) } : null;
   res.render('index', {
     metaTitle: 'Home', metaDesc: 'Play Cash Pop lottery — provably fair draws, instant wins.',
-    draws: draws.map(d => ({ ...d, label: d.draw_type === 'DAY' ? 'Day Draw' : 'Evening Draw' })),
+    draws: draws.map(d => ({ ...d, label: d.draw_type === 'DAY' ? 'Day Draw' : 'Evening Draw', countdownText: countdownText(d.close_at) })),
     recentResults, recentWins, nextDraw, scratchSeries,
     /* SCAN fix (A-04): the total is a BASE-currency sum — format it in
        the base currency (as /api/stats does), not the visitor's display
@@ -126,6 +147,18 @@ router.get('/fairness', async (req, res) => {
   let result = null;
   const drawId = parseInt(req.query.draw_id, 10);
   if (drawId) {
+    /* H1-02 (v23): TEST draws are operator artefacts (their numbers are
+       operator-set, not random) — on this PUBLIC surface they are
+       not-found, exactly the DS-075 rule every other public surface
+       already applies. Before this, anyone could enumerate them by
+       sequential draw_id and read a page implying a rigged draw was a
+       real one. */
+    /* A settled TEST draw verifies here WITH its TEST badge (verify.ejs)
+       — the deliberate D4-C3 design: test draws are not listed publicly
+       (the results queries exclude them) but a direct lookup is honestly
+       labelled, never hidden and never dressed as real. The v23 hunt's
+       H1-02 hid them entirely; the adversarial phase reversed that —
+       hiding would also 404 the operator's own test-draw checks. */
     const d = await req.db.get('SELECT * FROM draws WHERE id = ?', [drawId]);
     // Settled-only verification (see fairnessForDraw): an unsettled draw's
     // seed is committed but unrevealed, so no number/verdict is shown at all.
@@ -151,7 +184,10 @@ router.post('/currency', async (req, res) => {
 
 router.get('/sitemap.xml', async (req, res) => {
   const pages = await req.db.query("SELECT slug FROM pages WHERE status = 'published'");
-  const base = (process.env.BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
+  /* H5-10 (v23): without BASE_URL these PUBLIC urls fall back to the
+     address the request actually arrived on — never a hardcoded
+     localhost, which is what search engines were being told. */
+  const base = (process.env.BASE_URL || (req.protocol + '://' + req.get('host'))).replace(/\/$/, '');
   const urls = ['', '/play', '/results', '/fairness', ...pages.map(p => '/page/' + p.slug)];
   res.type('application/xml').send(
     `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">` +
@@ -159,7 +195,7 @@ router.get('/sitemap.xml', async (req, res) => {
 });
 
 router.get('/robots.txt', (req, res) => {
-  const base = (process.env.BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
+  const base = (process.env.BASE_URL || (req.protocol + '://' + req.get('host'))).replace(/\/$/, '');
   res.type('text/plain').send(`User-agent: *\nAllow: /\nSitemap: ${base}/sitemap.xml\n`);
 });
 
@@ -181,7 +217,13 @@ async function contactAnonSession(req, res) {
 }
 router.get('/contact', async (req, res) => {
   await contactAnonSession(req, res);
-  res.render('contact', { metaTitle: 'Contact us', metaDesc: 'Get in touch with the Cash Pop team.' });
+  /* H5-12 (v23): the page promises a reply BY EMAIL — only true when
+     email delivery is actually configured. Otherwise the honest text
+     says replies need an account ticket instead of promising an email
+     that can never be sent. */
+  let emailOn = false;
+  try { emailOn = require('../lib/delivery').emailConfigured(await require('../lib/delivery').resolveDelivery(req.db)); } catch {}
+  res.render('contact', { metaTitle: 'Contact us', metaDesc: 'Get in touch with the Cash Pop team.', emailOn });
 });
 router.post('/contact', rateLimit({ windowMs: 60000, max: 5, keyFn: req => `contact:${req.ip}` }), async (req, res) => {
   const { validEmail, now: nowMs } = require('../lib/util');

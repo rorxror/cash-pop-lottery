@@ -67,7 +67,7 @@ curl http://localhost:3000/healthz     # {"ok":true,...}
 
 ## 5. Configure a payment method
 
-In the console: **Payments → Payment methods**. The 13 seeded rails ship
+In the console: **Payments → Payment methods**. The 14 seeded rails ship
 disabled. Pick one (e.g. **Bank Transfer**), enable it, set its
 min/max amounts, and fill its **receiving details** (where players send
 money — e.g. your bank account for Bank Transfer, or a wallet address

@@ -140,7 +140,7 @@ test('USER-PASS-SET-01: unforced set signs in directly; mismatch changes nothing
   assert.equal(adm.status, 404, 'admin targets stay excluded from the generic handler (no A-1 style takeover)');
 });
 
-test('ADMIN-SELF-01: name, email (proof + duplicate + immediate path), password (other sessions die, current lives)', { timeout: 60000 }, async () => {
+test('ADMIN-SELF-01: name, email (proof + duplicate + OTP-D4 verify path), password (other sessions die, current lives)', { timeout: 60000 }, async () => {
   const page = await adminJar.text(ADMIN_PATH + '/my-account');
   assert.equal(page.status, 200, 'My Account renders inside the panel');
   assert.ok(page.body.includes('Display name') && page.body.includes('Login email') && page.body.includes('free hosting plan'), 'all three sections + the honest hosting note');
@@ -192,13 +192,24 @@ test('ADMIN-SELF-01: name, email (proof + duplicate + immediate path), password 
   assert.equal(ln.status, 302); assert.ok(ln.loc.includes(ADMIN_PATH), 'new password reaches the panel');
   assert.ok(await dbA.get("SELECT id FROM audit_log WHERE action = 'admin.self_password' AND entity_id = ?", [String(adminId)]), 'password change audited');
 
-  // email change with the NEW password (immediate path — no SMTP in the test env)
+  // email change with the NEW password — OTP-D4 (v23) contract: with NO
+  // SMTP in the test env the delivery fails, so the change must NOT
+  // apply immediately (the old immediate-apply path let an UNVERIFIED
+  // address become the login). The pending verification is kept and
+  // the link is surfaced to the admin himself; clicking it completes
+  // the change.
   const page3 = await adminJar.text(ADMIN_PATH + '/my-account');
   post = await adminJar.text(ADMIN_PATH + '/my-account/email', { method: 'POST', body: { _csrf: csrfOf(page3.body), new_email: 'boss@acct.test', current_password: 'NewBoss#pass12' } });
   assert.equal(post.status, 302);
-  assert.equal((await dbA.get('SELECT email FROM users WHERE id = ?', [adminId])).email, 'boss@acct.test', 'email changed (immediate, email not configured)');
+  assert.equal((await dbA.get('SELECT email FROM users WHERE id = ?', [adminId])).email, 'admin@acct.test', 'email NOT changed while delivery is impossible (OTP-D4)');
   const after = await adminJar.text(ADMIN_PATH + '/my-account');
-  assert.ok(after.body.includes('applied straight away') || after.body.includes('boss@acct.test'), 'page/flash states the change plainly');
+  assert.ok(after.body.includes('could not be sent'), 'flash states the delivery failure plainly');
+  const linkM = after.body.match(/\/verify-email\/([a-f0-9]{48})/);
+  assert.ok(linkM, 'pending verification link surfaced to the account owner');
+  assert.ok(await dbA.get("SELECT id FROM email_verifications WHERE user_id = ? AND new_email = 'boss@acct.test' AND used = 0", [adminId]), 'pending verification kept');
+  const click = await adminJar.text('/verify-email/' + linkM[1]);
+  assert.ok(click.status === 200 || click.status === 302, 'verification link consumes');
+  assert.equal((await dbA.get('SELECT email FROM users WHERE id = ?', [adminId])).email, 'boss@acct.test', 'email changed only after the link was clicked');
   const oldMail = new Jar('acct-oldmail');
   const lom = await loginAs(oldMail, 'admin@acct.test', 'NewBoss#pass12');
   assert.ok(!(lom.status === 302 && lom.loc.includes(ADMIN_PATH)), 'old login email no longer works');

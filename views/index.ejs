@@ -34,8 +34,8 @@
             real DB aggregates from routes/site.js. */ %>
       <div class="v20-stats-row">
         <div class="v20-stat-card"><span class="v20-stat-deco" aria-hidden="true"></span><span class="v20-stat-value live-count" data-count="<%= stats.players %>" data-mode="<%= stats.mode %>"><%= stats.players %></span><span class="v20-stat-label"><%= stats.players === 1 ? "Player" : "Players" %></span></div>
-        <div class="v20-stat-card"><span class="v20-stat-deco" aria-hidden="true"></span><span class="v20-stat-value live-count" data-count="<%= stats.tickets_today %>" data-mode="<%= stats.mode %>"><%= stats.tickets_today %></span><span class="v20-stat-label">Tickets in the last 24 hours</span></div>
-        <div class="v20-stat-card"><span class="v20-stat-deco" aria-hidden="true"></span><span class="v20-stat-value live-count" data-count="<%= stats.paid_out %>" data-mode="<%= stats.mode %>" data-money="1" data-symbol="<%= paidBase.symbol %>" data-decimals="<%= paidBase.dec %>"><%= stats.paid_out_fmt %></span><span class="v20-stat-label">Paid out</span></div>
+        <div class="v20-stat-card"><span class="v20-stat-deco" aria-hidden="true"></span><span class="v20-stat-value live-count" data-count="<%= stats.tickets_today %>" data-mode="<%= stats.mode %>"><%= stats.tickets_today %></span><span class="v20-stat-label">Lottery tickets in the last 24 hours</span></div>
+        <div class="v20-stat-card"><span class="v20-stat-deco" aria-hidden="true"></span><span class="v20-stat-value live-count" data-count="<%= stats.paid_out %>" data-mode="<%= stats.mode %>" data-money="1" data-symbol="<%= paidBase.symbol %>" data-decimals="<%= paidBase.dec %>"><%= stats.paid_out_fmt %></span><span class="v20-stat-label">Winnings credited</span></div>
       </div>
     </div>
     <div class="hero-teaser">
@@ -64,7 +64,7 @@
       <span class="draw-banner-sub">Entries close when the timer hits zero</span>
     </div>
     <div class="draw-banner-timer">
-      <div class="countdown countdown-lg" data-close-at="<%= nextDraw.close_at %>">-d --:--:--</div>
+      <div class="countdown countdown-lg" data-close-at="<%= nextDraw.close_at %>"><%= nextDraw.countdownText || '--:--:--' %></div>
       <a href="/play" class="btn btn-p btn-lg">Enter Now</a>
     </div>
   </div>
@@ -112,7 +112,7 @@
       <span class="v20-draw-ball" aria-hidden="true"><%= d.draw_type === 'DAY' ? '☀' : '☾' %></span>
       <div class="draw-type"><%= d.label %></div>
       <div class="muted"><%= d.draw_date %></div>
-      <div class="countdown v20-draw-countdown" data-close-at="<%= d.close_at %>">-d --:--:--</div>
+      <div class="countdown v20-draw-countdown" data-close-at="<%= d.close_at %>"><%= d.countdownText || '--:--:--' %></div>
       <div class="draw-hash muted">Seed hash: <span class="code"><%= d.seed_hash ? d.seed_hash.slice(0,16) + '...' : 'pending' %></span></div>
       <a href="/play" class="btn btn-p btn-sm btn-block v20-draw-enter">Enter</a>
     </article>

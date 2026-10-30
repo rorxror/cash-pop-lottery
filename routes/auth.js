@@ -3,7 +3,7 @@
    logout, password reset, Google OAuth, custom captcha + reCAPTCHA hooks. */
 const express = require('express');
 const router = express.Router();
-const { validEmail, hashPassword, verifyPassword, sha256, randHex, now, strongPassword, normalizeEmail, normalizePhone } = require('../lib/util');
+const { validEmail, hashPassword, verifyPassword, sha256, randHex, now, strongPassword, normalizeEmail, normalizePhone, emailedLinkBase } = require('../lib/util');
 const { getS, getBool, getCurrencies } = require('../lib/settings');
 const { createSession, getSession, destroySession, rateLimit, verifyTotp, useBackupCode, parseUA, csrfToken, touchSession, ANON_TTL, PREAUTH_TTL, scopeForRole, cookieForScope, setSessionCookie, ADMIN_COOKIE } = require('../lib/auth');
 const { getExtension, extEnabled } = require('../lib/extensions');
@@ -545,11 +545,16 @@ router.post('/forgot', rateLimit({ windowMs: 3600000, max: 10, keyFn: r => 'forg
     /* SCAN fix (A-09): same host fallback as the verify-email flow —
        without BASE_URL the old link was a bare relative path and the
        reset email was unusable. */
-    const link = baseUrl(req) + '/reset/' + token;
+    /* H3-02 (v23): the emailed link's base is BASE_URL in production —
+       never the request Host (see emailedLinkBase). Without a base the
+       send is skipped and the token burns below, exactly like any other
+       undelivered reset. */
+    const linkBase = emailedLinkBase(req);
+    const link = linkBase ? linkBase + '/reset/' + token : null;
     /* AUTH-CHANNELS-01: the page stays the generic anti-enumeration text,
        but an UNDELIVERED reset token must not stay live — burn it when the
        send did not actually go out. */
-    const resetSend = await notify.send(req.db, req.settings, 'email', 'password_reset', email, { name: u.name, link }).catch(() => ({ status: 'failed' }));
+    const resetSend = link ? await notify.send(req.db, req.settings, 'email', 'password_reset', email, { name: u.name, link }).catch(() => ({ status: 'failed' })) : { status: 'failed' };
     if (!resetSend || resetSend.status !== 'sent')
       await req.db.run('UPDATE password_resets SET used = 1 WHERE token_hash = ?', [sha256('reset:' + token)]);
   }
@@ -608,8 +613,10 @@ router.get('/verify-email/:token', async (req, res) => {
   // R-014 (consume half): consuming one verification burns all other
   // pending rows for this user, so a stale token cannot swap back later.
   await req.db.run('UPDATE email_verifications SET used = 1 WHERE user_id = ? AND used = 0 AND id != ?', [row.user_id, row.id]);
+  const uBefore = await req.db.get('SELECT email FROM users WHERE id = ?', [row.user_id]);
+  const isChange = !!(uBefore && uBefore.email && uBefore.email !== row.new_email);
   await req.db.run('UPDATE users SET email = ?, email_verified = 1 WHERE id = ?', [row.new_email, row.user_id]);
-  await audit.log(req.db, { actorId: row.user_id, actorRole: 'player', action: 'user.email_verified', entity: 'user', entityId: row.user_id, detail: { via: 'link' }, ip: req.ip });
+  await audit.log(req.db, { actorId: row.user_id, actorRole: 'player', action: isChange ? 'user.email_changed' : 'user.email_verified', entity: 'user', entityId: row.user_id, detail: { via: 'link' }, ip: req.ip });
   try { await req.setFlash('success', 'Email verified. You can now deposit and withdraw.'); } catch {}
   res.redirect('/login');
 });
@@ -647,7 +654,7 @@ router.post('/login/otp/request', loginLimiter, async (req, res) => {
   } catch (e) {
     return res.status(429).json({ ok: false, error: e.message });
   }
-  const result = await otpLib.sendOtp(req.db, req.settings, identifier, idType, code);
+  const result = await otpLib.sendOtp(req.db, req.settings, identifier, idType, code, 'login');
   await audit.log(req.db, { actorId: 0, actorRole: 'anon', action: 'otp.requested', entity: 'otp', entityId: '', detail: { idType, sent: result.sent }, ip: req.ip });
   // NEVER return the code: if no provider sent it, the user must see an
   // error, not a code that logs them in (previous demo-mode takeover hole).

@@ -19,8 +19,14 @@ dependencies only (no native modules), SQLite built in, MySQL optional.
    final setup.
 3. Set the environment variables from `.env.example` — at minimum
    `TICKET_HMAC_SECRET` (long random string; the app refuses to boot
-   without it in ANY environment) and `CREDENTIAL_ENCRYPTION_KEY`
-   (64 hex chars; credential saves are REFUSED without it).
+   without it in ANY environment), `CREDENTIAL_ENCRYPTION_KEY`
+   (64 hex chars; credential saves are REFUSED without it),
+   `ADMIN_SEED_EMAIL` + `ADMIN_SEED_PASSWORD` (your first admin
+   account, seeded on a fresh database only) and `BASE_URL`
+   (REQUIRED in production: password-reset and email-verification
+   links are built from it and are NOT sent at all while it is unset —
+   the app never falls back to a request's Host header for emailed
+   links).
 4. Set `ADMIN_PATH` to a random path (e.g. `/ops-9f2c1a-console`);
    the admin panel has no public link and non-admin requests to admin
    paths get a plain 404.
@@ -122,7 +128,12 @@ Create the empty database first; tables migrate automatically on boot.
 ## First-run checklist (in the admin panel)
 
 - Settings → Game economy: wager options, prize multipliers, draw times,
-  commission rate, deposit/withdrawal modes and limits.
+  commission rate and limits. (Deposit/withdrawal review is manual —
+  there is no global auto-approval mode; per-method Auto Pay is set on
+  each method's own page.)
+- Scratch: a "Gold Rush" scratch series ships SEEDED LIVE as a real,
+  sellable product (not demo data). Review it under Scratch before
+  launch — stop or disable it there if you do not want it selling.
 - Settings → Currencies: supported currencies + conversion rates.
 - Payment Methods: enable the rails you'll use; open each method's
   **Credentials** page and paste provider keys.

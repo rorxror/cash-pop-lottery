@@ -17,7 +17,7 @@
       <div class="field">
         <label>Email</label>
         <input type="email" value="<%= user.email %>" disabled readonly>
-        <small class="muted">Email cannot be changed here &mdash; contact support.</small>
+        <small class="muted">To change it, use the <strong>Change email</strong> section below — we email a confirmation link to the new address first.</small>
       </div>
       <div class="field">
         <label for="phone">Phone</label>
@@ -51,6 +51,21 @@
             <button class="btn btn-p" type="submit">Confirm phone</button>
           </form>
           <% } %>
+        </div>
+      </details>
+      <details class="v20-accordion-item">
+        <summary class="v20-accordion-summary"><span>Change email <span class="muted sm">&middot; currently <%= user.email %></span></span><span class="v20-accordion-chevron" aria-hidden="true">&#9662;</span></summary>
+        <div class="v20-accordion-body">
+          <% if (typeof pendingEmailChange !== 'undefined' && pendingEmailChange) { %>
+          <p class="muted"><strong>Confirmation pending:</strong> we sent a link to <strong><%= pendingEmailChange %></strong>. Your email changes only when that link is clicked. Sending the form again replaces the pending link.</p>
+          <% } %>
+          <p class="muted">Enter the new email and your current password. We send a confirmation link to the <strong>new</strong> address — your email changes only when that link is clicked, and your current email keeps working until then.</p>
+          <form method="POST" action="/profile/change-email">
+            <input type="hidden" name="_csrf" value="<%= csrf %>">
+            <div class="field"><label for="newEmail">New email</label><input type="email" id="newEmail" name="new_email" required autocomplete="email"></div>
+            <div class="field"><label for="curPwEmail">Current password</label><input type="password" id="curPwEmail" name="current_password" required autocomplete="current-password"></div>
+            <button class="btn btn-p" type="submit">Send confirmation link</button>
+          </form>
         </div>
       </details>
       <% if (typeof kycCard !== 'undefined' && kycCard) { %>
@@ -87,7 +102,14 @@
       <details class="v20-accordion-item">
         <summary class="v20-accordion-summary"><span>&#128279; Your referral link <span class="muted sm">&middot; Code <%= user.referral_code %></span></span><span class="v20-accordion-chevron" aria-hidden="true">&#9662;</span></summary>
         <div class="v20-accordion-body">
+          <% if (typeof referralOn !== 'undefined' && referralOn) { %>
           <p class="muted sm">Share this link — when friends register with it and play, you earn referral commission on their ticket purchases.</p>
+          <% } else { %>
+          <% /* H1-06 (v23): the rewards program is OFF — the link itself is
+               the player's to keep and share, but the page must not promise
+               earnings the current configuration will not pay. */ %>
+          <p class="muted sm">Your personal referral link — friends who register with it are recorded as your referrals. The referral rewards program is currently off, so sign-ups through this link do not earn commission right now.</p>
+          <% } %>
           <% /* U-16: full absolute URL (referralUrl local) in a read-only
                 input + Copy button (data-copy-target handled in app.js). */ %>
           <div class="field">
@@ -95,7 +117,7 @@
             <input type="text" id="refLink" readonly value="<%= (typeof referralUrl !== 'undefined' && referralUrl) ? referralUrl : ((typeof baseUrl !== 'undefined' && baseUrl ? baseUrl : '') + '/register?ref=' + user.referral_code) %>">
           </div>
           <p><button type="button" class="btn btn-sm" data-copy-target="refLink">Copy</button></p>
-          <% if (typeof refSummary !== 'undefined' && refSummary && refSummary.length) { %>
+          <% if (typeof referralOn !== 'undefined' && referralOn && typeof refSummary !== 'undefined' && refSummary && refSummary.length) { %>
           <p class="muted sm"><strong>Your referral earnings</strong></p>
           <% refSummary.forEach(function(r){ %>
           <p class="muted sm"><%= r.currency %>: pending <%= fmt(r.pending, r.currency) %> &middot; released <%= fmt(r.released, r.currency) %><% if (r.capped > 0) { %> &middot; capped <%= fmt(r.capped, r.currency) %><% } %></p>

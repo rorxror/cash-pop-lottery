@@ -4,7 +4,7 @@
 const express = require('express');
 const router = express.Router();
 const QRCode = require('qrcode');
-const { now, randHex, hmac, sha256, hashPassword, verifyPassword, toMinor, decimalsFor, esc, signTicket, normalizePhone, fmtMoney, convertMinor } = require('../lib/util');
+const { now, randHex, hmac, sha256, hashPassword, verifyPassword, toMinor, decimalsFor, esc, signTicket, normalizePhone, fmtMoney, convertMinor, normalizeEmail, validEmail, emailedLinkBase } = require('../lib/util');
 const { getS, getBool, getCurrencies, getSettings } = require('../lib/settings');
 const { requireLogin, rateLimit } = require('../lib/auth');
 const { getBalances, postLedger, depositPolicy, withdrawalPolicy, chargeFor, createDeposit, createWithdrawal, checkWithdrawalRules, notePayoutDetails, notePendingPayoutChange, promotePayoutDetails, releaseReferralCredits, maybeAutoApproveWithdrawal, exchangeCurrency, exchangeQuote } = require('../lib/money');
@@ -12,7 +12,7 @@ const kycLib = require('../lib/kyc');
 const uploadLib = require('../lib/upload');
 const { getRail, getReceivingDetails, validateUserProof } = require('../lib/rails');
 const railByKey = getRail;
-const { newTotpSecret, totpUri, verifyTotp, verifyTotpStep, newBackupCodes, hashBackupCodes, useBackupCode, destroyUserSessions, parseUA } = require('../lib/auth');
+const { newTotpSecret, totpUri, verifyTotp, verifyTotpStep, wrapTotpSecret, newBackupCodes, hashBackupCodes, useBackupCode, destroyUserSessions, parseUA } = require('../lib/auth');
 const notify = require('../lib/notify');
 const audit = require('../lib/audit');
 
@@ -73,6 +73,12 @@ async function playViewModel(req, forceCurrency) {
   return {
     wagerOptions, prizeTable, maxDraws: parseInt(getS(req.settings, 'max_draws', '7'), 10) || 7, balance: bal,
     wallets, playCurrency: sel,
+    /* H1-17 (v23): the playslip renders the CONFIGURED max pops — the
+       buy handler enforces settings max_pops, but the page hardcoded
+       15 balls and "up to 15 numbers", so a lowered cap left the page
+       offering picks the buy would reject. Clamped to the prize
+       table's extent: the table defines the sellable game. */
+    maxPops: Math.min(parseInt(getS(req.settings, 'max_pops', '15'), 10) || 15, prizeTable.length || 15),
   };
 }
 /* U-02: a failed buy re-renders the playslip (HTTP 400, the standing
@@ -380,7 +386,19 @@ async function walletPage(req, res) {
     } catch { totalApprox = null; }
   }
   const exchangeFeePercent = parseFloat(getS(req.settings, 'exchange_fee_percent', '0')) || 0;
-  res.render('wallet', { metaTitle: 'Wallet', metaDesc: 'Your balances, deposits and withdrawals.', wallets, depositMethods, withdrawMethods, pending, requests, kycNotice, totalApprox, myCur: req.cur, baseCur: baseCurrency(req), exchangeFeePercent, exchangePreview: req.__exchangePreview || null });
+  /* H1-10 (v23): bonus wagering progress is VISIBLE to the player whose
+     withdrawals it gates. Before, unmetWagering existed only inside the
+     withdrawal refusal — the player learned about the requirement from
+     a rejection. Now the wallet states it plainly per currency. */
+  const wagering = [];
+  try {
+    const bonusLib = require('../lib/bonus');
+    for (const w of wallets) {
+      const unmet = await bonusLib.unmetWagering(req.db, req.user.id, w.currency);
+      if (unmet > 0) wagering.push({ currency: w.currency, unmet });
+    }
+  } catch {}
+  res.render('wallet', { metaTitle: 'Wallet', metaDesc: 'Your balances, deposits and withdrawals.', wallets, depositMethods, withdrawMethods, pending, requests, kycNotice, totalApprox, myCur: req.cur, baseCur: baseCurrency(req), exchangeFeePercent, exchangePreview: req.__exchangePreview || null, wagering });
 }
 router.get('/wallet', requireLogin, walletPage);
 
@@ -459,7 +477,14 @@ router.get('/deposit/new', requireLogin, async (req, res) => {
      the AUTO text on an Auto Pay method and the manual steps on a
      Manual Pay method — never mixed. */
   const railDef = railByKey(method.rail);
-  const shownInstruction = method.processing_mode === 'auto'
+  /* H5-01 (v23): a manual method with no receiving details must not
+     print pay-to instructions pointing at an empty destination. */
+  const { RECEIVING_FIELDS: RF2 } = require('../lib/rails');
+  const manualNoDestination = (method.processing_mode || 'manual') !== 'auto'
+    && (RF2[method.rail] || []).length > 0 && !Object.keys(receiving || {}).length;
+  const shownInstruction = manualNoDestination
+    ? 'This method is not ready yet — no payment destination has been set for it. Please pick another method.'
+    : method.processing_mode === 'auto'
     ? (railDef && railDef.autoInstruction) || 'Once the payment provider confirms your payment, your balance is credited automatically.'
     : method.instruction;
   res.render('deposit_new', {
@@ -489,7 +514,7 @@ async function tryPaypalAutoVerify(req, method, depositId, txid) {
       await audit.log(req.db, { actorId: req.user.id, actorRole: 'player', action: 'deposit.auto_verify_refused', entity: 'deposit', entityId: dep.public_id, detail: { provider: 'paypal', reason: 'transaction already used by another deposit' }, ip: req.ip });
       return 'unconfirmed';
     }
-    const got = await paypal.getCapture(creds, txid);
+    const got = await paypal.getCapture(creds, txid, { decimals: decimalsFor(dep.currency, getCurrencies(req.settings)) });
     if (!got.ok) {
       await audit.log(req.db, { actorId: null, actorRole: 'webhook', action: 'deposit.auto_verify_unconfirmed', entity: 'deposit', entityId: dep.public_id, detail: { provider: 'paypal', reason: got.reason }, ip: req.ip });
       return 'unconfirmed';
@@ -521,7 +546,7 @@ async function trySkrillRecordedEvent(req, method, depositId, txid) {
       if (String(f.merchant_id || '') !== String(creds.merchant_id)) continue;
       const dep = await req.db.get('SELECT * FROM deposits WHERE id = ?', [depositId]);
       if (!dep || dep.status !== 'pending') return 'none';
-      const amtOk = Math.round(Number(f.mb_amount) * 100) === Number(dep.amount);
+      const amtOk = Math.round(Number(f.mb_amount) * (10 ** decimalsFor(dep.currency, getCurrencies(req.settings)))) === Number(dep.amount);
       const curOk = String(f.mb_currency || '').toUpperCase() === String(dep.currency).toUpperCase();
       if (!amtOk || !curOk) {
         await audit.log(req.db, { actorId: null, actorRole: 'webhook', action: 'deposit.auto_verify_unconfirmed', entity: 'deposit', entityId: dep.public_id, detail: { provider: 'skrill', reason: amtOk ? 'currency mismatch' : 'amount mismatch' }, ip: req.ip });
@@ -557,6 +582,17 @@ router.post('/deposit/new', requireLogin, rateLimit({ windowMs: 60000, max: 10, 
   if (!methodId) return backToForm('Invalid deposit method.');
   const method = await req.db.get("SELECT * FROM payment_methods WHERE id = ? AND enabled = 1 AND kind IN ('deposit','both')", [methodId]);
   if (!method) return backToForm('That deposit method is not available. Pick another method.', methodId);
+  /* H5-01 (v23): a MANUAL method with no receiving details has nowhere
+     for the player to pay — refuse the deposit honestly instead of
+     recording a request against an empty destination. (The admin
+     enable-toggle now prevents this state; this is the second door.) */
+  if ((method.processing_mode || 'manual') !== 'auto') {
+    const { RECEIVING_FIELDS } = require('../lib/rails');
+    if ((RECEIVING_FIELDS[method.rail] || []).length) {
+      const receiving = await getReceivingDetails(req.db, method);
+      if (!Object.keys(receiving || {}).length) return backToForm('This deposit method is not ready yet — there is no payment destination set for it. Please pick another method.', methodId);
+    }
+  }
   const amount = toMinor(req.body.amount, decimalsFor(method.currency, getCurrencies(req.settings)));
   if (amount === null || amount <= 0) return backToForm('Enter a valid amount.', methodId);
   if (method.min_amount && amount < method.min_amount) return backToForm(`Amount is below the minimum for this method (${req.fmt(method.min_amount, method.currency)}).`, methodId);
@@ -709,7 +745,7 @@ router.post('/withdraw/new', requireLogin, rateLimit({ windowMs: 60000, max: 10,
     } catch (e) {
       return backToForm(e.message, methodId);
     }
-    const sent = await otpLib.sendOtp(req.db, req.settings, identifier, channel, code);
+    const sent = await otpLib.sendOtp(req.db, req.settings, identifier, channel, code, 'withdrawal');
     // Fail closed: if the code could not be delivered, do NOT park the user
     // on a verify screen for a code that will never arrive.
     if (!sent.sent) { await otpLib.expireLiveOtps(req.db, identifier, channel); return backToForm('Could not send the verification code, so this withdrawal was not started. Please contact support if this keeps happening.', methodId); } // AUTH-CHANNELS-01
@@ -752,7 +788,7 @@ router.post('/withdraw/verify/resend', requireLogin, async (req, res) => {
   let code;
   try { code = await otpLib.createOtp(req.db, identifier, channel); }
   catch (e) { return res.status(429).render('error', { status: 429, message: e.message }); }
-  const sent = await otpLib.sendOtp(req.db, req.settings, identifier, channel, code);
+  const sent = await otpLib.sendOtp(req.db, req.settings, identifier, channel, code, 'withdrawal');
   if (!sent.sent) { await otpLib.expireLiveOtps(req.db, identifier, channel); return res.status(503).render('error', { status: 503, message: 'Could not send the verification code. Please try again later or contact support.' }); } // AUTH-CHANNELS-01
   await req.setFlash('success', 'A new verification code was sent.');
   return res.render('withdraw_verify', {
@@ -896,6 +932,22 @@ router.get('/transactions', requireLogin, async (req, res) => {
   const totalPages = Math.max(1, Math.ceil(total / PER));
   page = Math.min(page, totalPages); // D4-C2: an out-of-range page renders the LAST page, never a false "No transactions yet"
   const txs = await req.db.query('SELECT * FROM transactions' + where + ' ORDER BY created_at DESC LIMIT ? OFFSET ?', params.concat([PER, (page - 1) * PER]));
+  /* H1-10 (v23): a campaign bonus used to render as type "Bonus" with a
+     bare numeric campaign id in the Reference column — a raw internal
+     id on a player page. Resolve the campaign NAME for display and
+     label deposit bonuses distinctly; the raw id never renders. */
+  const campIds = [...new Set(txs.filter(t => t.ref_type === 'bonus_campaign').map(t => Number(t.ref_id)).filter(Number.isFinite))];
+  const campNames = {};
+  if (campIds.length) {
+    const rows = await req.db.query('SELECT id, name FROM bonus_campaigns WHERE id IN (' + campIds.map(() => '?').join(',') + ')', campIds);
+    for (const r of rows) campNames[r.id] = r.name;
+  }
+  for (const t of txs) {
+    let meta = {};
+    try { meta = JSON.parse(t.meta || '{}'); } catch {}
+    if (t.type === 'bonus') t.displayLabel = meta.kind === 'deposit_bonus' ? 'Deposit bonus' : 'Bonus';
+    if (t.ref_type === 'bonus_campaign') t.displayRef = campNames[Number(t.ref_id)] || 'Bonus campaign';
+  }
   res.render('transactions', { metaTitle: 'Transactions', metaDesc: '', txs, filterType: type, page, totalPages, total });
 });
 
@@ -927,7 +979,11 @@ router.get('/profile', requireLogin, async (req, res) => {
   const baseUrl = (process.env.BASE_URL || (req.protocol + '://' + req.get('host'))).replace(/\/+$/, '');
   const profileVerified = !!(req.user.email_verified || req.user.mobile_verified);
   const referralUrl = req.user.referral_code ? baseUrl + '/register?ref=' + encodeURIComponent(req.user.referral_code) : '';
-  res.render('profile', { metaTitle: 'Profile', metaDesc: '', verifyPhone: req.query.verify_phone === '1', refSummary: refRows, kycCard, baseUrl, referralUrl, profileVerified });
+  /* Player email change (hotfix 2026-10-29): a pending, unexpired
+     change row whose target differs from the current address. */
+  const pendingRow = await req.db.get('SELECT new_email FROM email_verifications WHERE user_id = ? AND used = 0 AND expires_at > ? ORDER BY id DESC LIMIT 1', [req.user.id, now()]);
+  const pendingEmailChange = (pendingRow && pendingRow.new_email && pendingRow.new_email !== req.user.email) ? pendingRow.new_email : '';
+  res.render('profile', { metaTitle: 'Profile', metaDesc: '', verifyPhone: req.query.verify_phone === '1', refSummary: refRows, kycCard, baseUrl, referralUrl, profileVerified, pendingEmailChange, referralOn: getBool(req.settings, 'referral_enabled', false) });
 });
 router.post('/profile', requireLogin, async (req, res) => {
   const name = typeof req.body.name === 'string' ? req.body.name : ''; // B-08: type-confusion guards
@@ -974,6 +1030,44 @@ router.post('/profile/notifications', requireLogin, async (req, res) => {
   res.redirect('/profile');
 });
 
+/* ---------------- player email change (hotfix 2026-10-29) ----------------
+   Owner-reported dead end: the profile page said "Email cannot be
+   changed here — contact support." The swap machinery already existed
+   (email_verifications + /verify-email/:token, used by the admin
+   self-service flow); what was missing was the PLAYER request path.
+   Safety contract (deliberately stricter than the admin self flow):
+   current-password proof, one-account duplicate refusal, the swap
+   happens ONLY when the NEW address clicks its emailed link, and if
+   the email cannot actually be sent the token is burned and NOTHING
+   changes (no silent immediate apply for player accounts). */
+router.post('/profile/change-email', requireLogin, rateLimit({ windowMs: 3600000, max: 5, keyFn: req => 'change-email:' + req.user.id }), async (req, res) => {
+  if (!req.user.password_hash || !verifyPassword(String(req.body.current_password || ''), req.user.password_hash)) {
+    await req.setFlash('error', 'Email NOT changed: your current password is incorrect.');
+    return res.redirect('/profile');
+  }
+  const email = normalizeEmail(req.body.new_email);
+  if (!validEmail(email) || email.endsWith('@phone.local')) { await req.setFlash('error', 'Email NOT changed: enter a valid new email address.'); return res.redirect('/profile'); }
+  if (email === normalizeEmail(req.user.email)) { await req.setFlash('error', 'That is already your email address.'); return res.redirect('/profile'); }
+  const dup = await req.db.get('SELECT id FROM users WHERE email = ? AND id != ?', [email, req.user.id]);
+  if (dup) { await req.setFlash('error', 'Email NOT changed: that email is already used by another account.'); return res.redirect('/profile'); }
+  // One live link at a time (same burn-then-issue pattern as verify-email).
+  await req.db.run('UPDATE email_verifications SET used = 1 WHERE user_id = ? AND used = 0', [req.user.id]);
+  const token = randHex(24);
+  await req.db.run('INSERT INTO email_verifications (user_id, new_email, token_hash, expires_at, used, created_at) VALUES (?, ?, ?, ?, 0, ?)',
+    [req.user.id, email, sha256('verify:' + token), now() + 24 * 3600 * 1000, now()]);
+  const linkBaseP = emailedLinkBase(req); // H3-02: BASE_URL in production, never a forged Host
+  const link = linkBaseP ? linkBaseP + '/verify-email/' + token : null;
+  const sent = link ? await notify.send(req.db, req.settings, 'email', 'email_verification', email, { name: req.user.name, link }).catch(() => ({ status: 'failed' })) : { status: 'failed' };
+  if (sent.status === 'sent') {
+    await audit.log(req.db, { actorId: req.user.id, actorRole: 'player', action: 'user.email_change_requested', entity: 'user', entityId: req.user.id, detail: { pending_verification: true, to: email }, ip: req.ip });
+    await req.setFlash('success', 'Confirmation link sent to ' + email + '. Your email changes only when that link is clicked — your current email keeps working until then.');
+  } else { // AUTH-CHANNELS-01 delivery truth: undelivered link is burned, nothing changes
+    await req.db.run('UPDATE email_verifications SET used = 1 WHERE token_hash = ?', [sha256('verify:' + token)]);
+    await req.setFlash('error', 'Could not send the confirmation email right now, so your email was NOT changed. Please try again later.');
+  }
+  res.redirect('/profile');
+});
+
 /* ---------------- contact verification (v14) ---------------- */
 // Email link + phone OTP verification mark email_verified / mobile_verified,
 // which the deposit/withdrawal gate reads. Admins can also mark a contact
@@ -988,8 +1082,9 @@ router.post('/profile/verify-email', requireLogin, rateLimit({ windowMs: 3600000
   const token = randHex(24);
   await req.db.run('INSERT INTO email_verifications (user_id, new_email, token_hash, expires_at, used, created_at) VALUES (?, ?, ?, ?, 0, ?)',
     [req.user.id, email, sha256('verify:' + token), now() + 24 * 3600 * 1000, now()]);
-  const link = (process.env.BASE_URL || (req.protocol + '://' + req.get('host'))) + '/verify-email/' + token;
-  const sent = await notify.send(req.db, req.settings, 'email', 'email_verification', email, { name: req.user.name, link });
+  const linkBaseV = emailedLinkBase(req); // H3-02: BASE_URL in production, never a forged Host
+  const link = linkBaseV ? linkBaseV + '/verify-email/' + token : null;
+  const sent = link ? await notify.send(req.db, req.settings, 'email', 'email_verification', email, { name: req.user.name, link }) : { status: 'failed' };
   if (sent.status === 'sent') await req.setFlash('success', 'Verification link sent to ' + email + '.');
   else { // AUTH-CHANNELS-01: burn the undelivered link token
     await req.db.run('UPDATE email_verifications SET used = 1 WHERE token_hash = ?', [sha256('verify:' + token)]);
@@ -1003,7 +1098,7 @@ router.post('/profile/verify-phone', requireLogin, async (req, res) => {
   const otpLib = require('../lib/otp');
   let code;
   try { code = await otpLib.createOtp(req.db, phone, 'phone'); } catch (e) { await req.setFlash('error', e.message); return res.redirect('/profile'); }
-  const sent = await otpLib.sendOtp(req.db, req.settings, phone, 'phone', code);
+  const sent = await otpLib.sendOtp(req.db, req.settings, phone, 'phone', code, 'verify');
   if (!sent.sent) { await otpLib.expireLiveOtps(req.db, phone, 'phone'); await req.setFlash('error', 'Could not send the verification code. Try again later.'); return res.redirect('/profile'); } // AUTH-CHANNELS-01: undelivered code invalidated
   await req.setFlash('success', 'Verification code sent to ' + phone + '. Enter it below.');
   res.redirect('/profile?verify_phone=1');
@@ -1145,7 +1240,7 @@ router.post('/security/totp/confirm', requireLogin, playerSecurityLimiter, async
   const codes = newBackupCodes(8);
   const enrollStep = verifyTotpStep(secret, req.body.totp_code);
   if (enrollStep !== null) await req.db.run('UPDATE users SET totp_last_step = ? WHERE id = ?', [enrollStep, req.user.id]);
-  await req.db.run('UPDATE users SET totp_secret = ?, backup_codes = ? WHERE id = ?', [secret, hashBackupCodes(codes), req.user.id]);
+  await req.db.run('UPDATE users SET totp_secret = ?, backup_codes = ? WHERE id = ?', [wrapTotpSecret(secret), hashBackupCodes(codes), req.user.id]);
   const { touchSession } = require('../lib/auth');
   await touchSession(req.db, req.sess.id, { totp_pending: null });
   await audit.log(req.db, { actorId: req.user.id, actorRole: req.user.role, action: 'user.totp_enable', entity: 'user', entityId: req.user.id, detail: {}, ip: req.ip });
